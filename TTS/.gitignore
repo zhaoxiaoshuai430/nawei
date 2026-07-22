@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+cuda_env/
+data/cache/
+data/logs/
+data/sessions/
+voice_lab/output/
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db

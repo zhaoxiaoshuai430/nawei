@@ -1,0 +1,17 @@
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+TTS/cuda_env/
+ASR/hf_download/
+TTS/data/cache/
+TTS/data/logs/
+TTS/data/sessions/
+TTS/voice_lab/output/
+.runtime-logs/
+**/.env
+*.log
+*.tmp
+*.bak

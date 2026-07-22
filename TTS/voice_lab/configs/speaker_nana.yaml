@@ -1,0 +1,37 @@
+# Speaker & training defaults for voice_lab (方案 A: Base SFT → CustomVoice 推理)
+speaker: nana
+language: Chinese
+
+# Base model to fine-tune (official Qwen3-TTS finetuning/)
+init_model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+tokenizer_model: Qwen/Qwen3-TTS-Tokenizer-12Hz
+
+# Gateway model id after training (do not change unless you rename speaker)
+gateway_model_id: voice_lab/nana
+
+# Audio
+target_sample_rate: 24000
+target_channels: 1
+clip_min_sec: 2.0
+clip_max_sec: 15.0
+
+# Training (adjust batch_size to your GPU VRAM)
+timbre:
+  batch_size: 2
+  learning_rate: 2.0e-6
+  num_epochs: 5
+
+instruct:
+  batch_size: 2
+  learning_rate: 2.0e-6
+  num_epochs: 8
+  # Community vspeech/Qwen3-TTS-Train supports --instruct_model
+  use_instruct_flag: true
+
+# ASR for transcript (Gateway must be running with run_asr.bat)
+asr_base_url: http://127.0.0.1:18000
+
+# Vendor repos (cloned by setup_finetuning.ps1)
+vendor:
+  official: vendor/Qwen3-TTS/finetuning
+  easy: vendor/Qwen3-TTS-EasyFinetuning

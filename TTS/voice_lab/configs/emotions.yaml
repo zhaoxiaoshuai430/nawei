@@ -1,0 +1,26 @@
+# 京爷们 6 戏路 — nana instruct 训练用（推理时选戏路即 instruct）
+emotions:
+  lao:
+    label: 唠嗑
+    folder: lao
+    instruct: 用老北京爷们儿随口唠嗑的口气说，京片子，语速中等偏慢，像跟哥们儿闲扯，脏字少或无
+  tu:
+    label: 吐槽
+    folder: tu
+    instruct: 用吐槽、骂骂咧咧的口气说，带脏字或狠话，语气冲、实在，像嫌东西贵、嫌人傻，不要平读
+  de:
+    label: 得意
+    folder: de
+    instruct: 用得意、显摆、觉得自己见多识广的口气说，略上扬，像安利 Tim 哥、讽刺别人不会过日子
+  tan:
+    label: 惊讶
+    folder: tan
+    instruct: 用惊讶、突然来劲的口气说，「哎哟喂」「我去」「什么情况」这类开头要明显，起伏大
+  diao:
+    label: 吊儿郎当
+    folder: diao
+    instruct: 用满不在乎、吊儿郎当的口气说，「得嘞」「没事儿」「哥们儿不在乎」那种懒散劲儿
+  qi:
+    label: 叹词
+    folder: qi
+    instruct: 用自然京片子叹词口吻说，气口拖音明显，重点在「哎」「诶」「嘿」「呸」不要念成普通字
