@@ -1,0 +1,34 @@
+ARG ASR_BASE_IMAGE=pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+FROM ${ASR_BASE_IMAGE}
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    ASR_HOST=0.0.0.0 \
+    ASR_PORT=8001 \
+    MODELSCOPE_CACHE=/app/services/asr/hf_download/modelscope \
+    MODELSCOPE_HOME=/app/services/asr/hf_download/modelscope \
+    HF_HOME=/app/services/asr/hf_download/huggingface \
+    XDG_CACHE_HOME=/app/services/asr/hf_download
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates ffmpeg libsndfile1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 nawei \
+    && useradd --uid 10001 --gid nawei --create-home --shell /usr/sbin/nologin nawei
+
+COPY deploy/requirements-asr.txt /tmp/requirements-asr.txt
+RUN python -m pip install --upgrade pip \
+    && python -m pip install --requirement /tmp/requirements-asr.txt
+
+WORKDIR /app/services/asr
+COPY --chown=nawei:nawei services/asr /app/services/asr
+COPY --chown=nawei:nawei models/asr /app/models/asr
+RUN mkdir -p /app/services/asr/hf_download/modelscope /app/services/asr/hf_download/huggingface \
+    && chown -R nawei:nawei /app/services/asr/hf_download
+
+USER nawei
+
+EXPOSE 8001
+CMD ["python", "src/main.py"]

@@ -1,0 +1,22 @@
+"""Run the LLM service on its documented port."""
+
+from __future__ import annotations
+
+import os
+
+import uvicorn
+
+
+HOST = os.getenv("LLM_HOST", "127.0.0.1")
+PORT = int(os.getenv("LLM_PORT", "8002"))
+WORKERS = int(os.getenv("LLM_WORKERS", "4"))
+
+
+def main() -> None:
+    """Start the LLM FastAPI application."""
+
+    uvicorn.run("services.llm.main:app", host=HOST, port=PORT, reload=False, workers=WORKERS)
+
+
+if __name__ == "__main__":
+    main()

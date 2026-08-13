@@ -1,0 +1,27 @@
+* text=auto
+
+*.py text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sql text eol=lf
+
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+*.wav binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.safetensors binary
+*.pt binary
+*.db binary
+
+models/**/*.pt filter=lfs diff=lfs merge=lfs -text
+models/**/*.safetensors filter=lfs diff=lfs merge=lfs -text
+models/**/*.part* filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,11 @@
+groups:
+  - name: nawei-availability
+    rules:
+      - alert: NaweiServiceUnavailable
+        expr: probe_success == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Nawei service health probe failed"
+          description: "{{ $labels.instance }} has failed health probes for more than two minutes."

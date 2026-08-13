@@ -1,5 +1,0 @@
-# TTS 子模块核心依赖（完整 pin 见根 requirements.txt）
-faster-qwen3-tts==0.2.5
-soundfile
-numpy
-huggingface-hub

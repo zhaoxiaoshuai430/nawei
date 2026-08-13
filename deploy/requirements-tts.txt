@@ -1,0 +1,16 @@
+faster-qwen3-tts==0.2.5
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+python-multipart>=0.0.9,<1
+python-dotenv>=1,<2
+PyYAML>=6,<7
+soundfile>=0.12,<1
+numpy>=1.24
+huggingface-hub>=0.20
+qwen-tts>=0.1.1
+transformers>=4.40
+safetensors>=0.4
+accelerate>=0.27
+librosa>=0.10
+sox>=1.4
+requests>=2.31

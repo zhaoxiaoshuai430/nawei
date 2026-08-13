@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "files": [
+    {
+      "path": "asr/SenseVoiceSmall/model.pt",
+      "size": 936291369,
+      "sha256": "833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea"
+    },
+    {
+      "path": "asr/fsmn-vad/model.pt",
+      "size": 1721366,
+      "sha256": "b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5"
+    },
+    {
+      "path": "tts/nana/checkpoint-epoch-7/speech_tokenizer/model.safetensors",
+      "size": 682293092,
+      "sha256": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258"
+    },
+    {
+      "path": "tts/nana/checkpoint-epoch-7/model.safetensors",
+      "size": 3833402520,
+      "sha256": "7d9048468a3c8f5c7f6cb7d2363686673b5ba6d397f1d444acc9830d0fcfd57b",
+      "parts": [
+        "tts/nana/checkpoint-epoch-7/model.safetensors.part000",
+        "tts/nana/checkpoint-epoch-7/model.safetensors.part001",
+        "tts/nana/checkpoint-epoch-7/model.safetensors.part002"
+      ]
+    }
+  ]
+}
