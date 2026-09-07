@@ -35,9 +35,14 @@ MODELSCOPE_CACHE = (
 ASSET_DIR = Path(os.environ.get("ASSET_DIR", str(REPO_ROOT / "assets")))
 SENSEVOICE_DIR = REPO_ROOT / "SenseVoice"
 
-# voice_lab: fine-tuned CustomVoice (speaker "nana" by default)
+# voice_lab: fine-tuned CustomVoice
 VOICE_LAB_DIR = REPO_ROOT / "voice_lab"
-VOICE_LAB_SPEAKER = os.environ.get("VOICE_LAB_SPEAKER", "nana").strip() or "nana"
+VOICE_LAB_SPEAKER = os.environ.get("VOICE_LAB_SPEAKER", "liliya").strip() or "liliya"
+TTS_DEFAULT_SPEAKER = os.environ.get("TTS_DEFAULT_SPEAKER", VOICE_LAB_SPEAKER).strip() or VOICE_LAB_SPEAKER
+TTS_DEFAULT_MODEL = (
+    os.environ.get("TTS_DEFAULT_MODEL", f"voice_lab/{VOICE_LAB_SPEAKER}").strip()
+    or f"voice_lab/{VOICE_LAB_SPEAKER}"
+)
 
 # Gateway
 ASR_BASE_URL = os.environ.get("ASR_BASE_URL", "http://127.0.0.1:8001").rstrip("/")

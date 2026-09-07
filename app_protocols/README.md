@@ -87,7 +87,7 @@ The old standalone TTS field `audio_b64` is no longer exposed by the standard TT
   "stream": false,
   "voice": {
     "mode": "custom",
-    "speaker_id": "nana",
+    "speaker_id": "liliya",
     "language": "Chinese",
     "instruct": ""
   },

@@ -27,7 +27,14 @@ def main() -> None:
     print("Gateway health: ok")
 
     status = _request_json(f"{base_url}/api/v1/status", context=context)
-    unavailable = [name for name, detail in status.get("services", {}).items() if not detail.get("ready")]
+    services = status.get("services")
+    if not isinstance(services, dict):
+        raise SystemExit(f"Gateway status response has no services object: {status}")
+    unavailable = [
+        str(name)
+        for name, detail in services.items()
+        if not isinstance(detail, dict) or not detail.get("ready")
+    ]
     if unavailable:
         raise SystemExit(f"Dependencies are not ready: {', '.join(unavailable)}")
     print("Dependency status: all ready")
@@ -76,7 +83,10 @@ def _request_json(
     request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
-            return json.loads(response.read().decode("utf-8"))
+            decoded = json.loads(response.read().decode("utf-8"))
+            if not isinstance(decoded, dict):
+                raise SystemExit(f"{method} {url} returned a non-object JSON response")
+            return decoded
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise SystemExit(f"{method} {url} failed with HTTP {exc.code}: {detail}") from exc

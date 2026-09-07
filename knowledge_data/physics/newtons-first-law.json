@@ -1,0 +1,39 @@
+{
+  "knowledge_base_id": "default",
+  "title": "初中物理知识",
+  "source_name": "OpenStax（莱斯大学）《Physics》",
+  "metadata": {
+    "subject": "物理",
+    "domain": "力与运动",
+    "version": "1.0.0",
+    "source_type": "authoritative_open_textbook"
+  },
+  "chunks": [
+    {
+      "chunk_key": "newtons-first-law-and-inertia",
+      "text": "知识点：牛顿第一定律与惯性。静止物体在没有受到合外力时保持静止，运动物体在没有受到合外力时保持匀速直线运动。物体保持原有运动状态的性质叫惯性；力是改变物体运动状态的原因。",
+      "source_name": "OpenStax（莱斯大学）《Physics》",
+      "source_url": "https://openstax.org/books/physics/pages/4-2-newtons-first-law-of-motion-inertia",
+      "source_locator": "第4章第2节·Newton’s First Law of Motion: Inertia·Newton’s First Law and Friction；Mass and Inertia",
+      "metadata": {
+        "subject": "物理",
+        "domain": "力与运动",
+        "concept": "牛顿第一定律",
+        "grade": "初中至高中",
+        "difficulty": "基础"
+      },
+      "entities": [
+        {"name": "物理", "entity_type": "KnowledgeNode"},
+        {"name": "力与运动", "entity_type": "Domain"},
+        {"name": "牛顿第一定律", "entity_type": "Concept", "aliases": ["惯性定律"]},
+        {"name": "惯性", "entity_type": "Concept"},
+        {"name": "合外力", "entity_type": "Concept"}
+      ],
+      "relations": [
+        {"source": "力与运动", "target": "牛顿第一定律", "relation_type": "CONTAINS", "source_type": "Domain", "target_type": "Concept", "evidence": "牛顿第一定律属于力与运动知识。"},
+        {"source": "牛顿第一定律", "target": "惯性", "relation_type": "EXPLAINS", "evidence": "牛顿第一定律也称惯性定律。"},
+        {"source": "合外力", "target": "牛顿第一定律", "relation_type": "CONDITION_OF", "evidence": "合外力决定物体运动状态是否发生改变。"}
+      ]
+    }
+  ]
+}

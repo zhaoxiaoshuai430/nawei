@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import subprocess
 import tempfile
 
@@ -44,14 +45,16 @@ def prepare_wav_path(
         src_path = src.name
     cleanup.append(src_path)
 
-    dst_path = tempfile.mktemp(suffix=".wav")
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as dst:
+        dst_path = dst.name
     cleanup.append(dst_path)
 
     try:
         import imageio_ffmpeg
 
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    except ImportError as exc:
+    except (ImportError, OSError, RuntimeError) as exc:
+        _cleanup_paths(cleanup)
         raise AudioFormatError(
             f"不支持的音频格式 {suffix}，请上传 WAV/MP3，或在 asr_env 安装 imageio-ffmpeg",
         ) from exc
@@ -60,8 +63,12 @@ def prepare_wav_path(
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     except subprocess.CalledProcessError as exc:
+        _cleanup_paths(cleanup)
         err = (exc.stderr or b"").decode("utf-8", errors="replace")[-400:]
         raise AudioFormatError(f"音频解码失败（{suffix}）: {err or exc}") from exc
+    except OSError as exc:
+        _cleanup_paths(cleanup)
+        raise AudioFormatError(f"无法启动音频解码器（{suffix}）: {exc}") from exc
 
     return dst_path, cleanup
 
@@ -73,28 +80,22 @@ def bytes_to_wav_bytes(
     target_sr: int = 24000,
 ) -> bytes:
     """Convert uploaded audio bytes to mono PCM WAV (for TTS reference storage)."""
-    import os
     from pathlib import Path
 
     path, cleanup = prepare_wav_path(content, suffix, target_sr=target_sr)
     try:
         return Path(path).read_bytes()
     finally:
-        for p in cleanup:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+        _cleanup_paths(cleanup)
 
 
-def to_wav_b64(audio: np.ndarray, sr: int) -> str:
-    if audio.dtype != np.float32:
-        audio = audio.astype(np.float32)
-    if audio.ndim > 1:
-        audio = audio.squeeze()
-    buf = io.BytesIO()
-    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
-    return base64.b64encode(buf.getvalue()).decode()
+def _cleanup_paths(paths: list[str]) -> None:
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
 
 
 def encode_audio_b64(

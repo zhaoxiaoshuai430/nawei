@@ -20,11 +20,12 @@ from app_protocols.base import ProtocolModel
 from app_protocols.events import sse_encode
 from services.llm.agent_runtime import AgentTurn, LLMAgentRuntime
 from services.llm.auth import authorize_llm_internal_request
+from services.llm.safety import LocalSafetyGuard, SafetyDecision, SafetyStreamBuffer
 
 try:
     from dotenv import load_dotenv as _load_dotenv
 except ImportError:  # pragma: no cover - fallback keeps local tests runnable without optional dependency
-    _load_dotenv = None
+    _load_dotenv = None  # type: ignore[assignment]
 
 
 MODEL_ID = "stub-llm"
@@ -75,6 +76,7 @@ _load_dotenv_file(DOTENV_PATH)
 
 _deepseek_clients: dict[float, httpx.AsyncClient] = {}
 agent_runtime = LLMAgentRuntime()
+safety_guard: LocalSafetyGuard = agent_runtime.safety_guard
 
 
 @asynccontextmanager
@@ -241,29 +243,37 @@ async def clear_memory(user_id: str, session_id: str | None = None) -> dict[str,
 async def complete_llm(request: LLMRequest) -> LLMResponse:
     """Run Agent, Skills, Tools, Memory, and configured inference as one turn."""
 
+    request, input_decision = _audit_request_input(request)
+    if input_decision.blocked:
+        return _blocked_input_response(request, input_decision)
     settings = load_settings()
     turn: AgentTurn | None = None
     try:
         turn = await agent_runtime.prepare(request)
-        response = complete_stub(turn.request) if settings.is_stub else await complete_deepseek(turn.request, settings)
-        return await _finalize_agent_response(turn, response)
+        if settings.is_stub:
+            response = complete_stub(turn.request)
+        elif _native_tool_calling_requested(turn.request):
+            response = await _complete_deepseek_with_native_tools(turn, settings)
+        else:
+            response = await complete_deepseek(turn.request, settings)
+        return await _finalize_agent_response(turn, response, input_decision=input_decision)
     except httpx.HTTPStatusError as exc:
         if settings.fallback_enabled:
             active_request = turn.request if turn is not None else request
             response = fallback_response(active_request, settings, reason=_extract_upstream_error(exc.response), status_code=exc.response.status_code)
-            return await _finalize_agent_response(turn, response)
+            return await _finalize_agent_response(turn, response, input_decision=input_decision)
         raise HTTPException(status_code=502, detail=_extract_upstream_error(exc.response)) from exc
     except httpx.HTTPError as exc:
         if settings.fallback_enabled:
             active_request = turn.request if turn is not None else request
             response = fallback_response(active_request, settings, reason=f"LLM upstream request failed: {exc}")
-            return await _finalize_agent_response(turn, response)
+            return await _finalize_agent_response(turn, response, input_decision=input_decision)
         raise HTTPException(status_code=502, detail=f"LLM upstream request failed: {exc}") from exc
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         if settings.fallback_enabled:
             active_request = turn.request if turn is not None else request
             response = fallback_response(active_request, settings, reason=f"Invalid LLM upstream response: {exc}")
-            return await _finalize_agent_response(turn, response)
+            return await _finalize_agent_response(turn, response, input_decision=input_decision)
         raise HTTPException(status_code=502, detail=f"Invalid LLM upstream response: {exc}") from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=f"LLM Agent runtime unavailable: {exc}") from exc
@@ -276,17 +286,47 @@ async def complete_llm(request: LLMRequest) -> LLMResponse:
 async def stream_llm(request: LLMRequest) -> StreamingResponse:
     """Stream one complete Agent and inference turn as canonical SSE."""
 
+    request, input_decision = _audit_request_input(request)
     settings = load_settings()
 
     async def event_source() -> AsyncIterator[str]:
+        if input_decision.blocked:
+            yield sse_encode(_safety_delta_event(request, input_decision.content))
+            yield sse_encode(_safety_done_event(request, input_decision=input_decision))
+            return
         try:
             turn = await agent_runtime.prepare(request)
-            parts: list[str] = []
+            safe_parts: list[str] = []
+            raw_parts: list[str] = []
             done_event: StreamEvent | None = None
+            delta_template: StreamEvent | None = None
             failed = False
+            stream_safety = SafetyStreamBuffer(safety_guard)
+            stream_chunk_chars = _stream_chunk_chars()
             async for event in _stream_backend_with_fallback(turn.request, settings):
+                tool_agent_metadata = event.data.get("tool_agent")
+                if isinstance(tool_agent_metadata, dict):
+                    turn.metadata["tools"] = {
+                        **dict(turn.metadata.get("tools") or {}),
+                        **tool_agent_metadata,
+                        "results": event.data.get("tool_results") or {},
+                        "errors": event.data.get("tool_errors") or {},
+                    }
                 if event.event == EventType.MESSAGE_DELTA:
-                    parts.append(str(event.data.get("text", "")))
+                    delta_template = event
+                    raw_text = str(event.data.get("text", ""))
+                    raw_parts.append(raw_text)
+                    for safe_text in stream_safety.feed(raw_text):
+                        safe_parts.append(safe_text)
+                        chunks = [safe_text] if stream_safety.blocked else _text_chunks(
+                            safe_text,
+                            size=stream_chunk_chars,
+                        )
+                        for text in chunks:
+                            yield sse_encode(_stream_event_with_text(event, text))
+                    if stream_safety.blocked:
+                        break
+                    continue
                 if event.event == EventType.MESSAGE_DONE:
                     done_event = event
                     continue
@@ -295,7 +335,18 @@ async def stream_llm(request: LLMRequest) -> StreamingResponse:
                 yield sse_encode(event)
             if failed:
                 return
-            persistence = await agent_runtime.after_turn(turn, "".join(parts))
+            for safe_text in stream_safety.finish():
+                safe_parts.append(safe_text)
+                chunks = [safe_text] if stream_safety.blocked else _text_chunks(
+                    safe_text,
+                    size=stream_chunk_chars,
+                )
+                for text in chunks:
+                    yield sse_encode(_stream_text_event(request, text, template=delta_template))
+            output_decision = stream_safety.decision or safety_guard.audit_output("".join(raw_parts))
+            if output_decision.changed:
+                safety_guard.log(stage="output", decision=output_decision, request_id=request.request_id)
+            persistence = await agent_runtime.after_turn(turn, "".join(safe_parts))
             final_event = done_event or StreamEvent(
                 event=EventType.MESSAGE_DONE,
                 request_id=request.request_id,
@@ -304,8 +355,11 @@ async def stream_llm(request: LLMRequest) -> StreamingResponse:
                 data={"message_id": request.request_id, "finish_reason": "stop"},
             )
             final_data = dict(final_event.data)
+            if output_decision.blocked:
+                final_data["finish_reason"] = "safety"
             final_data["runtime"] = turn.metadata
             final_data["persistence"] = persistence
+            final_data["safety"] = _safety_metadata(input_decision, output_decision)
             yield sse_encode(_copy_stream_event(final_event, data=final_data))
         except RuntimeError as exc:
             yield sse_encode(_error_event(request, f"LLM Agent runtime unavailable: {exc}"))
@@ -360,12 +414,20 @@ async def _stream_backend_with_fallback(
     request: LLMRequest,
     settings: LLMSettings,
 ) -> AsyncIterator[StreamEvent]:
+    emitted_content = False
     try:
-        source = stream_stub(request) if settings.is_stub else stream_deepseek(request, settings)
+        if settings.is_stub:
+            source = stream_stub(request)
+        elif _native_tool_calling_requested(request):
+            source = stream_deepseek_with_native_tools(request, settings)
+        else:
+            source = stream_deepseek(request, settings)
         async for event in source:
+            if event.event == EventType.MESSAGE_DELTA and str(event.data.get("text") or ""):
+                emitted_content = True
             yield event
     except httpx.HTTPStatusError as exc:
-        if not settings.fallback_enabled:
+        if emitted_content or not settings.fallback_enabled:
             yield _error_event(request, _extract_upstream_error(exc.response))
             return
         async for event in stream_fallback(
@@ -376,13 +438,13 @@ async def _stream_backend_with_fallback(
         ):
             yield event
     except httpx.HTTPError as exc:
-        if not settings.fallback_enabled:
+        if emitted_content or not settings.fallback_enabled:
             yield _error_event(request, f"LLM upstream stream failed: {exc}")
             return
         async for event in stream_fallback(request, settings, reason=f"LLM upstream stream failed: {exc}"):
             yield event
     except (KeyError, IndexError, TypeError, ValueError) as exc:
-        if not settings.fallback_enabled:
+        if emitted_content or not settings.fallback_enabled:
             yield _error_event(request, f"Invalid LLM upstream stream response: {exc}")
             return
         async for event in stream_fallback(
@@ -465,6 +527,35 @@ async def stream_fallback(
     )
 
 
+async def _complete_deepseek_with_native_tools(
+    turn: AgentTurn,
+    settings: LLMSettings,
+) -> LLMResponse:
+    first_response = await complete_deepseek(turn.request, settings)
+    calls = _parse_native_tool_calls(first_response.metadata.get("tool_calls"))
+    if not calls:
+        return first_response
+
+    followup_request, tool_metadata = await agent_runtime.execute_native_tool_calls(
+        turn.request,
+        calls=calls,
+        first_text=first_response.text,
+    )
+    final_response = await complete_deepseek(followup_request, settings)
+    final_response.usage = Usage(
+        input_tokens=first_response.usage.input_tokens + final_response.usage.input_tokens,
+        output_tokens=first_response.usage.output_tokens + final_response.usage.output_tokens,
+    )
+    final_response.metadata = {**dict(final_response.metadata), **tool_metadata}
+    turn.metadata["tools"] = {
+        **dict(turn.metadata.get("tools") or {}),
+        **tool_metadata["tool_agent"],
+        "results": tool_metadata["tool_results"],
+        "errors": tool_metadata["tool_errors"],
+    }
+    return final_response
+
+
 async def complete_deepseek(request: LLMRequest, settings: LLMSettings) -> LLMResponse:
     """Call the DeepSeek chat completions API."""
 
@@ -473,15 +564,20 @@ async def complete_deepseek(request: LLMRequest, settings: LLMSettings) -> LLMRe
     if settings.api_key:
         headers["Authorization"] = f"Bearer {settings.api_key}"
 
-    client = _deepseek_client(settings.timeout_seconds)
-    response = await client.post(_chat_completions_url(settings.base_url), json=payload, headers=headers)
+    response = await _post_deepseek_with_transport_retry(
+        _chat_completions_url(settings.base_url),
+        payload=payload,
+        headers=headers,
+        timeout_seconds=settings.timeout_seconds,
+    )
     response.raise_for_status()
     body = response.json()
 
     choice = body["choices"][0]
     message = choice.get("message") or {}
     text = message.get("content") or choice.get("text") or ""
-    if not str(text).strip():
+    tool_calls = message.get("tool_calls") if isinstance(message.get("tool_calls"), list) else []
+    if not str(text).strip() and not tool_calls:
         raise ValueError("LLM upstream returned empty content")
     usage = body.get("usage") or {}
     model = body.get("model") or settings.model
@@ -497,6 +593,7 @@ async def complete_deepseek(request: LLMRequest, settings: LLMSettings) -> LLMRe
             "provider": settings.provider,
             "model": model,
             "upstream_id": body.get("id"),
+            **({"tool_calls": tool_calls} if tool_calls else {}),
         },
     )
 
@@ -506,27 +603,20 @@ async def stream_deepseek(request: LLMRequest, settings: LLMSettings) -> AsyncIt
 
     payload = _build_deepseek_payload(request, settings)
     payload["stream"] = True
-    headers = {"Content-Type": "application/json"}
-    if settings.api_key:
-        headers["Authorization"] = f"Bearer {settings.api_key}"
-
     emitted_text = False
-    client = _deepseek_client(settings.timeout_seconds)
-    async with client.stream("POST", _chat_completions_url(settings.base_url), json=payload, headers=headers) as response:
-        response.raise_for_status()
-        async for body in _iter_openai_sse(response):
-            choice = (body.get("choices") or [{}])[0]
-            delta = choice.get("delta") or {}
-            text = delta.get("content") or choice.get("text") or ""
-            if text:
-                emitted_text = True
-                yield StreamEvent(
-                    event=EventType.MESSAGE_DELTA,
-                    request_id=request.request_id,
-                    trace_id=request.trace_id,
-                    session_id=request.session_id,
-                    data={"text": text},
-                )
+    async for body in _iter_deepseek_stream_bodies(payload, settings):
+        choice = (body.get("choices") or [{}])[0]
+        delta = choice.get("delta") or {}
+        text = delta.get("content") or choice.get("text") or ""
+        if text:
+            emitted_text = True
+            yield StreamEvent(
+                event=EventType.MESSAGE_DELTA,
+                request_id=request.request_id,
+                trace_id=request.trace_id,
+                session_id=request.session_id,
+                data={"text": text},
+            )
     if not emitted_text:
         fallback_response = await complete_deepseek(request, settings)
         for chunk in _text_chunks(fallback_response.text, size=12):
@@ -544,6 +634,103 @@ async def stream_deepseek(request: LLMRequest, settings: LLMSettings) -> AsyncIt
         session_id=request.session_id,
         data={"message_id": request.request_id, "finish_reason": "stop", "usage": {}},
     )
+
+
+async def stream_deepseek_with_native_tools(
+    request: LLMRequest,
+    settings: LLMSettings,
+) -> AsyncIterator[StreamEvent]:
+    """Stream model-selected tools followed by the final model answer."""
+
+    payload = _build_deepseek_payload(request, settings)
+    payload["stream"] = True
+    tool_call_parts: dict[int, dict[str, str]] = {}
+    first_text_parts: list[str] = []
+    emitted_text = False
+    async for body in _iter_deepseek_stream_bodies(payload, settings):
+        choice = (body.get("choices") or [{}])[0]
+        delta = choice.get("delta") or {}
+        _merge_stream_tool_call_parts(tool_call_parts, delta.get("tool_calls"))
+        text = str(delta.get("content") or choice.get("text") or "")
+        if not text:
+            continue
+        emitted_text = True
+        first_text_parts.append(text)
+        yield StreamEvent(
+            event=EventType.MESSAGE_DELTA,
+            request_id=request.request_id,
+            trace_id=request.trace_id,
+            session_id=request.session_id,
+            data={"text": text, "phase": "tool_selection"},
+        )
+
+    calls = _parse_native_tool_calls(_stream_tool_calls(tool_call_parts))
+    if not calls:
+        if not emitted_text:
+            fallback_response = await _complete_deepseek_with_native_request_tools(request, settings)
+            for chunk in _text_chunks(fallback_response.text, size=12):
+                yield StreamEvent(
+                    event=EventType.MESSAGE_DELTA,
+                    request_id=request.request_id,
+                    trace_id=request.trace_id,
+                    session_id=request.session_id,
+                    data={"text": chunk, "fallback": "non_stream_after_empty_stream"},
+                )
+        yield StreamEvent(
+            event=EventType.MESSAGE_DONE,
+            request_id=request.request_id,
+            trace_id=request.trace_id,
+            session_id=request.session_id,
+            data={"message_id": request.request_id, "finish_reason": "stop", "usage": {}},
+        )
+        return
+
+    followup_request, tool_metadata = await agent_runtime.execute_native_tool_calls(
+        request,
+        calls=calls,
+        first_text="".join(first_text_parts),
+    )
+    async for event in stream_deepseek(followup_request, settings):
+        if event.event == EventType.MESSAGE_DELTA:
+            event = _copy_stream_event(
+                event,
+                data={
+                    **dict(event.data),
+                    "phase": "final_answer",
+                    "tool_agent": tool_metadata["tool_agent"],
+                    "tool_results": tool_metadata["tool_results"],
+                    "tool_errors": tool_metadata["tool_errors"],
+                },
+            )
+        elif event.event == EventType.MESSAGE_DONE:
+            event = _copy_stream_event(
+                event,
+                data={
+                    **dict(event.data),
+                    "tool_agent": tool_metadata["tool_agent"],
+                    "tool_results": tool_metadata["tool_results"],
+                    "tool_errors": tool_metadata["tool_errors"],
+                },
+            )
+        yield event
+
+
+async def _complete_deepseek_with_native_request_tools(
+    request: LLMRequest,
+    settings: LLMSettings,
+) -> LLMResponse:
+    first_response = await complete_deepseek(request, settings)
+    calls = _parse_native_tool_calls(first_response.metadata.get("tool_calls"))
+    if not calls:
+        return first_response
+    followup_request, tool_metadata = await agent_runtime.execute_native_tool_calls(
+        request,
+        calls=calls,
+        first_text=first_response.text,
+    )
+    final_response = await complete_deepseek(followup_request, settings)
+    final_response.metadata = {**dict(final_response.metadata), **tool_metadata}
+    return final_response
 
 
 def load_settings() -> LLMSettings:
@@ -592,6 +779,57 @@ def _deepseek_client(timeout_seconds: float) -> httpx.AsyncClient:
     return client
 
 
+async def _post_deepseek_with_transport_retry(
+    url: str,
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout_seconds: float,
+) -> httpx.Response:
+    """Retry once when a pooled HTTP connection became stale while idle."""
+
+    for attempt in range(2):
+        try:
+            return await _deepseek_client(timeout_seconds).post(url, json=payload, headers=headers)
+        except httpx.TimeoutException:
+            raise
+        except httpx.TransportError:
+            if attempt > 0:
+                raise
+    raise RuntimeError("unreachable")
+
+
+async def _iter_deepseek_stream_bodies(
+    payload: dict[str, Any],
+    settings: LLMSettings,
+) -> AsyncIterator[dict[str, Any]]:
+    """Retry a stream once only when no upstream data has arrived yet."""
+
+    headers = {"Content-Type": "application/json"}
+    if settings.api_key:
+        headers["Authorization"] = f"Bearer {settings.api_key}"
+    for attempt in range(2):
+        received_data = False
+        try:
+            client = _deepseek_client(settings.timeout_seconds)
+            async with client.stream(
+                "POST",
+                _chat_completions_url(settings.base_url),
+                json=payload,
+                headers=headers,
+            ) as response:
+                await _raise_for_status_with_body(response)
+                async for body in _iter_openai_sse(response):
+                    received_data = True
+                    yield body
+            return
+        except httpx.TimeoutException:
+            raise
+        except httpx.TransportError:
+            if attempt > 0 or received_data:
+                raise
+
+
 def _build_deepseek_payload(request: LLMRequest, settings: LLMSettings) -> dict[str, Any]:
     messages = list(request.messages)
     if not any(message.role == MessageRole.SYSTEM for message in messages):
@@ -606,6 +844,7 @@ def _build_deepseek_payload(request: LLMRequest, settings: LLMSettings) -> dict[
             payload[key] = request.generation_config[key]
     if request.tools:
         payload["tools"] = request.tools
+        payload["tool_choice"] = "auto"
     if not _read_bool_env("LLM_THINKING_ENABLED", False):
         payload["thinking"] = {"type": "disabled"}
     return payload
@@ -615,7 +854,100 @@ def _message_to_deepseek_payload(message: Any) -> dict[str, Any]:
     payload = {"role": str(message.role), "content": message.content}
     if message.name:
         payload["name"] = message.name
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        payload["tool_calls"] = [_model_to_dict(item) for item in tool_calls]
+    tool_call_id = getattr(message, "tool_call_id", None)
+    if tool_call_id:
+        payload["tool_call_id"] = str(tool_call_id)
     return payload
+
+
+def _native_tool_calling_requested(request: LLMRequest) -> bool:
+    mode = str(
+        request.generation_config.get("tool_selection_mode")
+        or os.getenv("LLM_TOOL_SELECTION_MODE", "native")
+    ).strip().lower()
+    return mode in {"native", "function", "tool_calls"} and bool(request.tools)
+
+
+def _merge_stream_tool_call_parts(
+    parts: dict[int, dict[str, str]],
+    raw_calls: Any,
+) -> None:
+    if not isinstance(raw_calls, list):
+        return
+    for fallback_index, raw in enumerate(raw_calls):
+        if not isinstance(raw, dict):
+            continue
+        try:
+            index = int(raw.get("index", fallback_index))
+        except (TypeError, ValueError):
+            index = fallback_index
+        item = parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
+        if raw.get("id"):
+            item["id"] = str(raw["id"])
+        function = raw.get("function")
+        if not isinstance(function, dict):
+            continue
+        if function.get("name"):
+            item["name"] += str(function["name"])
+        if function.get("arguments"):
+            item["arguments"] += str(function["arguments"])
+
+
+def _stream_tool_calls(parts: dict[int, dict[str, str]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": item.get("id") or f"call_{index + 1}",
+            "type": "function",
+            "function": {
+                "name": item.get("name") or "",
+                "arguments": item.get("arguments") or "{}",
+            },
+        }
+        for index, item in sorted(parts.items())
+    ]
+
+
+def _parse_native_tool_calls(raw_calls: Any) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    if not isinstance(raw_calls, list):
+        return calls
+    allowed = set(agent_runtime.tool_agent.registered_tools)
+    max_calls = max(1, _read_int_env("LLM_TOOL_PLANNER_MAX_CALLS", 3))
+    for index, raw in enumerate(raw_calls):
+        if not isinstance(raw, dict):
+            continue
+        function = raw.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip().lower().replace("-", "_")
+        if name not in allowed:
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                parsed_arguments = json.loads(arguments or "{}")
+            except json.JSONDecodeError:
+                parsed_arguments = {}
+        elif isinstance(arguments, dict):
+            parsed_arguments = arguments
+        else:
+            parsed_arguments = {}
+        if not isinstance(parsed_arguments, dict):
+            parsed_arguments = {}
+        call_id = str(raw.get("id") or f"call_{index + 1}")
+        calls.append(
+            {
+                "id": call_id,
+                "name": name,
+                "args": parsed_arguments,
+            }
+        )
+        if len(calls) >= max_calls:
+            break
+    return calls
 
 
 async def _iter_openai_sse(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
@@ -702,6 +1034,10 @@ def _text_chunks(text: str, size: int = 12) -> list[str]:
     return [text[i : i + size] for i in range(0, len(text), size)]
 
 
+def _stream_chunk_chars() -> int:
+    return min(32, max(1, _read_int_env("LLM_STREAM_CHUNK_CHARS", 1)))
+
+
 def _chat_completions_url(base_url: str) -> str:
     trimmed = base_url.rstrip("/")
     if trimmed.endswith("/chat/completions"):
@@ -712,8 +1048,13 @@ def _chat_completions_url(base_url: str) -> str:
 def _extract_upstream_error(response: httpx.Response) -> str:
     try:
         body = response.json()
+    except httpx.ResponseNotRead:
+        return f"Upstream returned HTTP {response.status_code}"
     except ValueError:
-        return response.text
+        try:
+            return response.text
+        except httpx.ResponseNotRead:
+            return f"Upstream returned HTTP {response.status_code}"
     if isinstance(body, Mapping):
         error = body.get("error")
         if isinstance(error, Mapping):
@@ -723,11 +1064,24 @@ def _extract_upstream_error(response: httpx.Response) -> str:
     return str(body)
 
 
+async def _raise_for_status_with_body(response: httpx.Response) -> None:
+    if response.is_error:
+        await response.aread()
+    response.raise_for_status()
+
+
 def _read_float_env(name: str, default: float) -> float:
     raw = os.getenv(name, "").strip()
     if not raw:
         return default
     return float(raw)
+
+
+def _read_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return int(raw)
 
 
 def _read_bool_env(name: str, default: bool) -> bool:
@@ -747,6 +1101,145 @@ def _model_to_dict(model: Any) -> dict[str, Any]:
     return model.dict()  # type: ignore[no-any-return, attr-defined]
 
 
+def _audit_request_input(request: LLMRequest) -> tuple[LLMRequest, SafetyDecision]:
+    user_index = next(
+        (
+            index
+            for index in range(len(request.messages) - 1, -1, -1)
+            if request.messages[index].role == MessageRole.USER
+        ),
+        None,
+    )
+    if user_index is None:
+        return request, safety_guard.audit_input("")
+    decision = safety_guard.audit_input(request.messages[user_index].content)
+    if decision.changed:
+        safety_guard.log(stage="input", decision=decision, request_id=request.request_id)
+    if decision.action != "mask":
+        return request, decision
+
+    messages = list(request.messages)
+    original = messages[user_index]
+    messages[user_index] = _copy_message_with_content(original, decision.content)
+    metadata = dict(request.metadata)
+    safety_metadata = metadata.get("safety")
+    if not isinstance(safety_metadata, dict):
+        safety_metadata = {}
+    safety_metadata["input"] = decision.metadata()
+    metadata["safety"] = safety_metadata
+    return _copy_llm_request(request, messages=messages, metadata=metadata), decision
+
+
+def _copy_message_with_content(message: Message, content: str) -> Message:
+    update = {"content": content}
+    if hasattr(message, "model_copy"):
+        return message.model_copy(update=update)
+    return message.copy(update=update)
+
+
+def _copy_llm_request(
+    request: LLMRequest,
+    *,
+    messages: list[Message],
+    metadata: dict[str, Any],
+) -> LLMRequest:
+    update = {"messages": messages, "metadata": metadata}
+    if hasattr(request, "model_copy"):
+        return request.model_copy(update=update)
+    return request.copy(update=update)
+
+
+def _blocked_input_response(request: LLMRequest, decision: SafetyDecision) -> LLMResponse:
+    return LLMResponse(
+        request_id=request.request_id,
+        text=decision.content,
+        finish_reason="safety",
+        usage=Usage(input_tokens=0, output_tokens=len(decision.content)),
+        metadata={
+            "provider": "local-safety",
+            "model": "deterministic-rules",
+            "safety": _safety_metadata(decision, safety_guard.audit_output(decision.content)),
+        },
+    )
+
+
+def _audit_final_output(text: str, *, request_id: str) -> tuple[str, SafetyDecision]:
+    decision = safety_guard.audit_output(text)
+    if decision.changed:
+        safety_guard.log(stage="output", decision=decision, request_id=request_id)
+    return decision.content, decision
+
+
+def _safety_metadata(input_decision: SafetyDecision, output_decision: SafetyDecision) -> dict[str, Any]:
+    return {
+        "engine": "local_rules",
+        "uses_review_model": False,
+        "input": input_decision.metadata(),
+        "output": output_decision.metadata(),
+    }
+
+
+def _response_with_safety_metadata(
+    response: LLMResponse,
+    *,
+    safe_text: str,
+    input_decision: SafetyDecision,
+    output_decision: SafetyDecision,
+) -> LLMResponse:
+    metadata = dict(response.metadata)
+    metadata["safety"] = _safety_metadata(input_decision, output_decision)
+    update = {
+        "text": safe_text,
+        "finish_reason": "safety" if output_decision.blocked else response.finish_reason,
+        "metadata": metadata,
+    }
+    if hasattr(response, "model_copy"):
+        return response.model_copy(update=update)
+    return response.copy(update=update)
+
+
+def _stream_event_with_text(event: StreamEvent, text: str) -> StreamEvent:
+    data = dict(event.data)
+    data["text"] = text
+    return _copy_stream_event(event, data=data)
+
+
+def _stream_text_event(
+    request: LLMRequest,
+    text: str,
+    *,
+    template: StreamEvent | None,
+) -> StreamEvent:
+    if template is not None:
+        return _stream_event_with_text(template, text)
+    return StreamEvent(
+        event=EventType.MESSAGE_DELTA,
+        request_id=request.request_id,
+        trace_id=request.trace_id,
+        session_id=request.session_id,
+        data={"text": text, "provider": "local-safety"},
+    )
+
+
+def _safety_delta_event(request: LLMRequest, text: str) -> StreamEvent:
+    return _stream_text_event(request, text, template=None)
+
+
+def _safety_done_event(request: LLMRequest, *, input_decision: SafetyDecision) -> StreamEvent:
+    output_decision = safety_guard.audit_output(input_decision.content)
+    return StreamEvent(
+        event=EventType.MESSAGE_DONE,
+        request_id=request.request_id,
+        trace_id=request.trace_id,
+        session_id=request.session_id,
+        data={
+            "message_id": request.request_id,
+            "finish_reason": "safety",
+            "safety": _safety_metadata(input_decision, output_decision),
+        },
+    )
+
+
 def _response_with_runtime_metadata(
     response: LLMResponse,
     turn: AgentTurn,
@@ -761,11 +1254,23 @@ def _response_with_runtime_metadata(
     return response.copy(update=update)
 
 
-async def _finalize_agent_response(turn: AgentTurn | None, response: LLMResponse) -> LLMResponse:
+async def _finalize_agent_response(
+    turn: AgentTurn | None,
+    response: LLMResponse,
+    *,
+    input_decision: SafetyDecision,
+) -> LLMResponse:
+    safe_text, output_decision = _audit_final_output(response.text, request_id=response.request_id)
+    safe_response = _response_with_safety_metadata(
+        response,
+        safe_text=safe_text,
+        input_decision=input_decision,
+        output_decision=output_decision,
+    )
     if turn is None:
-        return response
-    persistence = await agent_runtime.after_turn(turn, response.text)
-    return _response_with_runtime_metadata(response, turn, persistence)
+        return safe_response
+    persistence = await agent_runtime.after_turn(turn, safe_text)
+    return _response_with_runtime_metadata(safe_response, turn, persistence)
 
 
 def _copy_stream_event(event: StreamEvent, *, data: dict[str, Any]) -> StreamEvent:

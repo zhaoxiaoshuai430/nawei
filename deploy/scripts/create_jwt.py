@@ -37,7 +37,7 @@ def main() -> None:
     if audience:
         payload["aud"] = audience
 
-    header = {"alg": "HS256", "typ": "JWT"}
+    header: dict[str, object] = {"alg": "HS256", "typ": "JWT"}
     signing_input = b".".join((_encode_json(header), _encode_json(payload)))
     signature = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
     print(f"{signing_input.decode('ascii')}.{_base64url(signature)}")

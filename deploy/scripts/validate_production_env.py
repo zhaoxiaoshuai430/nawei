@@ -11,13 +11,22 @@ SECRET_KEYS = (
     "ASR_INTERNAL_API_KEY",
     "LLM_INTERNAL_API_KEY",
     "TTS_INTERNAL_API_KEY",
+    "TTS_ADMIN_API_KEY",
     "LLM_API_KEY",
     "POSTGRES_PASSWORD",
+    "QDRANT_API_KEY",
+    "NEO4J_PASSWORD",
+    "KNOWLEDGE_INTERNAL_API_KEY",
+    "KNOWLEDGE_ADMIN_API_KEY",
+    "EMBEDDING_API_KEY",
 )
 INTERNAL_KEYS = (
     "ASR_INTERNAL_API_KEY",
     "LLM_INTERNAL_API_KEY",
     "TTS_INTERNAL_API_KEY",
+    "TTS_ADMIN_API_KEY",
+    "KNOWLEDGE_INTERNAL_API_KEY",
+    "KNOWLEDGE_ADMIN_API_KEY",
 )
 SERVICE_URL_KEYS = (
     "GATEWAY_ASR_URL",
@@ -28,6 +37,8 @@ SERVICE_URL_KEYS = (
     "GATEWAY_TTS_STREAM_URL",
     "DATABASE_URL",
     "REDIS_URL",
+    "QDRANT_URL",
+    "NEO4J_URI",
 )
 
 
@@ -35,21 +46,27 @@ def validate_environment() -> list[str]:
     errors: list[str] = []
     _require_exact("NAWEI_ENV", "production", errors)
     _require_exact("GATEWAY_AUTH_MODE", "jwt", errors)
+    _require_exact("GATEWAY_ENABLE_DIAGNOSTICS", "false", errors)
     _require_exact("LLM_PROVIDER", "deepseek", errors)
     _require_exact("LLM_AGENT_ENABLED", "true", errors)
     _require_exact("MEMORY_ENABLED", "true", errors)
     _require_exact("LLM_MEMORY_REQUIRED", "true", errors)
+    _require_exact("KNOWLEDGE_ENABLED", "true", errors)
+    _require_exact("KNOWLEDGE_REQUIRED", "true", errors)
 
     for key in SECRET_KEYS:
         value = os.getenv(key, "")
         if not value or value.startswith("REPLACE_WITH_"):
             errors.append(f"{key} must be configured with a real value.")
-        elif key != "LLM_API_KEY" and len(value.encode("utf-8")) < 32:
+        elif key not in {"LLM_API_KEY", "EMBEDDING_API_KEY"} and len(value.encode("utf-8")) < 32:
             errors.append(f"{key} must contain at least 32 bytes.")
 
     internal_values = [os.getenv(key, "") for key in INTERNAL_KEYS]
     if len(set(internal_values)) != len(internal_values):
-        errors.append("ASR, LLM, and TTS internal API keys must be distinct.")
+        errors.append("Internal and administrative API keys must all be distinct.")
+
+    if os.getenv("EMBEDDING_PROVIDER", "").strip().lower() == "hash":
+        errors.append("EMBEDDING_PROVIDER must use a production embedding service, not hash.")
 
     for key in SERVICE_URL_KEYS:
         value = os.getenv(key, "")

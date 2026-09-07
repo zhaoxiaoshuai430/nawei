@@ -15,7 +15,7 @@ class RealtimeVadConfig:
     sample_rate: int = 16000
     frame_ms: int = 20
     start_ms: int = 60
-    end_silence_ms: int = 600
+    end_silence_ms: int = 420
     pre_roll_ms: int = 200
     min_speech_ms: int = 180
     max_segment_seconds: float = 20.0
@@ -27,7 +27,7 @@ class RealtimeVadConfig:
             sample_rate=int(os.getenv("ASR_REALTIME_SAMPLE_RATE", "16000")),
             frame_ms=int(os.getenv("ASR_REALTIME_FRAME_MS", "20")),
             start_ms=int(os.getenv("ASR_REALTIME_START_MS", "60")),
-            end_silence_ms=int(os.getenv("ASR_REALTIME_END_SILENCE_MS", "600")),
+            end_silence_ms=int(os.getenv("ASR_REALTIME_END_SILENCE_MS", "420")),
             pre_roll_ms=int(os.getenv("ASR_REALTIME_PRE_ROLL_MS", "200")),
             min_speech_ms=int(os.getenv("ASR_REALTIME_MIN_SPEECH_MS", "180")),
             max_segment_seconds=float(os.getenv("ASR_REALTIME_MAX_SEGMENT_SECONDS", "20")),

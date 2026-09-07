@@ -1,4 +1,4 @@
-# 京爷们 6 戏路 — nana instruct 训练用（推理时选戏路即 instruct）
+# 六种戏路 instruct 配置（推理时选戏路即 instruct）
 emotions:
   lao:
     label: 唠嗑

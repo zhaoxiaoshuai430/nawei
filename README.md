@@ -1,64 +1,227 @@
-# Nawei 四模块语音项目
+# Nawei Voice AI Project
 
-Nawei 对外保持 Gateway、ASR、LLM、TTS 四个业务板块。客户端统一访问 Gateway；Agent、Skills、Tools、Memory 和实际模型推理全部由 LLM 大板块管理。
+Nawei is a five-service voice AI system:
 
 ```text
-Client -> Gateway :8000
-           |-> ASR :8001
-           |-> LLM :8002
-           |     |-> Agent / Skills / Tools
-           |     |-> Redis / PostgreSQL Memory
-           |     `-> DeepSeek / Stub Inference
-           `-> TTS :19000
+Client -> Gateway -> ASR -> LLM -> TTS -> Gateway -> Client
 ```
 
-项目没有独立 Agent、Memory 或知识库服务。Redis 和 PostgreSQL 是 LLM 的私有基础设施；Gateway 不保存会话历史。项目不包含知识库或 Qdrant。
+The LLM service owns the internal Agent runtime, tools, and persistent memory.
+The current bundled TTS voice is `liliya`.
 
-## 服务
+## Project Layout
 
-| 服务 | 端口 | 职责 |
-|---|---:|---|
-| Gateway | 8000 | 公共 API、鉴权、并发控制、ASR/LLM/TTS 编排 |
-| ASR | 8001 | SenseVoice 音频识别和情绪标签 |
-| LLM | 8002 | Agent、Skills、Tools、Redis/PostgreSQL Memory、DeepSeek/Stub 推理与 SSE |
-| TTS | 19000 | Qwen3-TTS、Nana 音色和流式音频 |
+```text
+app_protocols/          Shared request, response, and streaming event models
+services/gateway/       Public HTTP/WebSocket gateway, port 8000
+services/asr/           SenseVoice speech recognition, port 8001
+services/llm/           DeepSeek, Agent, tools, and memory, port 8002
+services/knowledge/     Qdrant + Neo4j GraphRAG service, port 8003
+services/tts/           Qwen3-TTS with the Liliya voice, port 19000
+deploy/                 Production containers, Compose, and dependencies
+models/                 Git LFS model manifests and split model files
+scripts/                Start, stop, status, model restore, and project checks
+tests/                  Cross-service protocol and deployment regression tests
+```
 
-LLM 来源：`https://gitee.com/w3280306004/agent02/tree/master`，适配提交 `99fc166561aeea580b7beb0799d23865bef4829b`。
+## Requirements
 
-## 启动
+- Windows PowerShell
+- Python 3.11
+- Git LFS for bundled model files
+- Docker for local PostgreSQL/Redis/Qdrant/Neo4j infrastructure and production Compose
+- Service-specific ASR and TTS Python environments
 
-1. 安装 Git LFS，并在克隆后执行 `git lfs pull` 下载 ASR/TTS 模型权重。
-2. 从根目录 `.env.example` 创建本地 `.env` 并配置 LLM。
-3. 运行：
+Install the main application and development dependencies:
+
+```powershell
+cd D:\daima\nawei
+.\.venv\Scripts\python.exe -m pip install -r deploy\requirements-app.txt -r deploy\requirements-dev.txt
+```
+
+## Configuration
+
+Create the local environment file:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+The local file is ignored by Git. The DeepSeek configuration uses:
+
+```dotenv
+LLM_PROVIDER=deepseek
+LLM_API_BASE_URL=https://api.deepseek.com
+LLM_API_KEY=REPLACE_WITH_YOUR_DEEPSEEK_API_KEY
+LLM_MODEL=deepseek-v4-pro
+```
+
+Production configuration starts from `deploy/.env.production.example`.
+
+## Model Files
+
+Download Git LFS objects and restore split model files before starting services:
+
+```powershell
+git lfs pull
+.\.venv\Scripts\python.exe scripts\restore_models.py
+```
+
+The repository tracks the Liliya model split parts through Git LFS. The restored
+`models/tts/liliya/checkpoint-epoch-1/model.safetensors` file is intentionally
+ignored because it can be reconstructed from the validated parts in
+`models/manifest.json`.
+
+## Start Project
+
+The unified startup script restores models, starts PostgreSQL, Redis, Qdrant,
+and Neo4j, then starts ASR, Knowledge, LLM, TTS, and Gateway:
+
+Start Docker Desktop before running the script. If the Docker CLI is installed
+but its engine is unavailable, startup now stops with a direct diagnostic.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_project.ps1
 ```
 
-启动脚本会通过 Docker 启动 LLM 所需的 Redis/PostgreSQL，再启动四个业务进程。使用外部数据库时传入 `-SkipInfrastructure`。
-
-4. 客户端连接 Gateway；接口说明位于 `http://127.0.0.1:8000/docs`。
-
-状态和停止命令：
+Check or stop the running services:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\status_project.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop_project.ps1
 ```
 
-## 主要 API
+## Browser Test Page
 
-| API | 链路 |
+After Gateway starts in development mode, open the local end-to-end test console:
+
+```text
+http://127.0.0.1:8000/test
+```
+
+The page supports uploaded WAV/MP3 audio and realtime microphone conversation.
+Both modes play TTS chunks as soon as the first streaming audio block arrives.
+It displays Gateway dependency latency plus file-read, ASR, LLM, TTS, first-token,
+first-audio, recording, and total elapsed times. Microphone access works on
+`localhost` or HTTPS origins.
+
+`GATEWAY_ENABLE_DIAGNOSTICS=true` enables `/test`, `/docs`, `/redoc`, and
+`/openapi.json` during development. These routes are always disabled when
+`NAWEI_ENV=production`.
+
+Use `-SkipInfrastructure` only when externally managed PostgreSQL, Redis,
+Qdrant, and Neo4j instances are already configured.
+
+## Manual Start
+
+Run each service in a separate terminal.
+
+ASR:
+
+```powershell
+cd D:\daima\nawei\services\asr
+.\.venv\Scripts\python.exe src\main.py
+```
+
+LLM:
+
+```powershell
+cd D:\daima\nawei
+.\.venv\Scripts\python.exe -m services.llm.run
+```
+
+Knowledge GraphRAG:
+
+```powershell
+cd D:\daima\nawei
+.\.venv\Scripts\python.exe -m services.knowledge.run
+```
+
+TTS:
+
+```powershell
+cd D:\daima\nawei\services\tts
+$env:TTS_SKIP_PRESET_FETCH="1"
+.\cuda_env\Scripts\python.exe -m app.services.tts.server --model voice_lab/liliya --port 19000
+```
+
+Gateway:
+
+```powershell
+cd D:\daima\nawei
+.\.venv\Scripts\python.exe -m services.gateway.run
+```
+
+## Ports
+
+| Port | Service | Purpose |
+|---:|---|---|
+| 8000 | Gateway | Public API and orchestration |
+| 8001 | ASR | Speech recognition |
+| 8002 | LLM | DeepSeek, Agent, tools, and memory |
+| 8003 | Knowledge | Qdrant vector retrieval and Neo4j graph expansion |
+| 19000 | TTS | Liliya speech synthesis |
+| 5432 | PostgreSQL | Persistent LLM memory |
+| 6379 | Redis | Session and profile cache |
+| 6333 | Qdrant | Knowledge chunk vectors and payloads |
+| 7474/7687 | Neo4j | Browser and Bolt knowledge graph access |
+
+## Gateway APIs
+
+| API | Purpose |
 |---|---|
-| `GET /health` | Gateway |
-| `GET /api/v1/status` | Gateway 检查 ASR、LLM、TTS |
-| `POST /api/v1/audio/transcriptions/base64` | Gateway -> ASR |
-| `POST /api/v1/text/completions` | Gateway -> LLM |
-| `POST /api/v1/text/speech-completions` | Gateway -> LLM -> TTS |
-| `POST /api/v1/audio/speech` | Gateway -> TTS |
-| `POST /api/v1/audio/speech/stream` | Gateway -> TTS SSE |
-| `WS /api/v1/voice/realtime` | Gateway -> PCM realtime ASR -> LLM SSE -> optional TTS |
+| `GET /health` | Gateway process health |
+| `GET /api/v1/status` | Dependency and concurrency status |
+| `GET /api/v1/status/details` | Authenticated detailed dependency status (`X-User-ID` locally) |
+| `POST /api/v1/audio/transcriptions/base64` | ASR through Gateway |
+| `POST /api/v1/text/completions` | LLM text completion |
+| `POST /api/v1/text/speech-completions` | LLM response with synthesized audio |
+| `POST /api/v1/audio/speech` | TTS through Gateway |
+| `POST /api/v1/audio/speech/stream` | Streaming TTS through Gateway |
+| `WS /api/v1/voice/realtime` | Realtime ASR, LLM, and optional TTS |
 
-语音助手只开放实时语音入口。整段音频上传的 `/api/v1/voice/completions` 及其流式变体已移除；ASR、LLM 和 TTS 的独立 HTTP 接口仅用于文本交互、模块调用与诊断。
+## Standalone APIs
 
-生产部署使用 [deploy/docker-compose.production.yml](deploy/docker-compose.production.yml)，其中 Redis/PostgreSQL 仅在内部网络供 LLM 使用。
+| Service | Health | Main API |
+|---|---|---|
+| ASR | `GET http://127.0.0.1:8001/health` | `POST /api/v1/audio/transcriptions/base64` |
+| LLM | `GET http://127.0.0.1:8002/health` | `POST /api/v1/llm` |
+| Knowledge | `GET http://127.0.0.1:8003/health` | `POST /api/v1/knowledge/retrieve` |
+| TTS | `GET http://127.0.0.1:19000/api/v1/status` | `POST /api/v1/audio/speech` |
+
+Internal service APIs require their configured internal API keys when security
+is enabled.
+
+## Project Checks
+
+Run all locally available checks:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check_project.ps1
+```
+
+The script runs Python compilation, Ruff, Mypy, main tests, tracked-secret
+scanning, ASR tests, TTS tests, PowerShell parsing, and Docker Compose
+validation. When all four services are running, include health checks with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check_project.ps1 -Live
+```
+
+Run only the fast main test suite:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+## Production Compose
+
+Validate the production configuration:
+
+```powershell
+$env:NAWEI_ENV_FILE=".env.production.example"
+docker compose --env-file deploy\.env.production.example -f deploy\docker-compose.production.yml config --quiet
+```
+
+Create a real `deploy/.env.production` with distinct production secrets before
+starting the production stack.

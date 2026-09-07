@@ -74,10 +74,21 @@ class DictionaryTool:
         word = word.strip().lower()
         if not re.fullmatch(r"[a-z][a-z\-']{1,40}", word):
             raise ValueError("Only English words are supported")
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.get(DICTIONARY_URL_TEMPLATE.format(word=quote(word)))
-            response.raise_for_status()
-            body = response.json()
+        request_url = DICTIONARY_URL_TEMPLATE.format(word=quote(word))
+        attempt_timeout = min(self.timeout_seconds, 2.5)
+        last_error: httpx.TransportError | None = None
+        for _attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=attempt_timeout) as client:
+                    response = await client.get(request_url)
+                    response.raise_for_status()
+                    body = response.json()
+                break
+            except httpx.TransportError as exc:
+                last_error = exc
+        else:
+            assert last_error is not None
+            raise last_error
         return _parse_dictionary_body(word=word, body=body)
 
 

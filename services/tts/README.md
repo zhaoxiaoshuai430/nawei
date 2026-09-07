@@ -1,6 +1,6 @@
 # TTS Service
 
-Standalone Qwen3 TTS service for the `nana` voice. In the integrated project, Gateway calls this service through the standard `TTSRequest` / `TTSResponse` JSON protocol.
+Standalone Qwen3 TTS service for the `liliya` voice. In the integrated project, Gateway calls this service through the standard `TTSRequest` / `TTSResponse` JSON protocol.
 
 ## Runtime
 
@@ -9,15 +9,25 @@ Standalone Qwen3 TTS service for the `nana` voice. In the integrated project, Ga
 | Path | `./services/tts` |
 | Default port | `19000` |
 | App entry | `app.services.tts.server` |
-| Default model | `voice_lab/nana` |
+| Default model | `voice_lab/liliya` |
 | Python environment | `cuda_env` |
+
+## Install
+
+The local environment reuses the production dependency set and adds the
+matching PyTorch runtime:
+
+```powershell
+cd .\services\tts
+.\cuda_env\Scripts\python.exe -m pip install -r requirements-tts.txt
+```
 
 ## Start
 
 ```powershell
 cd .\services\tts
 $env:TTS_SKIP_PRESET_FETCH="1"
-.\cuda_env\Scripts\python.exe -m app.services.tts.server --model voice_lab/nana --port 19000
+.\cuda_env\Scripts\python.exe -m app.services.tts.server --model voice_lab/liliya --port 19000
 ```
 
 Health check:
@@ -61,7 +71,7 @@ Request body:
   "stream": false,
   "voice": {
     "mode": "custom",
-    "speaker_id": "nana",
+    "speaker_id": "liliya",
     "language": "Chinese",
     "instruct": ""
   },
@@ -92,7 +102,7 @@ Response body:
   "metadata": {
     "provider": "http-tts",
     "tts_mode": "custom",
-    "speaker": "nana",
+    "speaker": "liliya",
     "language": "Chinese"
   }
 }

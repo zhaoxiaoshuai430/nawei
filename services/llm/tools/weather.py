@@ -89,7 +89,7 @@ KNOWN_CITIES = (
     "旧金山",
     "新加坡",
 )
-CITY_COORDINATES = {
+CITY_COORDINATES: dict[str, dict[str, str | float]] = {
     "北京": {"name": "北京", "country": "中国", "latitude": 39.9075, "longitude": 116.39723},
     "上海": {"name": "上海", "country": "中国", "latitude": 31.22222, "longitude": 121.45806},
     "广州": {"name": "广州", "country": "中国", "latitude": 23.11667, "longitude": 113.25},
@@ -936,8 +936,13 @@ def _max_hourly_chance_of_rain(daily: dict[str, Any]) -> int | None:
     hourly = daily.get("hourly")
     if not isinstance(hourly, list):
         return None
-    values = [_int_or_none(item.get("chanceofrain")) for item in hourly if isinstance(item, dict)]
-    values = [value for value in values if value is not None]
+    values: list[int] = []
+    for item in hourly:
+        if not isinstance(item, dict):
+            continue
+        value = _int_or_none(item.get("chanceofrain"))
+        if value is not None:
+            values.append(value)
     return max(values) if values else None
 
 

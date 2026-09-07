@@ -11,21 +11,13 @@ _EPOCH_RE = re.compile(r"checkpoint-epoch-(\d+)", re.I)
 
 
 def voice_lab_model_id(speaker: str | None = None) -> str:
-    name = (speaker or VOICE_LAB_SPEAKER).strip() or "nana"
+    name = (speaker or VOICE_LAB_SPEAKER).strip() or VOICE_LAB_SPEAKER
     return f"voice_lab/{name}"
 
 
 def is_voice_lab_model(model_id: str) -> bool:
     return (model_id or "").startswith("voice_lab/")
 
-
-def is_custom_voice_capable(model_id: str | None) -> bool:
-    """True for HF CustomVoice or a local voice_lab fine-tuned checkpoint."""
-    if not model_id:
-        return False
-    if is_voice_lab_model(model_id):
-        return True
-    return "CustomVoice" in model_id
 
 
 def voice_lab_speaker_from_model_id(model_id: str) -> str:
@@ -76,7 +68,7 @@ def list_trained_speakers() -> list[str]:
 
 def find_latest_checkpoint(speaker: str | None = None) -> Path | None:
     """Return newest checkpoint dir for a speaker."""
-    spk = (speaker or VOICE_LAB_SPEAKER).strip() or "nana"
+    spk = (speaker or VOICE_LAB_SPEAKER).strip() or VOICE_LAB_SPEAKER
     explicit = (os.environ.get("VOICE_LAB_CHECKPOINT") or "").strip()
     if explicit:
         p = Path(explicit)
@@ -120,7 +112,7 @@ def voice_lab_status() -> dict:
         "speaker": active,
         "speakers": speakers,
         "model_id": model_id,
-        "checkpoint": str(ckpt) if ckpt else None,
+        "checkpoint": ckpt.name if ckpt else None,
         "ready": ckpt is not None,
         "dir": str(VOICE_LAB_DIR.relative_to(REPO_ROOT)) if VOICE_LAB_DIR.exists() else "voice_lab",
     }

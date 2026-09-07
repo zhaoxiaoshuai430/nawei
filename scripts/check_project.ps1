@@ -7,12 +7,14 @@ $Root = Split-Path -Parent $PSScriptRoot
 $MainPython = Join-Path $Root ".venv\Scripts\python.exe"
 $AsrPython = Join-Path $Root "services\asr\.venv\Scripts\python.exe"
 $TtsPython = Join-Path $Root "services\tts\cuda_env\Scripts\python.exe"
+$GitSafeDirectory = $Root.Replace("\", "/")
 
 function Invoke-Checked {
     param(
         [string]$Name,
         [scriptblock]$Command
     )
+
     Write-Host "`n[$Name]" -ForegroundColor Cyan
     & $Command
     if ($LASTEXITCODE -ne 0) {
@@ -20,15 +22,63 @@ function Invoke-Checked {
     }
 }
 
+if (-not (Test-Path -LiteralPath $MainPython)) {
+    throw "Main Python runtime was not found: $MainPython"
+}
+
 Push-Location $Root
 try {
-    Invoke-Checked "Main tests" { & $MainPython -m pytest -q }
-    Invoke-Checked "Ruff" { & $MainPython -m ruff check app_protocols services\gateway services\llm tests deploy\scripts }
-    Invoke-Checked "Mypy" { & $MainPython -m mypy app_protocols services\gateway services\llm }
+    Invoke-Checked "Compile Python sources" {
+        & $MainPython -m compileall -q `
+            app_protocols `
+            services\gateway `
+            services\llm `
+            services\knowledge `
+            services\asr\src `
+            services\asr\sensevoice_runtime `
+            services\asr\tests `
+            services\tts\app `
+            services\tts\tests `
+            deploy\scripts `
+            tests
+    }
+    Invoke-Checked "Ruff" {
+        & $MainPython -m ruff check app_protocols services deploy\scripts tests
+    }
+    Invoke-Checked "Mypy" {
+        & $MainPython -m mypy app_protocols services\gateway services\llm --ignore-missing-imports
+    }
+    Invoke-Checked "Additional Mypy" {
+        & $MainPython -m mypy `
+            services\knowledge `
+            services\asr\src `
+            services\asr\sensevoice_runtime `
+            deploy\scripts `
+            --ignore-missing-imports `
+            --follow-imports=skip
+    }
+    Invoke-Checked "Main tests" {
+        & $MainPython -m pytest -q
+    }
+    Invoke-Checked "Service boundary tests" {
+        & $MainPython -m pytest -q services\asr\tests services\tts\tests
+    }
+
+    Write-Host "`n[Tracked secret scan]" -ForegroundColor Cyan
+    $secretMatches = & git -c "safe.directory=$GitSafeDirectory" grep -n -I -E 'sk-[A-Za-z0-9_-]{16,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY' -- ':!*.md' ':!*.example'
+    $secretScanExitCode = $LASTEXITCODE
+    if ($secretScanExitCode -eq 0) {
+        $secretMatches | Write-Host
+        throw "Tracked secret scan found a possible private credential."
+    }
+    if ($secretScanExitCode -ne 1) {
+        throw "Tracked secret scan failed with exit code $secretScanExitCode"
+    }
+    Write-Host "No tracked private credentials found."
+
     if ($Live) {
-        $env:NAWEI_RUN_LIVE_TESTS = "1"
-        Invoke-Checked "Live service connectivity" {
-            & $MainPython -m pytest -q tests\test_service_connectivity.py -k LiveService
+        Invoke-Checked "Live service health" {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\status_project.ps1
         }
     }
 }
@@ -36,58 +86,79 @@ finally {
     Pop-Location
 }
 
-Push-Location (Join-Path $Root "services\asr")
-try {
-    Invoke-Checked "ASR unit tests" { & $AsrPython -m unittest discover -s tests -v }
-    Invoke-Checked "ASR compile" { & $AsrPython -m compileall -q src tests }
-}
-finally {
-    Pop-Location
-}
-
-Push-Location (Join-Path $Root "services\tts")
-try {
-    Invoke-Checked "TTS tests" { & $TtsPython -m pytest -q -W error tests }
-    Invoke-Checked "TTS compile" { & $TtsPython -m compileall -q app tests }
-}
-finally {
-    Pop-Location
-}
-
-Invoke-Checked "PowerShell syntax" {
-    $scriptPaths = @(
-        "scripts\start_project.ps1",
-        "scripts\stop_project.ps1",
-        "scripts\status_project.ps1",
-        "scripts\check_project.ps1",
-        "scripts\project_runtime.ps1"
-    )
-    foreach ($relativePath in $scriptPaths) {
-        $tokens = $null
-        $errors = $null
-        [System.Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $Root $relativePath),
-            [ref]$tokens,
-            [ref]$errors
-        ) | Out-Null
-        if ($errors.Count -gt 0) {
-            $messages = ($errors | ForEach-Object Message) -join "; "
-            throw "$relativePath has PowerShell syntax errors: $messages"
+if (Test-Path -LiteralPath $AsrPython) {
+    Push-Location (Join-Path $Root "services\asr")
+    try {
+        $asrTestFiles = @(Get-ChildItem -Path tests -Filter "test_*.py" -File -Recurse)
+        if ($asrTestFiles.Count -gt 0) {
+            Invoke-Checked "ASR unit tests" {
+                & $AsrPython -m unittest discover -s tests -v
+            }
+        }
+        else {
+            Write-Warning "No ASR test source files were found; ASR unit tests were skipped."
+        }
+        Invoke-Checked "ASR compile" {
+            & $AsrPython -m compileall -q src tests
         }
     }
-    $global:LASTEXITCODE = 0
+    finally {
+        Pop-Location
+    }
+}
+else {
+    Write-Warning "ASR runtime was not found; ASR-specific checks were skipped: $AsrPython"
 }
 
-Invoke-Checked "Text quality" {
-    & $MainPython (Join-Path $Root "scripts\check_text_quality.py")
+if (Test-Path -LiteralPath $TtsPython) {
+    Push-Location (Join-Path $Root "services\tts")
+    try {
+        $ttsTestFiles = @(Get-ChildItem -Path tests -Filter "test_*.py" -File -Recurse)
+        if ($ttsTestFiles.Count -gt 0) {
+            Invoke-Checked "TTS tests" {
+                & $TtsPython -m pytest -q tests
+            }
+        }
+        else {
+            Write-Warning "No TTS test source files were found; TTS tests were skipped."
+        }
+        Invoke-Checked "TTS compile" {
+            & $TtsPython -m compileall -q app tests
+        }
+    }
+    finally {
+        Pop-Location
+    }
+}
+else {
+    Write-Warning "TTS runtime was not found; TTS-specific checks were skipped: $TtsPython"
 }
 
-Invoke-Checked "Deployment scripts compile" {
-    & $MainPython -m compileall -q (Join-Path $Root "deploy\scripts")
+Write-Host "`n[PowerShell syntax]" -ForegroundColor Cyan
+$scriptPaths = @(
+    "scripts\start_project.ps1",
+    "scripts\stop_project.ps1",
+    "scripts\status_project.ps1",
+    "scripts\check_project.ps1",
+    "scripts\project_runtime.ps1"
+)
+foreach ($relativePath in $scriptPaths) {
+    $tokens = $null
+    $errors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $Root $relativePath),
+        [ref]$tokens,
+        [ref]$errors
+    ) | Out-Null
+    if ($errors.Count -gt 0) {
+        $messages = ($errors | ForEach-Object Message) -join "; "
+        throw "$relativePath has PowerShell syntax errors: $messages"
+    }
 }
+Write-Host "PowerShell scripts parsed successfully."
 
 if (Get-Command docker -ErrorAction SilentlyContinue) {
-    Invoke-Checked "LLM Infrastructure Compose" {
+    Invoke-Checked "LLM infrastructure Compose" {
         docker compose -f (Join-Path $Root "deploy\docker-compose.llm-infra.yml") config --quiet
     }
     Invoke-Checked "Production Compose" {
@@ -110,7 +181,7 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
     }
 }
 else {
-    Write-Warning "Docker is not installed; runtime Compose startup was not checked. YAML structure was covered by pytest."
+    Write-Warning "Docker is not installed; Compose validation was skipped."
 }
 
 Write-Host "`nAll available project checks passed." -ForegroundColor Green

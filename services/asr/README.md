@@ -159,11 +159,11 @@ not advertised.
 | `ASR_QUEUE_TIMEOUT_SECONDS` | `30` | Maximum time a request waits for an inference slot |
 | `ASR_REALTIME_RMS_THRESHOLD` | `500` | PCM16 RMS threshold used to classify a 20 ms frame as voiced |
 | `ASR_REALTIME_START_MS` | `60` | Consecutive voiced duration required to start an utterance |
-| `ASR_REALTIME_END_SILENCE_MS` | `600` | Silence duration that finalizes an utterance |
+| `ASR_REALTIME_END_SILENCE_MS` | `420` | Silence duration that finalizes an utterance |
 | `ASR_REALTIME_PRE_ROLL_MS` | `200` | Audio retained before the detected speech start |
 | `ASR_REALTIME_MIN_SPEECH_MS` | `180` | Minimum finalized segment duration |
 | `ASR_REALTIME_MAX_SEGMENT_SECONDS` | `20` | Maximum duration before a segment is forcibly finalized |
-| `ASR_REALTIME_MAX_SESSION_SECONDS` | `120` | Maximum PCM duration accepted by one WebSocket session |
+| `ASR_REALTIME_MAX_SESSION_SECONDS` | `3600` | Maximum PCM duration accepted by one WebSocket session; raise it for longer continuous dictation |
 | `ASR_REALTIME_SEGMENT_QUEUE_SIZE` | `4` | Completed utterances buffered while inference is busy |
 
 The service sets ModelScope and HuggingFace cache variables to project-local paths under `hf_download` so it does not write to the Windows user cache directory. Complete local snapshots are preferred automatically, and routine FunASR/ModelScope update checks are disabled during service startup.

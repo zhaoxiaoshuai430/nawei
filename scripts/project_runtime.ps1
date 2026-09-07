@@ -21,6 +21,7 @@ function Get-NaweiServiceDefinitions {
                 ASR_MODEL_ID = "iic/SenseVoiceSmall"
                 ASR_MODEL_PATH = Join-Path $script:NaweiModelRoot "asr\SenseVoiceSmall"
                 ASR_VAD_MODEL_PATH = Join-Path $script:NaweiModelRoot "asr\fsmn-vad"
+                ASR_REALTIME_END_SILENCE_MS = "420"
                 MODELSCOPE_CACHE = Join-Path $script:NaweiProjectRoot "services\asr\hf_download\modelscope"
                 MODELSCOPE_HOME = Join-Path $script:NaweiProjectRoot "services\asr\hf_download\modelscope"
                 HF_HOME = Join-Path $script:NaweiProjectRoot "services\asr\hf_download\huggingface"
@@ -31,7 +32,7 @@ function Get-NaweiServiceDefinitions {
             Port = 19000
             HealthUrl = "http://127.0.0.1:19000/api/v1/status"
             FilePath = Join-Path $script:NaweiProjectRoot "services\tts\cuda_env\Scripts\python.exe"
-            Arguments = @("-m", "app.services.tts.server", "--model", "voice_lab/nana", "--port", "19000")
+            Arguments = @("-m", "app.services.tts.server", "--port", "19000")
             WorkingDirectory = Join-Path $script:NaweiProjectRoot "services\tts"
             Environment = @{
                 PYTHONUNBUFFERED = "1"
@@ -40,13 +41,25 @@ function Get-NaweiServiceDefinitions {
             }
         }
         [pscustomobject]@{
+            Name = "knowledge"
+            Port = 8003
+            HealthUrl = "http://127.0.0.1:8003/health"
+            FilePath = $mainPython
+            Arguments = @("-m", "services.knowledge.run")
+            WorkingDirectory = $mainDirectory
+            Environment = @{ PYTHONUNBUFFERED = "1" }
+        }
+        [pscustomobject]@{
             Name = "llm"
             Port = 8002
             HealthUrl = "http://127.0.0.1:8002/health"
             FilePath = $mainPython
             Arguments = @("-m", "services.llm.run")
             WorkingDirectory = $mainDirectory
-            Environment = @{ PYTHONUNBUFFERED = "1" }
+            Environment = @{
+                PYTHONUNBUFFERED = "1"
+                LLM_TIMEOUT_SECONDS = "25"
+            }
         }
         [pscustomobject]@{
             Name = "gateway"

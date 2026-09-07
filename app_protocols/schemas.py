@@ -239,7 +239,7 @@ class LLMResponse(ProtocolModel):
     text: str
     finish_reason: str = "stop"
     tool_calls: List[ToolCall] = Field(default_factory=list)
-    usage: Usage = Field(default_factory=Usage)
+    usage: Usage = Field(default_factory=lambda: Usage(input_tokens=0, output_tokens=0))
     metadata: Metadata = Field(default_factory=metadata_field)
 
 
@@ -252,7 +252,9 @@ class TTSRequest(ProtocolModel):
     text: str = Field(..., min_length=1, max_length=MAX_TTS_TEXT_CHARS)
     stream: bool = True
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
-    audio_config: AudioConfig = Field(default_factory=AudioConfig)
+    audio_config: AudioConfig = Field(
+        default_factory=lambda: AudioConfig(format=AudioFormat.WAV, sample_rate=24000, channels=1)
+    )
     metadata: Metadata = Field(default_factory=metadata_field)
 
 
@@ -291,7 +293,9 @@ class ChatCompletionRequest(ProtocolModel):
     stream: bool = True
     output_audio: bool = False
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
-    audio_config: AudioConfig = Field(default_factory=AudioConfig)
+    audio_config: AudioConfig = Field(
+        default_factory=lambda: AudioConfig(format=AudioFormat.WAV, sample_rate=24000, channels=1)
+    )
     metadata: Metadata = Field(default_factory=metadata_field)
 
 
@@ -306,7 +310,7 @@ class ChatCompletionResponse(ProtocolModel):
     duration_ms: Optional[int] = Field(None, ge=0)
     format: AudioFormat = AudioFormat.WAV
     sample_rate: int = Field(24000, gt=0)
-    usage: Usage = Field(default_factory=Usage)
+    usage: Usage = Field(default_factory=lambda: Usage(input_tokens=0, output_tokens=0))
     metadata: Metadata = Field(default_factory=metadata_field)
 
 
@@ -319,7 +323,9 @@ class StreamChatRequest(ProtocolModel):
     message: Message
     output_audio: bool = False
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
-    audio_config: AudioConfig = Field(default_factory=AudioConfig)
+    audio_config: AudioConfig = Field(
+        default_factory=lambda: AudioConfig(format=AudioFormat.WAV, sample_rate=24000, channels=1)
+    )
 
 
 class RealtimeAudioChunk(ProtocolModel):

@@ -63,7 +63,7 @@ class MessageDoneData(ProtocolModel):
 
     message_id: str
     finish_reason: str = "stop"
-    usage: Usage = Field(default_factory=Usage)
+    usage: Usage = Field(default_factory=lambda: Usage(input_tokens=0, output_tokens=0))
 
 
 class ErrorEventData(ProtocolModel):

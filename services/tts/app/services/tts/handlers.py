@@ -1,8 +1,9 @@
-"""TTS generation handlers for prewarm, streaming, and standard responses."""
+"""TTS generation handlers for streaming and standard responses."""
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
@@ -16,10 +17,12 @@ from app.services.tts import state
 from app.services.tts import emotion_refs
 from app.services.tts.capacity import CapacityRejected
 from app.services.tts.presets import preset_refs
-from app.services.tts.warmup import warm_voice_clone_cache
-from app.services.tts.streaming import stream_chunk_metrics
+from app.services.tts.streaming import real_time_factor, stream_chunk_metrics
 from app.utils.audio import concat_audio, encode_audio_b64
 from app.utils.cache import get_cached_ref_path
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -27,6 +30,15 @@ class RefAudioContext:
     path: str | None
     is_cached: bool
     ref_text: str
+
+
+async def run_blocking_until_complete(function, /, *args, **kwargs):
+    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        await worker
+        raise
 
 
 async def _acquire_generation_capacity():
@@ -96,92 +108,6 @@ def cleanup_ref_path(path: str | None, is_cached: bool) -> None:
         os.unlink(path)
 
 
-async def prewarm_clone(
-    *,
-    ref_text: str,
-    xvec_only: bool,
-    ref_preset: str,
-    ref_audio: UploadFile | None,
-) -> dict:
-    require_model_loaded()
-    if "Base" not in state.active_model_name:
-        return {"status": "skipped", "reason": "not a Base clone model"}
-
-    ctx = await resolve_ref_audio(
-        ref_preset=ref_preset,
-        ref_audio=ref_audio,
-        ref_text=ref_text,
-        required=True,
-    )
-    if not xvec_only and not ctx.ref_text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Advanced (ICL) mode requires reference transcript.",
-        )
-
-    model = state.model_cache[state.active_model_name]
-
-    def _do_warm():
-        warm_voice_clone_cache(
-            model,
-            ref_audio=ctx.path,
-            ref_text=ctx.ref_text,
-            xvec_only=xvec_only,
-        )
-
-    lease = await _acquire_generation_capacity()
-    try:
-        async with lease:
-            await asyncio.to_thread(_do_warm)
-    finally:
-        cleanup_ref_path(ctx.path, ctx.is_cached)
-
-    return {"status": "warmed", "xvec_only": xvec_only, "ref_preset": ref_preset or None}
-
-
-async def prewarm_emotion_clone(
-    *,
-    emotion_tag: str = "",
-    ref_id: str = "",
-    xvec_only: bool = False,
-) -> dict:
-    """Prewarm an emotion-tagged reference clip for clone tone switching."""
-    require_model_loaded()
-    if "Base" not in state.active_model_name:
-        return {"status": "skipped", "reason": "not a Base clone model"}
-    if not emotion_refs.emotion_refs_enabled():
-        raise HTTPException(status_code=400, detail="情绪参考库未就绪，请先放入 assets/emotion_refs/*.wav")
-
-    resolved_id = (ref_id or "").strip()
-    if not resolved_id:
-        resolved_id = emotion_refs.resolve_asr_to_emotion_ref(emotion_tag) or ""
-    if not resolved_id or resolved_id not in emotion_refs.emotion_refs:
-        raise HTTPException(status_code=404, detail="未找到对应的情绪参考片段")
-
-    preset = emotion_refs.emotion_refs[resolved_id]
-    if not xvec_only and not preset["ref_text"].strip():
-        raise HTTPException(status_code=400, detail="Advanced (ICL) mode requires reference transcript.")
-
-    model = state.model_cache[state.active_model_name]
-
-    def _do_warm():
-        emotion_refs.prewarm_emotion_ref_sync(
-            model,
-            ref_id=resolved_id,
-            xvec_only=xvec_only,
-        )
-
-    lease = await _acquire_generation_capacity()
-    async with lease:
-        await asyncio.to_thread(_do_warm)
-    return {
-        "status": "warmed",
-        "ref_id": resolved_id,
-        "label": preset["label"],
-        "tone": preset.get("tone", preset["label"]),
-        "xvec_only": xvec_only,
-    }
-
 
 async def generate_stream(
     *,
@@ -204,7 +130,7 @@ async def generate_stream(
 ) -> StreamingResponse:
     require_model_loaded()
     require_text_length(text)
-    print(f"Text Length：{len(text)}")
+    logger.info("Starting streaming TTS generation for %s characters", len(text))
 
     ctx = await resolve_ref_audio(
         ref_preset=ref_preset,
@@ -295,7 +221,7 @@ async def generate_stream(
                 audio_chunk = concat_audio(audio_chunk)
                 dur = len(audio_chunk) / sr
                 total_audio_s += dur
-                rtf = total_audio_s / (total_gen_ms / 1000) if total_gen_ms > 0 else 0.0
+                rtf = real_time_factor(generation_ms=total_gen_ms, audio_seconds=total_audio_s)
 
                 payload = {
                     "type": "chunk",
@@ -324,7 +250,7 @@ async def generate_stream(
                 audio_chunk = concat_audio(audio_chunk)
                 dur = len(audio_chunk) / sr
                 total_audio_s += dur
-                rtf = total_audio_s / (total_gen_ms / 1000) if total_gen_ms > 0 else 0.0
+                rtf = real_time_factor(generation_ms=total_gen_ms, audio_seconds=total_audio_s)
                 payload = {
                     "type": "chunk",
                     "audio_b64": encode_audio_b64(
@@ -346,7 +272,7 @@ async def generate_stream(
                 put_stream_message(json.dumps(payload))
 
             if not stop_requested.is_set():
-                rtf = total_audio_s / (total_gen_ms / 1000) if total_gen_ms > 0 else 0.0
+                rtf = real_time_factor(generation_ms=total_gen_ms, audio_seconds=total_audio_s)
                 done_payload = {
                     "type": "done",
                     "ttfa_ms": round(ttfa_ms) if ttfa_ms else 0,
@@ -357,11 +283,9 @@ async def generate_stream(
                 }
                 put_stream_message(json.dumps(done_payload))
 
-        except Exception as e:
-            import traceback
-
-            traceback.print_exc()
-            err = {"type": "error", "message": str(e)}
+        except Exception as exc:
+            logger.exception("Streaming TTS generation failed")
+            err = {"type": "error", "message": str(exc)}
             try:
                 put_stream_message(json.dumps(err), required=False)
             except RuntimeError:
@@ -403,7 +327,7 @@ async def generate_stream(
         finally:
             stop_requested.set()
             if worker is not None and worker.is_alive():
-                await asyncio.to_thread(worker.join)
+                await run_blocking_until_complete(worker.join)
             if lease is not None:
                 await lease.release()
             elif acquire_task.done() and not acquire_task.cancelled():
@@ -441,7 +365,7 @@ async def generate_non_streaming(
 ) -> JSONResponse:
     require_model_loaded()
     require_text_length(text)
-    print(f"Text Length：{len(text)}")
+    logger.info("Starting non-streaming TTS generation for %s characters", len(text))
 
     ctx = await resolve_ref_audio(
         ref_preset=ref_preset,
@@ -499,16 +423,18 @@ async def generate_non_streaming(
     lease = await _acquire_generation_capacity()
     try:
         async with lease:
-            audio, sr, elapsed, dur = await asyncio.to_thread(run)
-        rtf = dur / elapsed if elapsed > 0 else 0.0
+            audio, sr, elapsed, dur = await run_blocking_until_complete(run)
+        rtf = real_time_factor(generation_ms=elapsed * 1000, audio_seconds=dur)
+        audio_b64 = await run_blocking_until_complete(
+            encode_audio_b64,
+            audio,
+            sr,
+            output_format=audio_format,
+            target_sr=sample_rate,
+            channels=channels,
+        )
         return JSONResponse({
-            "audio_b64": encode_audio_b64(
-                audio,
-                sr,
-                output_format=audio_format,
-                target_sr=sample_rate,
-                channels=channels,
-            ),
+            "audio_b64": audio_b64,
             "format": audio_format,
             "sample_rate": sample_rate,
             "channels": channels,

@@ -1,0 +1,148 @@
+{
+  "knowledge_base_id": "default",
+  "title": "三角函数基础知识包",
+  "source_name": "教育部课程标准与权威开放教材",
+  "metadata": {
+    "subject": "数学",
+    "domain": "三角学",
+    "version": "1.0.0",
+    "source_type": "authoritative_educational_sources"
+  },
+  "chunks": [
+    {
+      "chunk_key": "trigonometry-overview",
+      "text": "知识点：三角函数。三角函数是研究角与边长比例、以及角与单位圆坐标之间关系的一类函数。它属于数学中的三角学，并与几何、函数、周期变化等内容相关。初学时通常先从直角三角形中的正弦、余弦和正切开始。",
+      "source_name": "中华人民共和国教育部《普通高中数学课程标准（2017年版2020年修订）》",
+      "source_url": "https://www.pep.com.cn/xw/zt/rjwy/gzkb2020/202205/P020220517519489596282.pdf",
+      "source_locator": "第28页·主题二“函数”·三角函数：单位圆定义、图像、性质与应用",
+      "metadata": {
+        "subject": "数学",
+        "domain": "三角学",
+        "concept": "三角函数",
+        "grade": "初中至高中",
+        "difficulty": "基础",
+        "aliases": ["三角函数", "三角比", "sin", "cos", "tan"]
+      },
+      "entities": [
+        {"name": "数学", "entity_type": "KnowledgeNode", "description": "研究数量、结构、空间和变化的学科。", "discipline_level": 1},
+        {"name": "初等数学", "entity_type": "Domain", "description": "基础数学知识领域。", "discipline_level": 2},
+        {"name": "三角学", "entity_type": "Domain", "description": "研究角、三角形和三角函数的数学领域。", "discipline_level": 3},
+        {"name": "三角函数", "entity_type": "Concept", "description": "描述角与比例或单位圆坐标关系的函数。", "aliases": ["三角比", "正弦", "余弦", "正切", "sin", "cos", "tan"], "discipline_level": 4}
+      ],
+      "relations": [
+        {"source": "数学", "target": "初等数学", "relation_type": "HAS_TEACHING_DOMAIN", "source_type": "KnowledgeNode", "target_type": "Domain", "evidence": "三角函数基础知识属于数学课程体系。"},
+        {"source": "初等数学", "target": "三角学", "relation_type": "CONTAINS", "source_type": "Domain", "target_type": "Domain", "evidence": "三角学是初等数学的重要组成部分。"},
+        {"source": "三角学", "target": "三角函数", "relation_type": "CONTAINS", "source_type": "Domain", "target_type": "Concept", "evidence": "三角函数是三角学的核心概念。"}
+      ]
+    },
+    {
+      "chunk_key": "right-triangle-definitions",
+      "text": "知识点：三角函数。在直角三角形中，选定一个锐角 θ：sin θ = 对边 ÷ 斜边，cos θ = 邻边 ÷ 斜边，tan θ = 对边 ÷ 邻边。这里的对边和邻边都相对于所选角 θ 而言。只要角度相同，这些边长比值就保持不变。",
+      "source_name": "OpenStax（莱斯大学）《Precalculus 2e》",
+      "source_url": "https://openstax.org/books/precalculus-2e/pages/5-4-right-triangle-trigonometry",
+      "source_locator": "第5章第4节·Right Triangle Trigonometry·直角三角形中的正弦、余弦和正切",
+      "metadata": {"subject": "数学", "domain": "三角学", "concept": "三角函数", "grade": "初中", "difficulty": "基础"},
+      "entities": [
+        {"name": "三角函数", "entity_type": "Concept"},
+        {"name": "正弦", "entity_type": "Concept", "description": "直角三角形中对边与斜边的比。"},
+        {"name": "余弦", "entity_type": "Concept", "description": "直角三角形中邻边与斜边的比。"},
+        {"name": "正切", "entity_type": "Concept", "description": "直角三角形中对边与邻边的比。"},
+        {"name": "直角三角形", "entity_type": "Prerequisite"}
+      ],
+      "relations": [
+        {"source": "三角函数", "target": "正弦", "relation_type": "CONTAINS", "evidence": "正弦是基本三角函数。"},
+        {"source": "三角函数", "target": "余弦", "relation_type": "CONTAINS", "evidence": "余弦是基本三角函数。"},
+        {"source": "三角函数", "target": "正切", "relation_type": "CONTAINS", "evidence": "正切是基本三角函数。"},
+        {"source": "直角三角形", "target": "三角函数", "relation_type": "PREREQUISITE_OF", "source_type": "Prerequisite", "target_type": "Concept", "evidence": "直角三角形中的边长比是三角函数的入门定义。"}
+      ]
+    },
+    {
+      "chunk_key": "unit-circle",
+      "text": "知识点：三角函数。对任意角 θ，可以使用单位圆定义三角函数。角 θ 的终边与单位圆交于点 P(x, y) 时，cos θ = x，sin θ = y；当 cos θ 不为 0 时，tan θ = y ÷ x。单位圆定义把三角函数从锐角推广到任意角。",
+      "source_name": "OpenStax（莱斯大学）《Precalculus 2e》",
+      "source_url": "https://openstax.org/books/precalculus-2e/pages/5-2-unit-circle-sine-and-cosine-functions",
+      "source_locator": "第5章第2节·Unit Circle: Sine and Cosine Functions",
+      "metadata": {"subject": "数学", "domain": "三角学", "concept": "三角函数", "grade": "高中", "difficulty": "基础"},
+      "entities": [
+        {"name": "三角函数", "entity_type": "Concept"},
+        {"name": "单位圆", "entity_type": "Concept"},
+        {"name": "任意角", "entity_type": "Concept"},
+        {"name": "弧度制", "entity_type": "Prerequisite"}
+      ],
+      "relations": [
+        {"source": "单位圆", "target": "三角函数", "relation_type": "EXPLAINS", "evidence": "单位圆坐标给出任意角三角函数的定义。"},
+        {"source": "任意角", "target": "三角函数", "relation_type": "EXTENDS", "evidence": "单位圆定义将三角函数推广到任意角。"},
+        {"source": "弧度制", "target": "三角函数", "relation_type": "PREREQUISITE_OF", "source_type": "Prerequisite", "target_type": "Concept", "evidence": "学习三角函数图像和周期性通常需要弧度制。"}
+      ]
+    },
+    {
+      "chunk_key": "special-angle-values",
+      "text": "知识点：三角函数。常用特殊角的值包括：sin 30° = 1/2，cos 30° = √3/2，tan 30° = √3/3；sin 45° = cos 45° = √2/2，tan 45° = 1；sin 60° = √3/2，cos 60° = 1/2，tan 60° = √3。",
+      "source_name": "OpenStax（莱斯大学）《Precalculus 2e》",
+      "source_url": "https://openstax.org/books/precalculus-2e/pages/5-4-right-triangle-trigonometry",
+      "source_locator": "第5章第4节·Special Angles：30°、45°、60°的精确三角函数值",
+      "metadata": {"subject": "数学", "domain": "三角学", "concept": "三角函数", "grade": "初中至高中", "difficulty": "基础"},
+      "entities": [
+        {"name": "三角函数", "entity_type": "Concept"},
+        {"name": "特殊角", "entity_type": "Concept"},
+        {"name": "正弦", "entity_type": "Concept"},
+        {"name": "余弦", "entity_type": "Concept"},
+        {"name": "正切", "entity_type": "Concept"}
+      ],
+      "relations": [
+        {"source": "特殊角", "target": "三角函数", "relation_type": "HAS_VALUE_IN", "evidence": "30°、45°、60°具有常用的精确三角函数值。"}
+      ]
+    },
+    {
+      "chunk_key": "fundamental-identities",
+      "text": "知识点：三角函数。常用基本关系包括：sin²θ + cos²θ = 1；当 cos θ 不为 0 时，tan θ = sin θ ÷ cos θ。这些关系可以用于已知一个三角函数值时求其他三角函数值，也可以用于化简表达式。",
+      "source_name": "OpenStax（莱斯大学）《Precalculus 2e》",
+      "source_url": "https://openstax.org/books/precalculus-2e/pages/5-3-the-other-trigonometric-functions",
+      "source_locator": "第5章第3节·The Pythagorean Identity and Other Properties of Sines and Cosines",
+      "metadata": {"subject": "数学", "domain": "三角学", "concept": "三角函数", "grade": "高中", "difficulty": "基础"},
+      "entities": [
+        {"name": "三角函数", "entity_type": "Concept"},
+        {"name": "同角三角函数关系", "entity_type": "Concept"},
+        {"name": "三角恒等式", "entity_type": "Concept"}
+      ],
+      "relations": [
+        {"source": "三角函数", "target": "同角三角函数关系", "relation_type": "HAS_RULE", "evidence": "sin²θ + cos²θ = 1 是基本同角关系。"},
+        {"source": "同角三角函数关系", "target": "三角恒等式", "relation_type": "FOUNDATION_OF", "evidence": "基本同角关系是学习三角恒等变换的基础。"}
+      ]
+    },
+    {
+      "chunk_key": "graphs-and-periodicity",
+      "text": "知识点：三角函数。正弦函数 y = sin x 和余弦函数 y = cos x 的周期都是 2π，函数值都在 [-1, 1] 内；正切函数 y = tan x 的周期是 π，并且在 x = π/2 + kπ 处没有定义。三角函数图像常用于描述波动和周期变化。",
+      "source_name": "OpenStax（莱斯大学）《Precalculus 2e》",
+      "source_url": "https://openstax.org/books/precalculus-2e/pages/6-key-concepts",
+      "source_locator": "第6章·Key Concepts·正弦、余弦与正切函数的图像和周期",
+      "metadata": {"subject": "数学", "domain": "三角学", "concept": "三角函数", "grade": "高中", "difficulty": "基础"},
+      "entities": [
+        {"name": "三角函数", "entity_type": "Concept"},
+        {"name": "周期函数", "entity_type": "Concept"},
+        {"name": "三角函数图像", "entity_type": "Concept"}
+      ],
+      "relations": [
+        {"source": "三角函数", "target": "周期函数", "relation_type": "IS_A", "evidence": "正弦、余弦和正切都具有周期性。"},
+        {"source": "三角函数", "target": "三角函数图像", "relation_type": "HAS_REPRESENTATION", "evidence": "函数图像展示三角函数的周期和取值变化。"}
+      ]
+    },
+    {
+      "chunk_key": "worked-example",
+      "text": "知识点：三角函数。例题：一个直角三角形中，角 A 的对边长 3，斜边长 5，求 sin A。根据正弦定义，sin A = 对边 ÷ 斜边 = 3 ÷ 5 = 0.6。解题时先确认所选角，再判断对边、邻边和斜边。",
+      "source_name": "OpenStax（莱斯大学）《Precalculus 2e》",
+      "source_url": "https://openstax.org/books/precalculus-2e/pages/5-4-right-triangle-trigonometry",
+      "source_locator": "第5章第4节·Example 2：3-4-5直角三角形的三角函数值",
+      "metadata": {"subject": "数学", "domain": "三角学", "concept": "三角函数", "grade": "初中", "difficulty": "基础", "content_type": "worked_example"},
+      "entities": [
+        {"name": "三角函数", "entity_type": "Concept"},
+        {"name": "正弦", "entity_type": "Concept"},
+        {"name": "直角三角形", "entity_type": "Prerequisite"},
+        {"name": "三角函数例题", "entity_type": "Example"}
+      ],
+      "relations": [
+        {"source": "三角函数例题", "target": "正弦", "relation_type": "PRACTICES", "source_type": "Example", "target_type": "Concept", "evidence": "例题使用对边与斜边之比计算正弦值。"}
+      ]
+    }
+  ]
+}

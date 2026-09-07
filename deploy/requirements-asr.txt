@@ -5,6 +5,7 @@ modelscope==1.38.1
 modelscope-hub==0.1.7
 fastapi>=0.110,<1
 uvicorn[standard]>=0.27,<1
+websockets>=16,<17
 python-multipart>=0.0.9,<1
 pydantic>=1.10,<3
 imageio-ffmpeg>=0.5,<1

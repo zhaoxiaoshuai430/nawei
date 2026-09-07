@@ -82,7 +82,8 @@ class UnitConversionResult:
 class UnitConverterTool:
     def convert_from_text(self, text: str) -> UnitConversionResult | None:
         match = re.search(
-            r"([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z/°\u4e00-\u9fff]+)\s*(?:等于|是多少|换成|转成|转换成|到)\s*([A-Za-z/°\u4e00-\u9fff]+)",
+            r"([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z/°\u4e00-\u9fff]+)\s*"
+            r"(?:等于|是|换成|转成|转换成|到)\s*(?:多少|几)?\s*([A-Za-z/°\u4e00-\u9fff]+)",
             text,
         )
         if not match:

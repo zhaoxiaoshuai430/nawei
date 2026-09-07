@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -12,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, NoReturn, Optional
 
 from pydantic import BaseModel, Field
 try:  # Pydantic 2.x
@@ -51,11 +52,12 @@ ensure_ffmpeg_on_path()
 sys.path.insert(0, str(SENSEVOICE_DIR))
 
 # 先导入 SenseVoice 模型定义以注册模型类
-import model as _sensevoice_model
+import model as _sensevoice_model  # noqa: F401
 
 from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
-from asr_protocol import STREAMING_MODE, decode_base64_audio, streaming_capabilities
+from asr_protocol import MAX_AUDIO_BYTES as DEFAULT_MAX_AUDIO_BYTES
+from asr_protocol import STREAMING_MODE, decode_base64_audio, read_upload_limited, streaming_capabilities
 from inference_capacity import CapacityRejected, InferenceCapacity
 from realtime import PCM16VadSegmenter, RealtimeVadConfig
 from service_security import asr_cors_origins, require_asr_internal_api_key, verify_asr_internal_api_key
@@ -76,7 +78,10 @@ VAD_MODEL_SOURCE = resolve_model_source(
 DEVICE = os.environ.get("ASR_DEVICE", "cuda:0")
 TAG_RE = re.compile(r"<\|[^|]+\|>")
 TARGET_SR = 16000
-MAX_AUDIO_BASE64_CHARS = 36 * 1024 * 1024
+MAX_AUDIO_BYTES = int(os.environ.get("ASR_MAX_AUDIO_BYTES", str(DEFAULT_MAX_AUDIO_BYTES)))
+MAX_AUDIO_FILES = int(os.environ.get("ASR_MAX_AUDIO_FILES", "4"))
+MAX_AUDIO_BASE64_CHARS = ((MAX_AUDIO_BYTES + 2) // 3) * 4
+logger = logging.getLogger(__name__)
 INFERENCE_CAPACITY = InferenceCapacity(
     limit=int(os.environ.get("ASR_MAX_CONCURRENT_INFERENCES", "1")),
     queue_limit=int(os.environ.get("ASR_MAX_QUEUE_SIZE", "16")),
@@ -125,20 +130,30 @@ def _find_ffmpeg() -> str:
 def _prepare_wav_path(content: bytes, suffix: str) -> tuple[str, list[str]]:
     suffix = (suffix or ".wav").lower()
     cleanup: list[str] = []
-    with tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False) as src:
-        src.write(content)
-        src_path = src.name
-    cleanup.append(src_path)
-    dst_path = tempfile.mktemp(suffix=".wav")
-    cleanup.append(dst_path)
-    ffmpeg = _find_ffmpeg()
-    cmd = [ffmpeg, "-y", "-i", src_path, "-ar", str(TARGET_SR), "-ac", "1", dst_path]
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
-    except subprocess.CalledProcessError as exc:
-        err = (exc.stderr or b"")[-400:].decode("utf-8", errors="replace")
-        raise HTTPException(status_code=415, detail=f"Audio decode failed: {err}") from exc
-    return dst_path, cleanup
+        with tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False) as src:
+            src.write(content)
+            src_path = src.name
+        cleanup.append(src_path)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as dst:
+            dst_path = dst.name
+        cleanup.append(dst_path)
+        ffmpeg = _find_ffmpeg()
+        cmd = [ffmpeg, "-y", "-i", src_path, "-ar", str(TARGET_SR), "-ac", "1", dst_path]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as exc:
+            err = (exc.stderr or b"")[-400:].decode("utf-8", errors="replace")
+            logger.warning("Audio decode failed: %s", err)
+            raise HTTPException(status_code=415, detail="Audio format could not be decoded.") from exc
+        return dst_path, cleanup
+    except BaseException:
+        for path in cleanup:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        raise
 
 
 def _pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000, channels: int = 1, bits: int = 16) -> bytes:
@@ -173,9 +188,21 @@ def _recognize_wav(wav_path: str, lang: str = "auto", use_itn: bool = True) -> d
 
 def _decode_base64_audio(audio_base64: str) -> bytes:
     try:
-        return decode_base64_audio(audio_base64)
+        return decode_base64_audio(audio_base64, max_bytes=MAX_AUDIO_BYTES)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=413 if "exceeds" in str(exc) else 400, detail=str(exc)) from exc
+
+
+async def _read_audio_upload(file: UploadFile) -> bytes:
+    try:
+        return await read_upload_limited(file, max_bytes=MAX_AUDIO_BYTES)
+    except ValueError as exc:
+        raise HTTPException(status_code=413 if "exceeds" in str(exc) else 400, detail=str(exc)) from exc
+
+
+def _raise_asr_failure(exc: Exception) -> NoReturn:
+    logger.exception("ASR request failed", exc_info=exc)
+    raise HTTPException(status_code=500, detail="ASR processing failed.") from exc
 
 
 def _recognize_content(
@@ -217,6 +244,15 @@ def _recognize_content(
                 os.unlink(p)
 
 
+async def _run_inference_thread(function: Any, /, *args: Any, **kwargs: Any) -> Any:
+    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        await worker
+        raise
+
+
 async def _recognize_content_async(**kwargs: Any) -> dict[str, Any]:
     """Run blocking audio decoding and model inference without blocking FastAPI."""
 
@@ -229,7 +265,7 @@ async def _recognize_content_async(**kwargs: Any) -> dict[str, Any]:
             headers={"Retry-After": str(exc.retry_after_seconds)},
         ) from exc
     async with lease:
-        return await asyncio.to_thread(_recognize_content, **kwargs)
+        return await _run_inference_thread(_recognize_content, **kwargs)
 
 
 def _recognize_pcm_segment(pcm: bytes, *, lang: str, use_itn: bool, segment_index: int) -> dict[str, Any]:
@@ -264,7 +300,7 @@ async def _recognize_pcm_segment_async(
             headers={"Retry-After": str(exc.retry_after_seconds)},
         ) from exc
     async with lease:
-        return await asyncio.to_thread(
+        return await _run_inference_thread(
             _recognize_pcm_segment,
             pcm,
             lang=lang,
@@ -349,7 +385,7 @@ async def realtime_transcribe(websocket: WebSocket) -> None:
 
         language = str(start.get("language") or "auto")
         use_itn = bool(start.get("use_itn", True))
-        max_session_seconds = float(os.getenv("ASR_REALTIME_MAX_SESSION_SECONDS", "120"))
+        max_session_seconds = float(os.getenv("ASR_REALTIME_MAX_SESSION_SECONDS", "3600"))
         max_session_bytes = int(config.sample_rate * max_session_seconds * 2)
         segment_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(
             maxsize=int(os.getenv("ASR_REALTIME_SEGMENT_QUEUE_SIZE", "4"))
@@ -383,11 +419,12 @@ async def realtime_transcribe(websocket: WebSocket) -> None:
                     )
                     continue
                 except Exception as exc:
+                    logger.exception("Realtime ASR segment failed", exc_info=exc)
                     await send_json(
                         {
                             "type": "error",
                             "code": "recognition_failed",
-                            "message": str(exc),
+                            "message": "Speech recognition failed.",
                             "segment_index": current_index,
                         }
                     )
@@ -489,13 +526,15 @@ async def transcribe(
 ) -> dict[str, Any]:
     if not files:
         return {"result": []}
+    if len(files) > MAX_AUDIO_FILES:
+        raise HTTPException(status_code=413, detail=f"At most {MAX_AUDIO_FILES} audio files are allowed per request.")
 
     key_list = keys.split(",") if keys else [f.filename or "audio" for f in files]
 
     out = []
     for i, file in enumerate(files):
         suffix = Path(file.filename or "audio.wav").suffix or ".wav"
-        content = await file.read()
+        content = await _read_audio_upload(file)
         try:
             item = await _recognize_content_async(
                 content=content,
@@ -509,7 +548,7 @@ async def transcribe(
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"ASR failed: {exc}") from exc
+            _raise_asr_failure(exc)
 
     return {"result": out}
 
@@ -640,7 +679,7 @@ async def transcribe_base64(request: Base64Request) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"ASR failed: {exc}") from exc
+        _raise_asr_failure(exc)
 
 
 @app.post(
@@ -677,7 +716,7 @@ async def transcribe_standard_base64(request: ASRRequest) -> ASRResponse:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"ASR failed: {exc}") from exc
+        _raise_asr_failure(exc)
 
 
 # ==================== SSE 流式识别接口 ====================

@@ -21,6 +21,7 @@ COPY --chown=nawei:nawei app_protocols /app/app_protocols
 COPY --chown=nawei:nawei services/__init__.py /app/services/__init__.py
 COPY --chown=nawei:nawei services/gateway /app/services/gateway
 COPY --chown=nawei:nawei services/llm /app/services/llm
+COPY --chown=nawei:nawei services/knowledge /app/services/knowledge
 COPY --chown=nawei:nawei deploy/scripts /app/deploy/scripts
 
 RUN mkdir -p /models/huggingface /models/sentence-transformers \
@@ -28,4 +29,4 @@ RUN mkdir -p /models/huggingface /models/sentence-transformers \
 
 USER nawei
 
-CMD [python, -m, services.gateway.run]
+CMD ["python", "-m", "services.gateway.run"]

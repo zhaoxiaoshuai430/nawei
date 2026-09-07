@@ -61,7 +61,7 @@ if ($remaining.Count -gt 0) {
 Write-Host "All tracked services stopped." -ForegroundColor Green
 
 if (-not $KeepInfrastructure -and (Get-Command docker -ErrorAction SilentlyContinue)) {
-    Write-Host "Stopping LLM Redis/PostgreSQL infrastructure..." -ForegroundColor Cyan
+    Write-Host "Stopping PostgreSQL, Redis, Qdrant, and Neo4j infrastructure..." -ForegroundColor Cyan
     docker compose -f (Join-Path $script:NaweiProjectRoot "deploy\docker-compose.llm-infra.yml") down
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "LLM infrastructure did not stop cleanly."

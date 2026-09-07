@@ -3,15 +3,14 @@ import time
 import torch
 from torch import nn
 import torch.nn.functional as F
-from typing import Iterable, Optional
+from typing import Any, Optional
 
 from funasr.register import tables
 from funasr.models.ctc.ctc import CTC
 from funasr.utils.datadir_writer import DatadirWriter
-from funasr.models.paraformer.search import Hypothesis
 from funasr.train_utils.device_funcs import force_gatherable
 from funasr.losses.label_smoothing_loss import LabelSmoothingLoss
-from funasr.metrics.compute_acc import compute_accuracy, th_accuracy
+from funasr.metrics.compute_acc import th_accuracy
 from funasr.utils.load_utils import load_audio_text_image_video, extract_fbank
 from utils.ctc_alignment import ctc_forced_align
 
@@ -22,7 +21,7 @@ class SinusoidalPositionEncoder(torch.nn.Module):
         super().__init__()
 
     def encode(
-        self, positions: torch.Tensor = None, depth: int = None, dtype: torch.dtype = torch.float32
+        self, positions: torch.Tensor, depth: int, dtype: torch.dtype = torch.float32
     ):
         batch_size = positions.size(0)
         positions = positions.type(dtype)
@@ -583,13 +582,13 @@ class SenseVoiceSmall(nn.Module):
 
     def __init__(
         self,
-        specaug: str = None,
-        specaug_conf: dict = None,
-        normalize: str = None,
-        normalize_conf: dict = None,
-        encoder: str = None,
-        encoder_conf: dict = None,
-        ctc_conf: dict = None,
+        specaug: Optional[str] = None,
+        specaug_conf: Optional[dict[str, Any]] = None,
+        normalize: Optional[str] = None,
+        normalize_conf: Optional[dict[str, Any]] = None,
+        encoder: Optional[str] = None,
+        encoder_conf: Optional[dict[str, Any]] = None,
+        ctc_conf: Optional[dict[str, Any]] = None,
         input_size: int = 80,
         vocab_size: int = -1,
         ignore_id: int = -1,
@@ -602,15 +601,27 @@ class SenseVoiceSmall(nn.Module):
 
         super().__init__()
 
+        specaug_module: Any = None
         if specaug is not None:
             specaug_class = tables.specaug_classes.get(specaug)
-            specaug = specaug_class(**specaug_conf)
+            if specaug_class is None:
+                raise ValueError(f"Unknown specaug class: {specaug}")
+            specaug_module = specaug_class(**(specaug_conf or {}))
+
+        normalize_module: Any = None
         if normalize is not None:
             normalize_class = tables.normalize_classes.get(normalize)
-            normalize = normalize_class(**normalize_conf)
+            if normalize_class is None:
+                raise ValueError(f"Unknown normalize class: {normalize}")
+            normalize_module = normalize_class(**(normalize_conf or {}))
+
+        if encoder is None:
+            raise ValueError("encoder must be configured")
         encoder_class = tables.encoder_classes.get(encoder)
-        encoder = encoder_class(input_size=input_size, **encoder_conf)
-        encoder_output_size = encoder.output_size()
+        if encoder_class is None:
+            raise ValueError(f"Unknown encoder class: {encoder}")
+        encoder_module: Any = encoder_class(input_size=input_size, **(encoder_conf or {}))
+        encoder_output_size = encoder_module.output_size()
 
         if ctc_conf is None:
             ctc_conf = {}
@@ -621,9 +632,9 @@ class SenseVoiceSmall(nn.Module):
         self.eos = eos if eos is not None else vocab_size - 1
         self.vocab_size = vocab_size
         self.ignore_id = ignore_id
-        self.specaug = specaug
-        self.normalize = normalize
-        self.encoder = encoder
+        self.specaug = specaug_module
+        self.normalize = normalize_module
+        self.encoder = encoder_module
         self.error_calculator = None
 
         self.ctc = ctc
@@ -646,7 +657,7 @@ class SenseVoiceSmall(nn.Module):
         )
     
     @staticmethod
-    def from_pretrained(model:str=None, **kwargs):
+    def from_pretrained(model: Optional[str] = None, **kwargs):
         from funasr import AutoModel
         model, kwargs = AutoModel.build_model(model=model, trust_remote_code=True, **kwargs)
         
@@ -782,13 +793,14 @@ class SenseVoiceSmall(nn.Module):
         self,
         data_in,
         data_lengths=None,
-        key: list = ["wav_file_tmp_name"],
+        key: Optional[list[Any]] = None,
         tokenizer=None,
         frontend=None,
         **kwargs,
     ):
 
 
+        keys: list[Any] = key or ["wav_file_tmp_name"]
         meta_data = {}
         if (
             isinstance(data_in, torch.Tensor) and kwargs.get("data_type", "sound") == "fbank"
@@ -860,10 +872,10 @@ class SenseVoiceSmall(nn.Module):
 
         results = []
         b, n, d = encoder_out.size()
-        if isinstance(key[0], (list, tuple)):
-            key = key[0]
-        if len(key) < b:
-            key = key * b
+        if keys and isinstance(keys[0], (list, tuple)):
+            keys = list(keys[0])
+        if len(keys) < b:
+            keys = keys * b
         for i in range(b):
             x = ctc_logits[i, : encoder_out_lens[i].item(), :]
             yseq = x.argmax(dim=-1)
@@ -881,7 +893,7 @@ class SenseVoiceSmall(nn.Module):
             # Change integer-ids to tokens
             text = tokenizer.decode(token_int)
             if ibest_writer is not None:
-                ibest_writer["text"][key[i]] = text
+                ibest_writer["text"][keys[i]] = text
 
             if output_timestamp:
                 from itertools import groupby
@@ -914,10 +926,10 @@ class SenseVoiceSmall(nn.Module):
                         token_id += 1
                     _start = _end
 
-                result_i = {"key": key[i], "text": text, "timestamp": timestamp}
+                result_i = {"key": keys[i], "text": text, "timestamp": timestamp}
                 results.append(result_i)
             else:
-                result_i = {"key": key[i], "text": text}
+                result_i = {"key": keys[i], "text": text}
                 results.append(result_i)
         return results, meta_data
 

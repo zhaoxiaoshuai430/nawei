@@ -11,18 +11,18 @@ from typing import Any, Callable, NotRequired, TypedDict
 try:  # pragma: no cover - optional dependency in lightweight installs
     from langchain_core.runnables import RunnableLambda
 except ImportError:  # pragma: no cover
-    RunnableLambda = None  # type: ignore[assignment]
+    RunnableLambda = None  # type: ignore[misc,assignment]
 
 try:  # pragma: no cover - optional dependency in lightweight installs
     from langchain_core.tools import StructuredTool
 except ImportError:  # pragma: no cover
-    StructuredTool = None  # type: ignore[assignment]
+    StructuredTool = None  # type: ignore[misc,assignment]
 
 try:  # pragma: no cover - optional dependency in lightweight installs
     from langgraph.graph import END, StateGraph
 except ImportError:  # pragma: no cover
-    END = "__end__"  # type: ignore[assignment]
-    StateGraph = None  # type: ignore[assignment]
+    END = "__end__"  # type: ignore[misc,assignment]
+    StateGraph = None  # type: ignore[misc,assignment]
 
 
 Formatter = Callable[[Any], str]
@@ -109,6 +109,37 @@ class LangChainRuntimeToolAgent:
 
         return sorted(self._tools.keys()) if self._tools else list(_TOOL_ORDER)
 
+    def openai_tool_definitions(
+        self,
+        names: list[str] | set[str] | tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return enabled runtime tools in OpenAI-compatible function format."""
+
+        enabled = set(self.registered_tools)
+        if names is not None:
+            enabled.intersection_update(names)
+        return [
+            item
+            for item in _openai_tool_definitions()
+            if str(item.get("function", {}).get("name") or "") in enabled
+        ]
+
+    def suggested_tool_names(
+        self,
+        query: str,
+        *,
+        default_timeout_seconds: float = 6.0,
+    ) -> list[str]:
+        """Return deterministic tool candidates without executing them."""
+
+        calls = self._select_tool_calls(
+            {
+                "query": query,
+                "default_timeout_seconds": default_timeout_seconds,
+            }
+        )
+        return [call.name for call in calls]
+
     async def collect(
         self,
         *,
@@ -174,6 +205,8 @@ class LangChainRuntimeToolAgent:
         metadata = dict(state.get("metadata", {}))
         metadata["result_tools"] = [item.name for item in outputs if item.result is not None]
         metadata["error_tools"] = [item.name for item in outputs if item.error]
+        metadata["tool_timings_ms"] = {item.name: item.elapsed_ms for item in outputs}
+        metadata["tool_wall_ms"] = max((item.elapsed_ms for item in outputs), default=0)
         return {**state, "metadata": metadata}
 
     def _select_tool_calls(self, state: RuntimeToolAgentState) -> list[RuntimeToolCall]:
@@ -251,7 +284,7 @@ class LangChainRuntimeToolAgent:
             if normalized is None:
                 continue
             calls.append(RuntimeToolCall(name, normalized, self._timeout_for(_TIMEOUT_PREFIX_BY_TOOL[name], default_timeout)))
-        return _dedupe_tool_calls(calls)
+        return calls
 
     def _normalize_tool_args(self, name: str, args: dict[str, Any], *, query: str) -> dict[str, Any] | None:
         if name not in _TOOL_ORDER or not self._tool_enabled(name):
@@ -386,7 +419,7 @@ class LangChainRuntimeToolAgent:
             "unit_converter": StructuredTool.from_function(
                 coroutine=self._unit_from_text,
                 name="unit_converter",
-                description="Convert a unit expression contained in user text.",
+                description="Convert explicit unit expressions such as 3 kilometers to meters.",
             ),
             "dictionary": StructuredTool.from_function(
                 coroutine=self._dictionary_lookup,
@@ -470,6 +503,76 @@ _TIMEOUT_PREFIX_BY_TOOL = {
     "encyclopedia": "ENCYCLOPEDIA",
     "weather": "WEATHER",
 }
+
+
+def _openai_tool_definitions() -> list[dict[str, Any]]:
+    def function(
+        name: str,
+        description: str,
+        properties: dict[str, Any],
+        required: list[str],
+    ) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    query_property = {"type": "string", "description": "The user's current query."}
+    return [
+        function("time", "Get the current local date and time. Must be used for current date or time questions.", {}, []),
+        function(
+            "calculator",
+            "算术计算工具。用户询问明确计算时必须调用，例如：13乘以27、144的平方根、带括号四则运算；不要心算代替。",
+            {"text": {"type": "string", "description": "The expression or original arithmetic question."}},
+            ["text"],
+        ),
+        function(
+            "unit_converter",
+            "单位换算工具。用户询问明确的单位换算时必须调用，例如：3公里等于多少米、500克换算成千克。",
+            {"text": {"type": "string", "description": "The complete unit-conversion request."}},
+            ["text"],
+        ),
+        function(
+            "dictionary",
+            "Look up the definition and usage of an English word.",
+            {"word": {"type": "string", "description": "A single English word."}},
+            ["word"],
+        ),
+        function(
+            "web_search",
+            "Search the live web. Must be used for current, latest, recent, or year-specific sports results, awards, news, policies, and other time-sensitive facts.",
+            {"query": query_property},
+            ["query"],
+        ),
+        function(
+            "encyclopedia",
+            "Look up stable encyclopedia facts for a person, place, event, object, or concept.",
+            {"query": query_property},
+            ["query"],
+        ),
+        function(
+            "weather",
+            "Get weather for an explicit city or region. Ask the user for a location when none is provided.",
+            {
+                "city": {"type": "string", "description": "Explicit city or region name."},
+                "day": {
+                    "type": "string",
+                    "enum": ["today", "tomorrow", "day_after_tomorrow"],
+                    "description": "Forecast day.",
+                },
+            },
+            ["city", "day"],
+        ),
+    ]
 
 
 def _dedupe_tool_calls(calls: list[RuntimeToolCall]) -> list[RuntimeToolCall]:

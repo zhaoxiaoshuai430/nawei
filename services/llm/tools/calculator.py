@@ -11,6 +11,8 @@ from typing import Any, Callable
 
 
 CALC_MARKERS = ("计算", "算一下", "等于多少", "是多少", "平方根", "开方")
+CHINESE_OPERATOR_PATTERN = re.compile(r"乘以|加上|减去|除以|[乘加减除]")
+NUMBER_PATTERN = re.compile(r"(?<![A-Za-z_])(?:\d+(?:\.\d*)?|\.\d+)")
 
 ALLOWED_BINARY: dict[type[ast.operator], Callable[[float, float], float]] = {
     ast.Add: operator.add,
@@ -36,6 +38,7 @@ ALLOWED_FUNCS: dict[str, Callable[..., float]] = {
     "log10": math.log10,
 }
 ALLOWED_CONSTANTS = {"pi": math.pi, "e": math.e}
+ALLOWED_IDENTIFIERS = set(ALLOWED_FUNCS) | set(ALLOWED_CONSTANTS)
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,11 @@ class CalculatorTool:
     """Evaluate simple numeric expressions without Python eval."""
 
     def extract_expression(self, text: str) -> str | None:
-        if not any(marker in text for marker in CALC_MARKERS) and not re.search(r"\d\s*[\+\-\*/×÷^]\s*\d", text):
+        if (
+            not any(marker in text for marker in CALC_MARKERS)
+            and not re.search(r"\d\s*[\+\-\*/×÷^]\s*\d", text)
+            and not re.search(r"\d\s*(?:乘以|加上|减去|除以|[乘加减除])\s*\d", text)
+        ):
             return None
         normalized = (
             text.replace("×", "*")
@@ -68,11 +75,40 @@ class CalculatorTool:
             .replace("）", ")")
             .replace("，", ",")
         )
-        match = re.search(r"([0-9piPIeE\s\+\-\*/%\.\(\),\*]+)", normalized)
-        if not match:
+        normalized = _normalize_chinese_operators(normalized)
+        normalized = re.sub(
+            r"((?:\d+(?:\.\d*)?|\.\d+))\s*的?\s*(?:平方根|开方)",
+            r"sqrt(\1)",
+            normalized,
+        )
+        normalized = re.sub(
+            r"(?:根号下?|√)\s*((?:\d+(?:\.\d*)?|\.\d+))",
+            r"sqrt(\1)",
+            normalized,
+        )
+        identifiers = {item.lower() for item in re.findall(r"[A-Za-z_]+", normalized)}
+        if identifiers - ALLOWED_IDENTIFIERS:
             return None
-        expression = match.group(1).strip()
-        return expression if any(char.isdigit() for char in expression) else None
+
+        source_number_count = len(NUMBER_PATTERN.findall(normalized))
+        for match in re.finditer(r"[0-9A-Za-z_\s\+\-\*/%\.\(\),]+", normalized):
+            expression = match.group(0).strip()
+            if not any(char.isdigit() for char in expression):
+                continue
+            if source_number_count > 1 and len(NUMBER_PATTERN.findall(expression)) < source_number_count:
+                continue
+            expression = re.sub(
+                r"[A-Za-z_]+",
+                lambda token: token.group(0).lower(),
+                expression,
+            )
+            try:
+                tree = ast.parse(expression, mode="eval")
+                _eval_node(tree.body)
+            except (SyntaxError, TypeError, ValueError, ZeroDivisionError, OverflowError):
+                continue
+            return expression
+        return None
 
     def calculate_from_text(self, text: str) -> CalculatorResult | None:
         expression = self.extract_expression(text)
@@ -90,10 +126,39 @@ class CalculatorTool:
 def format_calculator_system_prompt(result: CalculatorResult) -> str:
     return (
         "实时工具结果：计算器\n"
-        f"- 表达式：{result.expression}\n"
+        f"- 算式：{format_expression_for_display(result.expression)}\n"
         f"- 结果：{result.result_text}\n"
-        "回答计算题时必须基于以上工具结果，并简要说明关键步骤。"
+        "回答计算题时必须基于以上工具结果。面向用户只输出普通中文和可读算式，不输出 JSON、Python 运算符或 LaTeX 命令。"
     )
+
+
+def format_expression_for_display(expression: str) -> str:
+    """Convert internal calculator syntax to a user-facing plain-text expression."""
+
+    readable = expression.replace("**", "^").replace("*", " × ").replace("/", " ÷ ")
+    readable = re.sub(r"\s+", " ", readable).strip()
+    return readable
+
+
+def _normalize_chinese_operators(text: str) -> str:
+    replacements = (
+        ("乘以", "*"),
+        ("加上", "+"),
+        ("减去", "-"),
+        ("除以", "/"),
+        ("乘", "*"),
+        ("加", "+"),
+        ("减", "-"),
+        ("除", "/"),
+    )
+    normalized = text
+    for phrase, operator_symbol in replacements:
+        normalized = re.sub(
+            rf"(?<=[0-9)])\s*{phrase}\s*(?=[0-9(.+\-])",
+            operator_symbol,
+            normalized,
+        )
+    return normalized
 
 
 def _eval_node(node: ast.AST) -> float:

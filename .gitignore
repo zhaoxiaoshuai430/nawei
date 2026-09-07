@@ -16,9 +16,12 @@ services/tts/voice_lab/output/
 .runtime-logs/
 /.runtime/
 /logs/
-/models/tts/nana/checkpoint-epoch-7/model.safetensors
+/models/tts/liliya/checkpoint-epoch-1/model.safetensors
 deploy/backups/
 **/.env
+**/.env.*
+!**/.env.example
+!**/.env.*.example
 *.log
 *.tmp
 *.bak

@@ -10,17 +10,21 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import time
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import Any, Iterable
+from typing import Any
 from zoneinfo import ZoneInfo
 
+
+logger = logging.getLogger(__name__)
+
 try:  # pragma: no cover - exercised by integration tests or live runtime
-    import asyncpg
+    import asyncpg  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover - optional dependency
     asyncpg = None  # type: ignore[assignment]
 
@@ -41,7 +45,7 @@ def _consume_background_task_exception(task: asyncio.Task[Any]) -> None:
     except asyncio.CancelledError:
         return
     except Exception:
-        return
+        logger.exception("Background memory task failed")
 
 
 DEFAULT_DATABASE_URL = "postgresql://llm:llm@127.0.0.1:5432/llm"
@@ -53,6 +57,12 @@ MIN_MEMORY_IMPORTANCE = 4
 DEFAULT_PROMPT_VERSION = "navi-memory-v2"
 DEFAULT_MEMORY_EXTRACTOR_URL = "http://127.0.0.1:8002/api/v1/llm"
 DEFAULT_MEMORY_EXTRACTOR_TIMEOUT_SECONDS = 60.0
+
+
+def _redis_key_component(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 _MEMORY_EXTRACTION_SYSTEM_PROMPT = """
 You extract memory for Xiaowei, an AI education voice robot.
 Return only one strict JSON object. No markdown, no explanation.
@@ -159,13 +169,14 @@ class MemoryStore:
         self._redis: Any = None
         self._init_lock = asyncio.Lock()
         self._init_lock_loop: asyncio.AbstractEventLoop | None = None
-        self._memory_messages: dict[str, list[dict[str, str]]] = {}
+        self._memory_messages: dict[str, list[dict[str, Any]]] = {}
         self._memory_profiles: dict[str, dict[str, Any]] = {}
         self._memory_items: dict[str, list[dict[str, Any]]] = {}
         self._memory_concepts: dict[str, list[dict[str, Any]]] = {}
         self._profile_process_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._postgres_retry_after = 0.0
         self._redis_retry_after = 0.0
+        self._redis_last_error: str | None = None
         self.profile_redis_cache_enabled = os.getenv("MEMORY_PROFILE_REDIS_CACHE", "false").strip().lower() in {"1", "true", "yes", "on"}
         self.extractor_enabled = os.getenv("MEMORY_EXTRACTOR_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
         self.extractor_url = os.getenv("MEMORY_EXTRACTOR_URL", DEFAULT_MEMORY_EXTRACTOR_URL).strip()
@@ -238,9 +249,16 @@ class MemoryStore:
             )
             await self._redis.ping()
             self._redis_retry_after = 0.0
-        except Exception:
+            if self._redis_last_error is not None:
+                logger.info("Redis memory cache connection restored")
+                self._redis_last_error = None
+        except Exception as exc:
             self._redis = None
             self._redis_retry_after = time.monotonic() + _read_float_env("MEMORY_RETRY_INTERVAL_SECONDS", 10.0)
+            error = f"{type(exc).__name__}: {exc}"
+            if error != self._redis_last_error:
+                logger.warning("Redis memory cache unavailable; retrying with fallback: %s", error)
+                self._redis_last_error = error
 
     async def close(self) -> None:
         """Close optional PostgreSQL and Redis clients owned by this store."""
@@ -337,6 +355,41 @@ class MemoryStore:
         )
         profile = _profile_for_query(profile, query)
         return MemoryContext(user_id=user_id, profile=profile, history=history, memories=memories)
+
+    async def build_short_term_context(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        query: str = "",
+        history_limit: int | None = None,
+        include_profile: bool = True,
+        prefer_local_history: bool = False,
+    ) -> MemoryContext:
+        """Load only profile and recent history for the current turn."""
+
+        limit = history_limit if history_limit is not None else _read_int_env("MEMORY_SHORT_TERM_HISTORY_LIMIT", 8)
+        limit = max(1, min(limit, MAX_HISTORY_MESSAGES))
+        if prefer_local_history:
+            local_history = self._local_history(user_id=user_id, session_id=session_id, limit=limit)
+            if local_history:
+                return MemoryContext(user_id=user_id, profile={}, history=local_history, memories=[])
+
+        await self.initialize()
+        if not include_profile:
+            history = await self.get_history(user_id=user_id, session_id=session_id, limit=limit)
+            return MemoryContext(user_id=user_id, profile={}, history=history, memories=[])
+
+        profile, history = await asyncio.gather(
+            self.get_profile(user_id),
+            self.get_history(user_id=user_id, session_id=session_id, limit=limit),
+        )
+        return MemoryContext(
+            user_id=user_id,
+            profile=_profile_for_query(profile, query),
+            history=history,
+            memories=[],
+        )
 
     async def recall_foundation(self, *, user_id: str, query: str, top_k: int = 6) -> list[MemoryHit]:
         """Recall stable profile/preference memories with text filters."""
@@ -529,12 +582,17 @@ class MemoryStore:
         session_id: str,
         user_text: str,
         assistant_text: str,
+        persist_messages: bool = True,
+        extract_memory: bool = True,
     ) -> None:
         """Persist a completed turn and asynchronously extract useful memory."""
 
         await self.initialize()
-        await self.add_message(user_id=user_id, session_id=session_id, role="user", content=user_text)
-        await self.add_message(user_id=user_id, session_id=session_id, role="assistant", content=assistant_text)
+        if persist_messages:
+            await self.add_message(user_id=user_id, session_id=session_id, role="user", content=user_text)
+            await self.add_message(user_id=user_id, session_id=session_id, role="assistant", content=assistant_text)
+        if not extract_memory:
+            return
         await self.extract_and_store(user_id=user_id, session_id=session_id, user_text=user_text, use_llm=False)
         if self._should_run_llm_extractor(user_text):
             task = asyncio.create_task(self.extract_and_store(user_id=user_id, session_id=session_id, user_text=user_text, use_rules=False))
@@ -543,24 +601,38 @@ class MemoryStore:
     async def add_message(self, *, user_id: str, session_id: str, role: str, content: str) -> None:
         """Save a message to Redis and PostgreSQL."""
 
+        content = self.cache_message(user_id=user_id, session_id=session_id, role=role, content=content)
+        if not content:
+            return
+        await self.persist_message(user_id=user_id, session_id=session_id, role=role, content=content)
+
+    def cache_message(self, *, user_id: str, session_id: str, role: str, content: str) -> str:
+        """Make a message immediately available to same-process follow-up turns."""
+
+        content = content.strip()
+        if not content:
+            return ""
+        key = self._history_key(user_id, session_id)
+        items = self._memory_messages.setdefault(key, [])
+        items.append({"role": role, "content": content, "ts": time.time()})
+        del items[:-MAX_HISTORY_MESSAGES]
+        return content
+
+    async def persist_message(self, *, user_id: str, session_id: str, role: str, content: str) -> None:
+        """Persist an already locally cached message to Redis and PostgreSQL."""
+
         content = content.strip()
         if not content:
             return
+        key = self._history_key(user_id, session_id)
         if self._redis is not None:
             try:
-                key = self._history_key(user_id, session_id)
                 payload = json.dumps({"role": role, "content": content, "ts": time.time()}, ensure_ascii=False)
                 await self._redis.rpush(key, payload)
                 await self._redis.ltrim(key, -MAX_HISTORY_MESSAGES, -1)
                 await self._redis.expire(key, HISTORY_TTL_SECONDS)
             except Exception:
                 self._redis = None
-
-        if self._redis is None:
-            key = self._history_key(user_id, session_id)
-            items = self._memory_messages.setdefault(key, [])
-            items.append({"role": role, "content": content, "ts": time.time()})
-            del items[:-MAX_HISTORY_MESSAGES]
 
         if self._pool is None:
             return
@@ -667,6 +739,10 @@ class MemoryStore:
             )
         return [_compact_message(dict(row)) for row in rows]
 
+    def _local_history(self, *, user_id: str, session_id: str, limit: int) -> list[dict[str, str]]:
+        items = self._memory_messages.get(self._history_key(user_id, session_id), [])[-limit:]
+        return [_compact_message(item) for item in items]
+
     async def get_profile(self, user_id: str) -> dict[str, Any]:
         """Read a user profile from Redis cache or PostgreSQL."""
 
@@ -705,16 +781,23 @@ class MemoryStore:
 
         if not changes:
             return
-        current = await self.get_profile(user_id)
         normalized_changes = _normalize_education_profile(changes)
-        merged = _normalize_education_profile(_merge_profile(current, normalized_changes))
-        if merged == current:
-            return
         self._profile_process_cache.pop(user_id, None)
 
         if self._pool is not None:
             async with self._pool.acquire() as conn:
                 async with conn.transaction():
+                    await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", user_id)
+                    row = await conn.fetchrow(
+                        "SELECT profile_data FROM navi_user_profiles WHERE user_id = $1",
+                        user_id,
+                    )
+                    current = _normalize_education_profile(
+                        _jsonb_to_dict(row["profile_data"]) if row and row["profile_data"] else {}
+                    )
+                    merged = _normalize_education_profile(_merge_profile(current, normalized_changes))
+                    if merged == current:
+                        return
                     await conn.execute(
                         """
                         INSERT INTO navi_user_profiles(user_id, profile_data, field_count, completeness, last_updated_at)
@@ -738,6 +821,10 @@ class MemoryStore:
                         session_id=session_id,
                     )
         else:
+            current = await self.get_profile(user_id)
+            merged = _normalize_education_profile(_merge_profile(current, normalized_changes))
+            if merged == current:
+                return
             self._memory_profiles[user_id] = merged
             self._obsolete_profile_conflicts_in_memory(user_id=user_id, changes=normalized_changes)
 
@@ -909,8 +996,8 @@ class MemoryStore:
                     """,
                     user_id,
                 )
-        except Exception:
-            return
+        except Exception as exc:
+            logger.warning("Memory decay failed; continuing without decay: %s", exc)
 
     async def remember(
         self,
@@ -1129,6 +1216,9 @@ class MemoryStore:
             profile_changes = _merge_profile(profile_changes, extraction.get("profile", {}))
             memory_records = _merge_memory_records(memory_records, extraction.get("memories", []))
 
+        if not profile_changes and not memory_records:
+            return
+
         await self.update_profile(user_id=user_id, changes=profile_changes, reason="memory_extraction", session_id=session_id)
         for record in memory_records:
             await self.remember(
@@ -1334,7 +1424,7 @@ class MemoryStore:
                     await conn.execute("DELETE FROM navi_messages WHERE user_id = $1 AND session_id = $2", user_id, session_id)
                 else:
                     await conn.execute("DELETE FROM navi_messages WHERE user_id = $1", user_id)
-                    await conn.execute("DELETE FROM navi_learning_concepts WHERE user_id = $1", user_id)
+                await conn.execute("DELETE FROM navi_learning_concepts WHERE user_id = $1", user_id)
 
     def _recall_in_memory(self, *, user_id: str, query: str, top_k: int, min_importance: int) -> list[MemoryHit]:
         hits: list[MemoryHit] = []
@@ -1349,11 +1439,11 @@ class MemoryStore:
 
     @staticmethod
     def _history_key(user_id: str, session_id: str) -> str:
-        return f"navi:history:{user_id}:{session_id}"
+        return f"navi:history:v2:{_redis_key_component(user_id)}:{_redis_key_component(session_id)}"
 
     @staticmethod
     def _profile_key(user_id: str) -> str:
-        return f"navi:profile:{user_id}"
+        return f"navi:profile:v2:{_redis_key_component(user_id)}"
 
 
 def _memory_hit_from_row(row: Any, score: float | None = None) -> MemoryHit:
@@ -1482,44 +1572,11 @@ def _concept_query_overlap(item: dict[str, Any], query_terms: set[str]) -> float
     terms = set(_tokenize(text))
     return len(terms & query_terms) / max(len(query_terms), 1)
 
-def format_memory_system_prompt(context: MemoryContext) -> str:
-    """Build the education assistant system prompt."""
-
-    profile_text = json.dumps(context.profile, ensure_ascii=False)[:180] if context.profile else "无"
-    memories = "\n".join(f"- {item.content[:50]}" for item in context.memories[:3])
-    if not memories:
-        memories = "无"
-    history = "\n".join(f"{_role_name(item['role'])}: {str(item['content'])[:60]}" for item in context.history[-3:])
-    if not history:
-        history = "无"
-
-    return (
-        "你是小维，AI 教育语音助手。用简体中文回答，适合朗读，不提 DeepSeek。\n"
-        f"当前日期:{_current_date_context()}。涉及今年、最新、赛事、新闻或可能变化的信息时，必须优先依据实时工具结果；没有实时工具结果时要明确说明不确定。\n"
-        f"画像:{profile_text}\n"
-        f"近期:{history}\n"
-        f"记忆:{memories}"
-    )
 
 
 def _current_date_context() -> str:
     now = datetime.now(timezone(timedelta(hours=8)))
     return f"{now:%Y-%m-%d} {now:%A} Asia/Shanghai"
-
-
-def resolve_user_id(*, session_id: str, metadata: dict[str, Any], messages: Iterable[Any]) -> str:
-    """Resolve a stable user id from metadata, falling back to session id."""
-
-    for source in (metadata,):
-        value = source.get("user_id") or source.get("student_id")
-        if value:
-            return str(value)
-    for message in reversed(list(messages)):
-        message_meta = getattr(message, "metadata", {}) or {}
-        value = message_meta.get("user_id") or message_meta.get("student_id")
-        if value:
-            return str(value)
-    return f"session:{session_id}"
 
 
 def _compact_message(item: dict[str, Any]) -> dict[str, str]:
@@ -1614,7 +1671,8 @@ def _profile_for_query(profile: dict[str, Any], query: str) -> dict[str, Any]:
     if preferences:
         filtered["preferences"] = preferences
 
-    learning_profile = profile.get("learning_profile") if isinstance(profile.get("learning_profile"), dict) else {}
+    learning_profile_value = profile.get("learning_profile")
+    learning_profile: dict[str, Any] = learning_profile_value if isinstance(learning_profile_value, dict) else {}
     filtered_learning: dict[str, Any] = {}
 
     subjects = list(learning_profile.get("subjects") or profile.get("subjects") or [])
@@ -1633,7 +1691,8 @@ def _profile_for_query(profile: dict[str, Any], query: str) -> dict[str, Any]:
         filtered_learning["learning_state"] = learning_state
         filtered["learning_state"] = learning_state
 
-    subject_states = profile.get("subject_states") if isinstance(profile.get("subject_states"), dict) else {}
+    subject_states_value = profile.get("subject_states")
+    subject_states: dict[str, Any] = subject_states_value if isinstance(subject_states_value, dict) else {}
     relevant_states: dict[str, Any] = {}
     for subject, state in subject_states.items():
         if _profile_value_relevant(subject, query) or _profile_value_relevant(state, query):
@@ -1722,8 +1781,10 @@ def _content_terms(text: str) -> list[str]:
 
 def _profile_signatures_from_changes(changes: dict[str, Any]) -> dict[str, Any]:
     signatures: dict[str, Any] = {}
-    identity = changes.get("identity") if isinstance(changes.get("identity"), dict) else {}
-    learning_profile = changes.get("learning_profile") if isinstance(changes.get("learning_profile"), dict) else {}
+    identity_value = changes.get("identity")
+    identity: dict[str, Any] = identity_value if isinstance(identity_value, dict) else {}
+    learning_profile_value = changes.get("learning_profile")
+    learning_profile: dict[str, Any] = learning_profile_value if isinstance(learning_profile_value, dict) else {}
     for key in ("nickname", "grade"):
         value = changes.get(key) or identity.get(key)
         if value not in (None, "", [], {}):
@@ -1766,8 +1827,10 @@ def _parse_llm_memory_extraction(raw_text: str) -> dict[str, Any] | None:
         return None
     if not isinstance(decoded, dict):
         return None
-    profile = decoded.get("profile") if isinstance(decoded.get("profile"), dict) else {}
-    memories = decoded.get("memories") if isinstance(decoded.get("memories"), list) else []
+    profile_value = decoded.get("profile")
+    profile: dict[str, Any] = profile_value if isinstance(profile_value, dict) else {}
+    memories_value = decoded.get("memories")
+    memories: list[Any] = memories_value if isinstance(memories_value, list) else []
     records = []
     for item in memories:
         if isinstance(item, dict):
@@ -1984,10 +2047,16 @@ def _extract_profile_changes(text: str) -> dict[str, Any]:
     subjects = _infer_profile_subjects(text)
     if subjects:
         changes["subjects"] = subjects
-    likes = _first_match(text, [r"(?:我喜欢|我爱|我想学|我对)([^，。！？；;,.!?\n]{1,30})(?:感兴趣)?"])
+    likes = _first_match(
+        text,
+        [r"(?:我喜欢(?!的|什么|啥|哪种|哪个|哪些)|我爱(?!的)|我想学|我对)([^，。！？；;,.!?\n]{1,30})(?:感兴趣)?"],
+    )
     if likes:
         changes["preferences"] = {"topics_enjoy": [_strip_interest_suffix(likes)]}
-    avoids = _first_match(text, [r"(?:我不喜欢|我讨厌|我害怕)([^，。！？；;,.!?\n]{1,30})"])
+    avoids = _first_match(
+        text,
+        [r"(?:我不喜欢(?!的|什么|啥|哪种|哪个|哪些)|我讨厌|我害怕)([^，。！？；;,.!?\n]{1,30})"],
+    )
     if avoids:
         changes["preferences"] = {"topics_avoid": [avoids.strip()]}
     focus = _first_match(
@@ -2009,7 +2078,7 @@ def _extract_memory_records(text: str) -> list[dict[str, Any]]:
     patterns = [
         ("(?:\u6211(?:\u6700\u8fd1|\u73b0\u5728)?(?:\u6b63\u5728)?(?:\u5728)?(?:\u5b66|\u5b66\u4e60)|\u6700\u8fd1(?:\u5728)?(?:\u5b66|\u5b66\u4e60)|\u6b63\u5728(?:\u5b66|\u5b66\u4e60))" + boundary + "{1,40}", 6, "learning_state"),
         ("(?:\u6211)?(?:\u603b\u662f|\u4e00\u76f4|\u7ecf\u5e38|\u8001\u662f|\u6709\u70b9|\u6bd4\u8f83)?(?:\u4e0d\u592a\u4f1a|\u4e0d\u4f1a|\u4e0d\u61c2|\u6ca1\u5f04\u61c2|\u641e\u4e0d\u61c2|\u770b\u4e0d\u61c2|\u5361\u5728|\u5361\u4f4f|\u8584\u5f31|\u5f31\u5728)" + boundary + "{1,40}", 8, "weakness"),
-        ("(?:\u6211\u559c\u6b22|\u6211\u7231|\u6211\u60f3\u5b66|\u6211\u4e0d\u559c\u6b22|\u6211\u8ba8\u538c|\u6211\u5bb3\u6015)" + boundary + "{1,40}", 6, "preference"),
+        ("(?:\u6211\u559c\u6b22(?!\u7684|\u4ec0\u4e48|\u5565|\u54ea\u79cd|\u54ea\u4e2a|\u54ea\u4e9b)|\u6211\u7231(?!\u7684)|\u6211\u60f3\u5b66|\u6211\u4e0d\u559c\u6b22(?!\u7684|\u4ec0\u4e48|\u5565|\u54ea\u79cd|\u54ea\u4e2a|\u54ea\u4e9b)|\u6211\u8ba8\u538c|\u6211\u5bb3\u6015)" + boundary + "{1,40}", 6, "preference"),
         ("(?:\u6211\u8981|\u6211\u51c6\u5907|\u4e0b\u5468|\u660e\u5929|\u4eca\u5929)" + boundary + "{2,50}", 5, "plan"),
         ("(?:\u8003\u8bd5|\u4f5c\u4e1a|\u8bfe\u7a0b|\u8001\u5e08|\u5b66\u6821|\u9898\u76ee|\u77e5\u8bc6\u70b9)" + boundary + "{0,50}", 5, "learning_event"),
         ("(?:\u6211\u53eb|\u53eb\u6211|\u6211\u7684\u540d\u5b57\u662f)" + boundary + "{1,20}", 8, "profile_fact"),
@@ -2042,8 +2111,6 @@ def _extract_memory_records(text: str) -> list[dict[str, Any]]:
     return records[:5]
 
 
-def _extract_memory_candidates(text: str) -> list[tuple[str, int]]:
-    return [(record["content"], record["importance"]) for record in _extract_memory_records(text)]
 
 
 def _memory_content_hash(content: str) -> str:
@@ -2288,8 +2355,6 @@ def _looks_like_memory_question(text: str) -> bool:
     )
 
 
-def _role_name(role: str) -> str:
-    return "学生" if role == "user" else "老师"
 
 
 def _tokenize(text: str) -> list[str]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import uvicorn
 
@@ -10,12 +11,20 @@ import uvicorn
 HOST = os.getenv("LLM_HOST", "127.0.0.1")
 PORT = int(os.getenv("LLM_PORT", "8002"))
 WORKERS = int(os.getenv("LLM_WORKERS", "4"))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def main() -> None:
     """Start the LLM FastAPI application."""
 
-    uvicorn.run("services.llm.main:app", host=HOST, port=PORT, reload=False, workers=WORKERS)
+    uvicorn.run(
+        "services.llm.main:app",
+        host=HOST,
+        port=PORT,
+        reload=False,
+        workers=WORKERS,
+        app_dir=str(PROJECT_ROOT),
+    )
 
 
 if __name__ == "__main__":

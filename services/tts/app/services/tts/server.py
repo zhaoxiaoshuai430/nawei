@@ -14,9 +14,8 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import setup_environment
+from app.config import TTS_DEFAULT_MODEL, setup_environment
 from app.service_security import tts_cors_origins
-from app.services.tts import state
 from app.services.tts.engine import load_model_into_cache
 from app.services.tts.emotion_refs import load_emotion_refs
 from app.services.tts.presets import load_preset_refs
@@ -32,7 +31,6 @@ except ImportError:
 _app: FastAPI | None = None
 _initialized = False
 
-DEFAULT_MODEL = os.environ.get("TTS_DEFAULT_MODEL", "voice_lab/nana").strip() or "voice_lab/nana"
 DEFAULT_PORT = int(os.environ.get("TTS_PORT", "19000"))
 
 
@@ -89,8 +87,8 @@ def run_tts_service(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Standalone Qwen3 TTS API")
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
-        help=f"Model to preload at startup (default: {DEFAULT_MODEL})",
+        default=TTS_DEFAULT_MODEL,
+        help=f"Model to preload at startup (default: {TTS_DEFAULT_MODEL})",
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--host", default="0.0.0.0")

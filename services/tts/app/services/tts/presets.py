@@ -3,10 +3,8 @@ from __future__ import annotations
 
 import base64
 import os
-from pathlib import Path
 
 from app.config import ASSET_DIR
-from app.services.tts import emotion_refs
 from app.services.tts.warmup import warm_voice_clone_cache
 from app.utils.cache import get_cached_ref_path
 
@@ -101,31 +99,3 @@ def prime_preset_voice_cache(model) -> None:
                 )
             except Exception:
                 continue
-
-
-def resolve_ref_path(
-    *,
-    ref_preset: str,
-    ref_audio_content: bytes | None,
-    ref_text: str,
-) -> tuple[str | None, bool, str]:
-    """Return (path, is_cached, ref_text)."""
-    if ref_preset and ref_preset in emotion_refs.emotion_refs:
-        path, cached, resolved_text = emotion_refs.resolve_emotion_ref_path(
-            ref_preset, ref_text=ref_text
-        )
-        if path:
-            return path, cached, resolved_text
-    if ref_preset and ref_preset in preset_refs:
-        preset = preset_refs[ref_preset]
-        if not ref_text:
-            ref_text = preset["ref_text"]
-        return preset["path"], True, ref_text
-    if ref_audio_content:
-        return get_cached_ref_path(ref_audio_content), True, ref_text
-    return None, False, ref_text
-
-
-def cleanup_ref_path(path: str | None, is_cached: bool) -> None:
-    if path and os.path.exists(path) and not is_cached:
-        os.unlink(path)

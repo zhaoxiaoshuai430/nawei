@@ -2,24 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
+import pydantic
 from pydantic import BaseModel, Field
 
-try:  # Pydantic 2.x
-    from pydantic import ConfigDict
-except ImportError:  # pragma: no cover - Pydantic 1.x
-    ConfigDict = None  # type: ignore[assignment]
 
-
-Metadata = Dict[str, Any]
+Metadata = dict[str, Any]
 
 
 class ProtocolModel(BaseModel):
     """Base model with conservative validation for protocol DTOs."""
 
-    if ConfigDict is not None:
-        model_config = ConfigDict(extra="forbid", use_enum_values=True)
+    if hasattr(pydantic, "ConfigDict"):
+        model_config = pydantic.ConfigDict(extra="forbid", use_enum_values=True)
     else:  # pragma: no cover - Pydantic 1.x
         class Config:
             extra = "forbid"

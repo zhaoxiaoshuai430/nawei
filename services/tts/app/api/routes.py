@@ -1,7 +1,6 @@
 """Standalone TTS HTTP API (/api/v1). No ASR or LLM."""
 from __future__ import annotations
 
-import asyncio
 import ipaddress
 import json
 import os
@@ -9,13 +8,14 @@ import secrets
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, Form, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 try:  # Pydantic 2.x
     from pydantic import ConfigDict
 except ImportError:  # pragma: no cover - Pydantic 1.x
     ConfigDict = None  # type: ignore[assignment]
 
-from app.config import list_available_models
+from app.config import TTS_DEFAULT_SPEAKER, list_available_models
 from app.service_security import require_tts_internal_api_key
 from app.services.tts import handlers as tts_handlers
 from app.services.tts import state
@@ -30,8 +30,27 @@ router = APIRouter(prefix="/api/v1", tags=["tts"])
 TTS_API_DEPENDENCIES = [Depends(require_tts_internal_api_key)]
 
 _VALID_MODES = frozenset({"voice_clone", "custom", "voice_design"})
-_DEFAULT_STANDARD_SPEAKER = os.environ.get("TTS_DEFAULT_SPEAKER", "nana")
 _DEFAULT_STANDARD_LANGUAGE = os.environ.get("TTS_DEFAULT_LANGUAGE", "Chinese")
+_LANGUAGE_ALIASES = {
+    "zh": "chinese",
+    "zh-cn": "chinese",
+    "zh-hans": "chinese",
+    "en": "english",
+    "en-us": "english",
+    "en-gb": "english",
+    "fr": "french",
+    "de": "german",
+    "it": "italian",
+    "ja": "japanese",
+    "jp": "japanese",
+    "ko": "korean",
+    "pt": "portuguese",
+    "ru": "russian",
+    "es": "spanish",
+}
+_SUPPORTED_LANGUAGES = frozenset(
+    {"chinese", "english", "french", "german", "italian", "japanese", "korean", "portuguese", "russian", "spanish"}
+)
 
 
 class ProtocolModel(BaseModel):
@@ -96,9 +115,15 @@ def _metadata_bool(metadata: dict[str, Any], key: str, default: bool) -> bool:
 
 
 def _standard_language(language: str) -> str:
-    if not language or language == "auto":
-        return _DEFAULT_STANDARD_LANGUAGE
-    return language
+    value = language if language and language.strip().lower() != "auto" else _DEFAULT_STANDARD_LANGUAGE
+    normalized = value.strip().lower().replace("_", "-")
+    normalized = _LANGUAGE_ALIASES.get(normalized, normalized)
+    if normalized not in _SUPPORTED_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"language must be one of: {', '.join(sorted(_SUPPORTED_LANGUAGES))}",
+        )
+    return normalized
 
 
 def _standard_duration_ms(metrics: dict[str, Any]) -> Optional[int]:
@@ -171,7 +196,8 @@ async def health():
 
 @router.get("/status")
 async def status():
-    return _tts_status_payload()
+    payload = _tts_status_payload()
+    return JSONResponse(content=payload, status_code=200 if payload["loaded"] else 503)
 
 
 @router.post("/models/load")
@@ -200,7 +226,7 @@ async def load_model(
             headers={"Retry-After": str(exc.retry_after_seconds)},
         ) from exc
     async with lease:
-        await asyncio.to_thread(load_model_into_cache, model_id)
+        await tts_handlers.run_blocking_until_complete(load_model_into_cache, model_id)
     return {"status": "loaded", "model": model_id}
 
 
@@ -227,7 +253,7 @@ async def tts_standard_generate(request: TTSRequest) -> TTSResponse:
     voice = request.voice
     mode = _normalize_mode(str(voice.mode or "custom"))
     language = _standard_language(voice.language)
-    speaker = voice.speaker_id or str(metadata.get("speaker") or _DEFAULT_STANDARD_SPEAKER)
+    speaker = voice.speaker_id or str(metadata.get("speaker") or TTS_DEFAULT_SPEAKER)
 
     response = await tts_handlers.generate_non_streaming(
         text=request.text,
@@ -280,7 +306,7 @@ async def tts_standard_stream(request: TTSRequest):
     voice = request.voice
     mode = _normalize_mode(str(voice.mode or "custom"))
     language = _standard_language(voice.language)
-    speaker = voice.speaker_id or str(metadata.get("speaker") or _DEFAULT_STANDARD_SPEAKER)
+    speaker = voice.speaker_id or str(metadata.get("speaker") or TTS_DEFAULT_SPEAKER)
 
     return await tts_handlers.generate_stream(
         text=request.text,

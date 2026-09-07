@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from services.llm.memory import LearningConcept, MemoryContext
+from services.knowledge.schemas import KnowledgeContext
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,7 @@ class AgentSkillContext:
 
     memory: MemoryContext
     concepts: list[LearningConcept] = field(default_factory=list)
+    knowledge: KnowledgeContext = field(default_factory=KnowledgeContext)
     tutor_strategy: dict[str, Any] = field(default_factory=dict)
     skill_metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -28,6 +30,10 @@ class AgentSkillContext:
     @property
     def concept_ids(self) -> list[str]:
         return [item.id for item in self.concepts]
+
+    @property
+    def knowledge_chunk_ids(self) -> list[str]:
+        return [item.chunk_id for item in self.knowledge.chunks]
 
 
 class AgentSkill(Protocol):

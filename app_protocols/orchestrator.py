@@ -148,11 +148,16 @@ class ConversationOrchestrator:
         )
 
         buffer: list[str] = []
+        message_done: StreamEvent | None = None
         async for event in self.llm_provider.stream_complete(llm_request):
-            yield event
             if event.event == EventType.MESSAGE_DELTA:
                 text = str(event.data.get("text", ""))
                 buffer.append(text)
+                yield event
+            elif event.event == EventType.MESSAGE_DONE:
+                message_done = event
+            else:
+                yield event
 
         full_text = "".join(buffer).strip()
         if request.output_audio and self.tts_provider and full_text:
@@ -174,7 +179,7 @@ class ConversationOrchestrator:
             async for audio_event in self.tts_provider.stream_synthesize(tts_request):
                 yield audio_event
 
-        yield StreamEvent(
+        yield message_done or StreamEvent(
             event=EventType.MESSAGE_DONE,
             request_id=request.request_id,
             trace_id=request.trace_id,

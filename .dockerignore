@@ -1,6 +1,7 @@
 .git
 **/.git
 **/.env
+**/.env.*
 **/.venv
 **/cuda_env
 **/__pycache__
@@ -20,7 +21,8 @@ logs
 deploy/backups
 services/asr/tests/fixtures
 **/tests
-/models/tts/nana/checkpoint-epoch-7/model.safetensors
+/models/tts/liliya/checkpoint-epoch-0
+/models/tts/liliya/checkpoint-epoch-1/model.safetensors
 *.log
 *.tmp
 *.bak
