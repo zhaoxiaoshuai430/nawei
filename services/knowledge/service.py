@@ -1,11 +1,18 @@
 """Application service coordinating catalog, Qdrant, Neo4j, and caching."""
 
+# GraphRAG 业务核心：文档入库将文本与关系写到不同存储，检索时再组合成可引用证据。
+# catalog(PostgreSQL) 跟踪文档状态，cache(Redis) 缓存检索结果，Qdrant 存向量与片段，Neo4j 存图谱。
+# 阅读顺序：initialize -> ingest/ingest_structured -> retrieve -> delete_document。
+# 所有索引操作都受 knowledge_base_id 约束；这里的公共知识与 LLM 用户记忆分属不同业务边界。
+
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from typing import Any
 
@@ -13,7 +20,7 @@ from services.knowledge.cache import KnowledgeCache
 from services.knowledge.catalog import KnowledgeCatalog
 from services.knowledge.chunker import chunk_text
 from services.knowledge.config import KnowledgeSettings
-from services.knowledge.embeddings import EmbeddingProvider, build_embedding_provider
+from services.knowledge.embeddings import EmbeddingProvider, FastEmbedProvider, build_embedding_provider
 from services.knowledge.entity_resolver import GraphEntityResolver
 from services.knowledge.expansion_planner import KnowledgeExpansionPlanner
 from services.knowledge.extractor import GraphExtractor, build_graph_extractor
@@ -25,6 +32,7 @@ from services.knowledge.schemas import (
     KnowledgeDocumentRequest,
     KnowledgeDocumentResponse,
     KnowledgeRetrieveRequest,
+    GraphCandidate,
     KnowledgeStructuredDocumentRequest,
 )
 
@@ -42,18 +50,24 @@ class KnowledgeService:
         self.qdrant: QdrantKnowledgeStore | None = None
         self.neo4j: Neo4jKnowledgeStore | None = None
         self.last_error: str | None = None
+        self.startup_warmup: dict[str, Any] = {"status": "pending"}
 
     async def initialize(self) -> None:
+        # FastEmbed 在就绪前预热，避免第一条正式查询承担模型首次加载开销。
+        # 向量库初始化会检查模型版本/维度，不能让旧索引与新模型悄悄混用。
         await self.catalog.initialize()
         await self.cache.initialize()
         if not self.settings.enabled:
             return
         try:
+            if isinstance(self.embeddings, FastEmbedProvider):
+                await self.embeddings.embed(["知识检索预热"])
             self.qdrant = QdrantKnowledgeStore(
                 url=self.settings.qdrant_url,
                 api_key=self.settings.qdrant_api_key,
                 collection=self.settings.qdrant_collection,
                 dimension=self.settings.embedding_dimension,
+                embedding_version=self.embeddings.model_id,
             )
             self.neo4j = Neo4jKnowledgeStore(
                 uri=self.settings.neo4j_uri,
@@ -64,10 +78,36 @@ class KnowledgeService:
             await self.qdrant.initialize()
             await self.neo4j.initialize()
             self.last_error = None
+            await self._warm_retrieval()
         except Exception as exc:
             self.last_error = str(exc)
             if self.settings.required:
                 raise RuntimeError(f"Knowledge dependencies are unavailable: {exc}") from exc
+
+    async def _warm_retrieval(self) -> None:
+        if os.getenv("KNOWLEDGE_STARTUP_WARMUP_ENABLED", "true").strip().lower() in {"false", "0", "off", "no"}:
+            self.startup_warmup = {"status": "disabled"}
+            return
+        started = time.perf_counter()
+        timeout = float(os.getenv("KNOWLEDGE_STARTUP_WARMUP_TIMEOUT_SECONDS", "60"))
+        if not 0 < timeout <= 180:
+            raise ValueError("KNOWLEDGE_STARTUP_WARMUP_TIMEOUT_SECONDS must be in (0, 180]")
+        try:
+            async with asyncio.timeout(timeout):
+                # A unique query avoids a Redis hit hiding cold vector/graph connections.
+                context = await self.retrieve(KnowledgeRetrieveRequest(
+                    knowledge_base_id=self.settings.default_base_id,
+                    query=f"知识检索预热 {uuid.uuid4().hex}",
+                    top_k=8, graph_depth=2,
+                    graph_candidates=[GraphCandidate(name="知识检索预热", entity_types=["Concept"], priority=1)],
+                ))
+            self.startup_warmup = {
+                "status": "ready", "elapsed_ms": round((time.perf_counter() - started) * 1000),
+                "timings_ms": context.metadata.get("timings_ms", {}),
+            }
+        except Exception as exc:
+            self.startup_warmup = {"status": "failed", "error_type": type(exc).__name__}
+            raise RuntimeError(f"Knowledge retrieval warmup failed: {type(exc).__name__}") from exc
 
     async def close(self) -> None:
         await self.catalog.close()
@@ -80,6 +120,8 @@ class KnowledgeService:
             await self.neo4j.close()
 
     async def ingest(self, request: KnowledgeDocumentRequest) -> KnowledgeDocumentResponse:
+        # 同一知识库按内容哈希检测已完成的重复导入；文档及片段使用可重复生成的 UUID。
+        # 流程为切块 -> 向量化 -> 抽取实体关系 -> 写双库 -> 标记就绪 -> 失效检索缓存。
         qdrant, neo4j = self._require_stores()
         content_hash = hashlib.sha256(request.content.strip().encode("utf-8")).hexdigest()
         duplicate = await self.catalog.find_ready_by_hash(
@@ -122,6 +164,7 @@ class KnowledgeService:
             mentions: list[dict[str, str]] = []
             relations: list[dict[str, Any]] = []
             for index, (text, vector) in enumerate(zip(texts, vectors, strict=True)):
+                # 同一个 chunk_id 同时用于向量点和图谱 Chunk，检索命中可直接作为图遍历起点。
                 chunk_id = str(uuid.uuid5(uuid.UUID(document_id), f"chunk:{index}"))
                 extraction = await self.extractor.extract(
                     title=request.title,
@@ -197,6 +240,8 @@ class KnowledgeService:
                     }
                 )
 
+            # 先以 indexing 状态写入，再完成图谱写入后置为 ready，避免正常检索使用半成品。
+            # 这不是跨数据库事务；失败时依靠补偿清理，见 _rollback_document。
             await qdrant.upsert_chunks(chunks)
             await neo4j.upsert_document(
                 knowledge_base_id=request.knowledge_base_id,
@@ -439,6 +484,8 @@ class KnowledgeService:
         neo4j: Neo4jKnowledgeStore,
         error: Exception,
     ) -> None:
+        # 尽力标记失败并分别清理双库，不让清理异常覆盖原始入库错误。
+        # 补偿本身也可能失败，因此失败状态和日志仍需保留供后续排查。
         try:
             await self.catalog.fail_document(document_id=document_id, error=str(error))
         except Exception:
@@ -457,9 +504,17 @@ class KnowledgeService:
         return vectors
 
     async def retrieve(self, request: KnowledgeRetrieveRequest) -> KnowledgeContext:
+        # 主路径：缓存 -> 图谱候选解析 -> 问题向量化 -> 片段召回 -> 锚点校验 -> 图关系扩展。
+        # 返回的是证据上下文，不是模型生成的答案；来源与匹配状态交给 LLM 组织引用。
+        started = time.perf_counter()
         qdrant, neo4j = self._require_stores()
         anchor_terms = _normalize_anchor_terms(request.anchor_terms)
+        # 缓存键包含索引、模型、维度与扩展策略，避免切换模型或检索逻辑后复用旧结果。
         route_context = {
+            "collection": self.settings.qdrant_collection,
+            "embedding_provider": self.settings.embedding_provider,
+            "embedding_model": self.embeddings.model_id,
+            "embedding_dimension": self.embeddings.dimension,
             "retrieval_version": _RETRIEVAL_CACHE_VERSION,
             "graph_candidates": [item.model_dump() for item in request.graph_candidates],
             "expansion": request.expansion.model_dump(),
@@ -474,8 +529,11 @@ class KnowledgeService:
         )
         if cached is not None:
             cached.metadata["cache"] = "hit"
+            cached.metadata["timings_ms"] = {"cache_lookup": round((time.perf_counter() - started) * 1000)}
             return cached
 
+        timings = {"cache_lookup": round((time.perf_counter() - started) * 1000)}
+        stage_started = time.perf_counter()
         resolver = GraphEntityResolver(neo4j)
         planner = KnowledgeExpansionPlanner()
         resolved_entities = await resolver.resolve(
@@ -483,7 +541,11 @@ class KnowledgeService:
             candidates=request.graph_candidates,
         )
         qdrant_filters = planner.qdrant_filters(resolved_entities)
+        timings["entity_resolution"] = round((time.perf_counter() - stage_started) * 1000)
+        stage_started = time.perf_counter()
         vector = (await self.embeddings.embed([request.query]))[0]
+        timings["embedding"] = round((time.perf_counter() - stage_started) * 1000)
+        stage_started = time.perf_counter()
         chunks = await qdrant.search(
             knowledge_base_id=request.knowledge_base_id,
             query=request.query,
@@ -492,6 +554,7 @@ class KnowledgeService:
             filters=qdrant_filters,
         )
         if qdrant_filters and not chunks:
+            # 图谱限定范围无结果时放宽过滤，但仍限制在同一 knowledge_base_id 内。
             chunks = await qdrant.search(
                 knowledge_base_id=request.knowledge_base_id,
                 query=request.query,
@@ -500,7 +563,10 @@ class KnowledgeService:
                 filters=None,
             )
         retrieved_chunk_count = len(chunks)
+        timings["vector_and_lexical_search"] = round((time.perf_counter() - stage_started) * 1000)
+        stage_started = time.perf_counter()
         if anchor_terms:
+            # 片段必须实际提到锚点概念；仅命中宽泛学科节点，不等于有具体公式的文本证据。
             chunks = [chunk for chunk in chunks if _chunk_matches_anchor(chunk, anchor_terms)]
         relation_groups = (
             await neo4j.expand_entities(
@@ -517,6 +583,7 @@ class KnowledgeService:
         )
         if chunk_relations:
             relation_groups["chunk_relations"] = chunk_relations
+        timings["graph_expansion"] = round((time.perf_counter() - stage_started) * 1000)
         context = GroundingAssembler().assemble(
             knowledge_base_id=request.knowledge_base_id,
             query=request.query,
@@ -527,6 +594,7 @@ class KnowledgeService:
             retrieved_chunk_count=retrieved_chunk_count,
             metadata={
                 "cache": "miss",
+                "timings_ms": timings,
                 "embedding_model": self.embeddings.model_id,
                 "qdrant_filters": qdrant_filters,
                 "graph_candidate_count": len(request.graph_candidates),
@@ -542,6 +610,7 @@ class KnowledgeService:
         return context
 
     async def delete_document(self, document_id: str) -> bool:
+        # 删除需同时处理向量、图谱、目录及缓存；只删一处会留下可被检索到的旧证据。
         qdrant, neo4j = self._require_stores()
         document = await self.catalog.get_document(document_id)
         if document is None:
@@ -571,6 +640,7 @@ class KnowledgeService:
             "postgres": catalog_status,
             "redis": "ok" if self.cache.redis is not None else "fallback",
             "embedding_model": self.embeddings.model_id,
+            "startup_warmup": self.startup_warmup,
         }
 
     def _require_stores(self) -> tuple[QdrantKnowledgeStore, Neo4jKnowledgeStore]:

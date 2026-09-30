@@ -15,15 +15,27 @@ except ImportError:  # pragma: no cover - dependency validated by live health
 
 
 class QdrantKnowledgeStore:
-    def __init__(self, *, url: str, api_key: str, collection: str, dimension: int) -> None:
+    def __init__(self, *, url: str, api_key: str, collection: str, dimension: int, embedding_version: str | None = None) -> None:
         if AsyncQdrantClient is None or models is None:
             raise RuntimeError("qdrant-client is not installed.")
         self.collection = collection
         self.dimension = dimension
+        self.embedding_version = embedding_version
         self.client = AsyncQdrantClient(url=url, api_key=api_key or None, timeout=30)
 
     async def initialize(self) -> None:
-        if not await self.client.collection_exists(self.collection):
+        if await self.client.collection_exists(self.collection):
+            info = await self.client.get_collection(self.collection)
+            vectors = info.config.params.vectors
+            if not isinstance(vectors, models.VectorParams) or vectors.size != self.dimension or vectors.distance != models.Distance.COSINE:
+                raise ValueError("Existing Qdrant collection is incompatible; create a separate embedding index")
+            if self.embedding_version:
+                mismatched = await self.client.count(self.collection, count_filter=models.Filter(must_not=[
+                    models.FieldCondition(key="embedding_version", match=models.MatchValue(value=self.embedding_version)),
+                ]), exact=True)
+                if mismatched.count:
+                    raise ValueError("Existing Qdrant collection contains a different embedding version")
+        else:
             await self.client.create_collection(
                 collection_name=self.collection,
                 vectors_config=models.VectorParams(size=self.dimension, distance=models.Distance.COSINE),

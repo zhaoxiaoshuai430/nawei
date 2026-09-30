@@ -1,0 +1,12 @@
+[
+  {"query": "公交车突然刹车时，乘客为何向前倾倒？", "expected_terms": ["惯性"]},
+  {"query": "不受合外力的运动物体会慢慢停下来吗？", "expected_terms": ["牛顿第一定律", "惯性"]},
+  {"query": "直角三角形中，对边长度除以斜边长度对应什么？", "expected_terms": ["正弦"]},
+  {"query": "什么数学工具适合表示周而复始的振荡？", "expected_terms": ["三角函数", "正弦", "余弦"]},
+  {"query": "圆上的点怎么把角度和横纵坐标联系起来？", "expected_terms": ["单位圆"]},
+  {"query": "邻边与斜边的比例叫什么？", "expected_terms": ["余弦"]},
+  {"query": "力究竟维持运动还是改变运动？", "expected_terms": ["惯性", "牛顿第一定律"]},
+  {"query": "角度增大一整圈之后，正弦值为什么重复？", "expected_terms": ["周期", "单位圆"]},
+  {"query": "我家路由器的管理密码是多少？", "expected_terms": []},
+  {"query": "请告诉我明天彩票开奖的确切号码。", "expected_terms": []}
+]

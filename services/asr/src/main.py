@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Standalone SenseVoice ASR service with HTTP and realtime PCM input."""
+# ASR 主入口：音频解码/格式归一化 -> 容量控制 -> SenseVoice 推理 -> 标准转写结果。
+# HTTP 接收完整音频；原生 WebSocket 接收 PCM16，在说话期间增量解码，由 VAD 确定段落边界。
+# Paraformer 实时入口返回增量 partial；原 SenseVoice 分段入口和上传接口保持可用。
+# 阅读顺序：_recognize_content_async -> transcribe_standard_base64 -> realtime_transcribe。
 from __future__ import annotations
 
 import asyncio
@@ -45,7 +49,7 @@ os.environ.setdefault("HF_HOME", str(HUGGINGFACE_CACHE_DIR))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(HUGGINGFACE_CACHE_DIR / "transformers"))
 os.environ.setdefault("XDG_CACHE_HOME", str(ASR_CACHE_DIR))
 
-from runtime_tools import ensure_ffmpeg_on_path, resolve_model_source
+from runtime_tools import ensure_ffmpeg_on_path, is_native_pcm_wav, resolve_model_source
 
 ensure_ffmpeg_on_path()
 
@@ -61,6 +65,9 @@ from asr_protocol import STREAMING_MODE, decode_base64_audio, read_upload_limite
 from inference_capacity import CapacityRejected, InferenceCapacity
 from realtime import PCM16VadSegmenter, RealtimeVadConfig
 from service_security import asr_cors_origins, require_asr_internal_api_key, verify_asr_internal_api_key
+from streaming_model import ParaformerStreamingPool
+from streaming_realtime import serve_streaming
+from text_correction import correct_transcript
 from tags import parse_sensevoice_raw
 
 MODEL_ID = os.environ.get("ASR_MODEL_ID", "iic/SenseVoiceSmall")
@@ -99,6 +106,8 @@ if cors_origins:
     )
 ASR_API_DEPENDENCIES = [Depends(require_asr_internal_api_key)]
 
+# 模型在模块初始化时加载并复用，不是每次请求重新加载；首次启动包含权重加载耗时。
+# HTTP 与实时识别共用同一模型，实际并发由 INFERENCE_CAPACITY 控制。
 print(f"Loading {MODEL_ID} from {MODEL_SOURCE} on {DEVICE} ...")
 model = AutoModel(
     model=MODEL_SOURCE,
@@ -111,6 +120,19 @@ model = AutoModel(
     check_latest=False,
 )
 print("SenseVoice model ready.")
+
+REALTIME_BACKEND = os.getenv("ASR_REALTIME_BACKEND", "sensevoice").strip().lower()
+if REALTIME_BACKEND not in {"sensevoice", "paraformer"}:
+    raise ValueError("ASR_REALTIME_BACKEND must be sensevoice or paraformer.")
+STREAMING_MODEL = (
+    ParaformerStreamingPool(
+        Path(os.getenv("ASR_STREAMING_MODEL_PATH", str(MODEL_ROOT / "asr" / "paraformer-online"))),
+        device=os.getenv("ASR_STREAMING_DEVICE", "cpu"),
+        threads=int(os.getenv("ASR_STREAMING_THREADS", "2")),
+        workers=int(os.getenv("ASR_STREAMING_WORKERS", "1")),
+    )
+    if REALTIME_BACKEND == "paraformer" else None
+)
 
 
 def _find_ffmpeg() -> str:
@@ -128,6 +150,8 @@ def _find_ffmpeg() -> str:
 
 
 def _prepare_wav_path(content: bytes, suffix: str) -> tuple[str, list[str]]:
+    # 可直接使用的 PCM WAV 不额外转码；其余格式交给 FFmpeg 转为 16 kHz 单声道。
+    # 返回路径及清理清单，成功时调用者负责回收；本函数失败时自行删除已创建的文件。
     suffix = (suffix or ".wav").lower()
     cleanup: list[str] = []
     try:
@@ -135,6 +159,8 @@ def _prepare_wav_path(content: bytes, suffix: str) -> tuple[str, list[str]]:
             src.write(content)
             src_path = src.name
         cleanup.append(src_path)
+        if is_native_pcm_wav(content):
+            return src_path, cleanup
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as dst:
             dst_path = dst.name
         cleanup.append(dst_path)
@@ -158,6 +184,7 @@ def _prepare_wav_path(content: bytes, suffix: str) -> tuple[str, list[str]]:
 
 def _pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000, channels: int = 1, bits: int = 16) -> bytes:
     """Convert raw PCM data to WAV format."""
+    # 原始 PCM 没有采样率/声道等文件头；这里仅补 WAV 容器，不执行重采样。
     import wave
     buffer = io.BytesIO()
     with wave.open(buffer, 'wb') as wf:
@@ -179,10 +206,15 @@ def _recognize_wav(wav_path: str, lang: str = "auto", use_itn: bool = True) -> d
     )
     raw = res[0]["text"] if res else ""
     meta = parse_sensevoice_raw(raw)
+    clean_text = rich_transcription_postprocess(raw) if raw else ""
+    correction = correct_transcript(clean_text)
     return {
-        "text": rich_transcription_postprocess(raw) if raw else "",
-        "language": meta.get("language", ""),
         **meta,
+        "text": correction.text,
+        "language": meta.get("language", ""),
+        "raw_text": raw,
+        "clean_text": correction.text,
+        "corrections": list(correction.applied),
     }
 
 
@@ -228,15 +260,18 @@ def _recognize_content(
         )
         raw = res[0]["text"] if res else ""
         meta = parse_sensevoice_raw(raw)
+        clean_text = rich_transcription_postprocess(raw) if raw else ""
+        correction = correct_transcript(clean_text)
         item = {
-            "key": key,
-            "text": rich_transcription_postprocess(raw) if raw else "",
-            "language": meta.get("language", ""),
             **meta,
+            "key": key,
+            "text": correction.text,
+            "language": meta.get("language", ""),
+            "corrections": list(correction.applied),
         }
         if include_raw:
             item["raw_text"] = raw
-            item["clean_text"] = TAG_RE.sub("", raw)
+            item["clean_text"] = correction.text
         return item
     finally:
         for p in cleanup:
@@ -245,6 +280,9 @@ def _recognize_content(
 
 
 async def _run_inference_thread(function: Any, /, *args: Any, **kwargs: Any) -> Any:
+    # 同步解码和模型推理移到线程，避免阻塞 FastAPI 的事件循环。
+    # 取消协程不能停止已运行的线程，所以等待 worker 真正结束后再向外传播取消，
+    # 使外层容量租约不会在模型仍占用资源时提前释放。
     worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
     try:
         return await asyncio.shield(worker)
@@ -256,6 +294,7 @@ async def _run_inference_thread(function: Any, /, *args: Any, **kwargs: Any) -> 
 async def _recognize_content_async(**kwargs: Any) -> dict[str, Any]:
     """Run blocking audio decoding and model inference without blocking FastAPI."""
 
+    # 排队超限或等待超时返回 429，并提供 Retry-After；不无界积压 GPU 推理请求。
     try:
         lease = await INFERENCE_CAPACITY.acquire()
     except CapacityRejected as exc:
@@ -325,23 +364,36 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "model": MODEL_ID,
         "device": DEVICE,
-        "streaming": streaming_capabilities(),
+        "streaming": streaming_capabilities(native=STREAMING_MODEL is not None),
         "concurrency": vars(INFERENCE_CAPACITY.snapshot()),
+        "streaming_concurrency": STREAMING_MODEL.snapshot() if STREAMING_MODEL is not None else None,
     }
 
 
 @app.get("/api/v1/capabilities")
 async def capabilities() -> dict[str, object]:
     return {
-        **streaming_capabilities(),
+        **streaming_capabilities(native=STREAMING_MODEL is not None),
         "concurrency": vars(INFERENCE_CAPACITY.snapshot()),
+        "streaming_concurrency": STREAMING_MODEL.snapshot() if STREAMING_MODEL is not None else None,
     }
 
 
 @app.websocket("/api/v1/asr/realtime")
 async def realtime_transcribe(websocket: WebSocket) -> None:
+    if STREAMING_MODEL is not None:
+        with STREAMING_MODEL.session() as decoder:
+            await serve_streaming(websocket, decoder)
+    else:
+        await sensevoice_realtime_transcribe(websocket)
+
+
+@app.websocket("/api/v1/asr/realtime/sensevoice")
+async def sensevoice_realtime_transcribe(websocket: WebSocket) -> None:
     """Accept mono 16 kHz PCM16 frames and emit VAD-finalized transcripts."""
 
+    # 首条 JSON 声明音频格式并携带内部服务凭证，后续二进制帧才是音频。
+    # 接收循环做 VAD，后台 worker 按序识别；发送锁避免控制事件和结果同时写连接。
     await websocket.accept()
     connection_open = True
     send_lock = asyncio.Lock()
@@ -387,6 +439,7 @@ async def realtime_transcribe(websocket: WebSocket) -> None:
         use_itn = bool(start.get("use_itn", True))
         max_session_seconds = float(os.getenv("ASR_REALTIME_MAX_SESSION_SECONDS", "3600"))
         max_session_bytes = int(config.sample_rate * max_session_seconds * 2)
+        # 一个队列元素是一段完整语音，而非一个网络包；有界队列限制待识别音频量。
         segment_queue: asyncio.Queue[tuple[int, bytes] | None] = asyncio.Queue(
             maxsize=int(os.getenv("ASR_REALTIME_SEGMENT_QUEUE_SIZE", "4"))
         )
@@ -492,6 +545,8 @@ async def realtime_transcribe(websocket: WebSocket) -> None:
                     await send_json({"type": "error", "code": "invalid_command", "message": "Unknown command."})
 
             if connection_open:
+                # stop 后排出 VAD 尚未结束的尾段，等待识别队列清空再发 session.done。
+                # 客户端只有收到 session.done，才能确认最后一句也已完成处理。
                 for event in segmenter.flush():
                     if event.kind == "segment":
                         await send_json({"type": "speech.ended", "segment_index": segment_index})
@@ -616,6 +671,7 @@ class ASRDetails(ProtocolModel):
     emotion_hint: Optional[str] = None
     raw_text: Optional[str] = None
     clean_text: Optional[str] = None
+    corrections: list[dict[str, str]] = Field(default_factory=list)
 
 
 class ASRResponse(ProtocolModel):
@@ -652,6 +708,7 @@ def _asr_item_to_standard_response(request: ASRRequest, item: dict[str, Any]) ->
             emotion_hint=item.get("emotion_hint"),
             raw_text=item.get("raw_text"),
             clean_text=item.get("clean_text") or text,
+            corrections=item.get("corrections") or [],
         ),
         metadata={
             "provider": "sensevoice",
@@ -693,6 +750,7 @@ async def transcribe_base64(request: Base64Request) -> dict[str, Any]:
     dependencies=ASR_API_DEPENDENCIES,
 )
 async def transcribe_standard_base64(request: ASRRequest) -> ASRResponse:
+    # 标准 DTO 虽定义 audio_url，当前实现只支持 audio_base64，不能静默忽略 URL。
     if request.audio_url:
         raise HTTPException(status_code=400, detail="audio_url is not supported by this ASR service yet.")
     if not request.audio_base64:
@@ -704,6 +762,13 @@ async def transcribe_standard_base64(request: ASRRequest) -> ASRResponse:
     content = _decode_base64_audio(request.audio_base64)
 
     try:
+        if request.format.strip().lower() == "pcm16":
+            # 每帧字节数 = 2 字节采样 * 声道数；不完整帧返回 400，防止音频错位。
+            # 先按请求中的真实采样率封装 WAV，再交给公共解码流程处理。
+            if len(content) % (2 * request.channels):
+                raise HTTPException(status_code=400, detail="PCM16 audio must contain complete sample frames.")
+            content = _pcm_to_wav(content, sample_rate=request.sample_rate, channels=request.channels)
+            suffix = ".wav"
         item = await _recognize_content_async(
             content=content,
             suffix=suffix,

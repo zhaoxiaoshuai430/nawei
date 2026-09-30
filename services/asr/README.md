@@ -41,6 +41,11 @@ Alias:
 POST http://127.0.0.1:8001/api/v1/asr/transcriptions
 ```
 
+For raw little-endian PCM16, set `format` to `pcm16` and provide the actual
+`sample_rate` and `channels`. The service wraps these samples in a WAV container
+before decoding. Each payload must contain complete frames (two bytes per
+channel); incomplete frames return HTTP 400.
+
 Request body:
 
 ```json
@@ -133,13 +138,13 @@ The first WebSocket message is JSON:
 }
 ```
 
-After the `ready` event, send little-endian mono PCM16 as binary messages. Send
-`{"type":"stop"}` to flush the active utterance. The service performs
+With either backend, after `ready`, send little-endian mono PCM16 as binary messages. Send
+`{"type":"stop"}` to flush the active utterance. With the legacy SenseVoice backend, the service performs
 energy-based VAD, queues completed utterances through the normal inference
 capacity limiter, and emits `speech.started`, `speech.ended`,
 `transcript.processing`, `transcript.final`, and `session.done` events.
 
-This is realtime audio input with sentence-level final results. SenseVoice still
+The SenseVoice backend provides realtime input with sentence-level final results. SenseVoice still
 does not retain decoder state, so `partial` word/token results are intentionally
 not advertised.
 
@@ -165,5 +170,31 @@ not advertised.
 | `ASR_REALTIME_MAX_SEGMENT_SECONDS` | `20` | Maximum duration before a segment is forcibly finalized |
 | `ASR_REALTIME_MAX_SESSION_SECONDS` | `3600` | Maximum PCM duration accepted by one WebSocket session; raise it for longer continuous dictation |
 | `ASR_REALTIME_SEGMENT_QUEUE_SIZE` | `4` | Completed utterances buffered while inference is busy |
+| `ASR_TEXT_CORRECTIONS_ENABLED` | `true` | Apply conservative corrections to finalized transcripts |
+| `ASR_TEXT_CORRECTIONS_INCLUDE_DEFAULTS` | `true` | Include built-in corrections for observed command phrases |
+| `ASR_TEXT_CORRECTIONS_JSON` | empty | JSON phrase map added after model decoding; use contextual phrases instead of single characters |
 
 The service sets ModelScope and HuggingFace cache variables to project-local paths under `hf_download` so it does not write to the Windows user cache directory. Complete local snapshots are preferred automatically, and routine FunASR/ModelScope update checks are disabled during service startup.
+# Native online ASR
+
+The Windows launcher selects `ASR_REALTIME_BACKEND=paraformer`; direct standalone
+launch and production Compose retain `sensevoice` unless explicitly configured.
+Prepare the additional model with `scripts/prepare_streaming_asr.py --download`
+using the ASR interpreter from the project root.
+
+- `ASR_STREAMING_MODEL_PATH`: local `models/asr/paraformer-online` directory.
+- `ASR_STREAMING_DEVICE`: `cpu` by default, separate from the SenseVoice device.
+- `ASR_STREAMING_THREADS`: `2` by default.
+- Realtime input: 16 kHz, mono, little-endian PCM16; packets up to 32000 bytes.
+- Native decoding: `[0, 10, 5]` chunks, 600 ms stride, connection-local caches.
+- `transcript.partial.text` is the current segment's complete snapshot, not a delta.
+- `transcript.final` replaces that snapshot and resets decoder state for the next segment.
+- Final events preserve `raw_text` and expose corrected `text`/`clean_text` plus applied correction metadata.
+- `stop` flushes residual PCM and decoder tokens before `session.done`.
+- Explicit legacy route: `/api/v1/asr/realtime/sensevoice`.
+- HTTP upload endpoints and their SenseVoice behavior remain unchanged.
+
+`/health` and `/api/v1/capabilities` distinguish native WebSocket streaming from
+the existing independent HTTP chunk mode. The online model targets Chinese and
+does not provide SenseVoice emotion/event tags. Use the legacy path when those
+capabilities or the original multilingual recognition are required.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 
 import httpx
 import pytest
@@ -79,6 +80,65 @@ def test_detailed_status_requires_identity(monkeypatch: pytest.MonkeyPatch) -> N
     assert "concurrency" in authorized.json()
 
 
+async def test_health_probe_bounds_total_wait_and_reports_timeout(monkeypatch):
+    monkeypatch.setenv("GATEWAY_HEALTH_TIMEOUT_SECONDS", "0.02")
+    cancelled = asyncio.Event()
+
+    async def stalled(request):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(stalled)) as client:
+        result = await asyncio.wait_for(
+            gateway_main._probe_dependency(client, "llm", "http://test/health"), timeout=1,
+        )
+    assert not result["ready"]
+    assert result["error_type"] == "TimeoutError"
+    assert cancelled.is_set()
+
+
+async def test_health_probe_allows_slow_healthy_dependency(monkeypatch):
+    monkeypatch.delenv("GATEWAY_HEALTH_TIMEOUT_SECONDS", raising=False)
+    finished = asyncio.Event()
+
+    async def respond(reader, writer):
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            await asyncio.sleep(3.2)
+            body = b'{"status":"ok"}'
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            finished.set()
+
+    server = await asyncio.start_server(respond, "127.0.0.1", 0)
+    try:
+        port = server.sockets[0].getsockname()[1]
+        async with httpx.AsyncClient(timeout=gateway_main.DEFAULT_HEALTH_TIMEOUT_SECONDS, trust_env=False) as client:
+            result = await gateway_main._probe_dependency(client, "llm", f"http://127.0.0.1:{port}/health")
+        assert result["ready"]
+    finally:
+        server.close()
+        await server.wait_closed()
+        await asyncio.wait_for(finished.wait(), timeout=5)
+
+
+@pytest.mark.parametrize("body", [[], {"status": "degraded"}])
+async def test_health_probe_rejects_invalid_or_unready_responses(body):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body))) as client:
+        result = await gateway_main._probe_dependency(client, "llm", "http://test/health")
+    assert not result["ready"]
+    if isinstance(body, list):
+        assert result["error_type"] == "ValueError"
+
+
 def test_legacy_asr_document_preserves_timing_and_confidence() -> None:
     request = ASRRequest(
         request_id="r",
@@ -98,6 +158,7 @@ def test_legacy_asr_document_preserves_timing_and_confidence() -> None:
                     "duration_ms": 420,
                     "segments": [{"start_ms": 0, "end_ms": 420, "text": "hello"}],
                     "metadata": {"decoder": "legacy"},
+                    "corrections": [{"source": "helo", "replacement": "hello", "occurrences": "1"}],
                 }
             ]
         },
@@ -107,6 +168,7 @@ def test_legacy_asr_document_preserves_timing_and_confidence() -> None:
     assert response.duration_ms == 420
     assert response.segments[0].end_ms == 420
     assert response.metadata["decoder"] == "legacy"
+    assert response.asr.corrections == [{"source": "helo", "replacement": "hello", "occurrences": "1"}]
 
 
 @pytest.mark.parametrize("status_code", [400, 408, 409, 413, 415, 422, 429])

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import ssl
 import time
 import urllib.error
@@ -14,7 +15,7 @@ import uuid
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
-    parser.add_argument("--token")
+    parser.add_argument("--token", default=os.getenv("NAWEI_SMOKE_TOKEN"))
     parser.add_argument("--user-id")
     parser.add_argument("--insecure", action="store_true")
     args = parser.parse_args()
@@ -28,12 +29,12 @@ def main() -> None:
 
     status = _request_json(f"{base_url}/api/v1/status", context=context)
     services = status.get("services")
-    if not isinstance(services, dict):
+    if status.get("status") != "ready" or not isinstance(services, dict):
         raise SystemExit(f"Gateway status response has no services object: {status}")
     unavailable = [
         str(name)
-        for name, detail in services.items()
-        if not isinstance(detail, dict) or not detail.get("ready")
+        for name in ("asr", "llm", "tts")
+        if not isinstance(services.get(name), dict) or services[name].get("ready") is not True
     ]
     if unavailable:
         raise SystemExit(f"Dependencies are not ready: {', '.join(unavailable)}")

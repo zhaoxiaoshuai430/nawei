@@ -1,5 +1,6 @@
 global:
   scrape_interval: 15s
+  scrape_timeout: 14s
   evaluation_interval: 15s
 
 rule_files:
@@ -12,10 +13,25 @@ scrape_configs:
       module: [http_2xx]
     static_configs:
       - targets:
-          - http://gateway:8000/health
+          - http://gateway:8000/ready
           - http://asr:8001/health
           - http://tts:19000/api/v1/status
-          - http://llm:8002/health
+          - http://llm:8002/ready
+          - http://knowledge:8003/health
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  - job_name: nawei-gateway-liveness
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets: [http://gateway:8000/health]
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target

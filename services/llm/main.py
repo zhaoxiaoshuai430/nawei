@@ -1,18 +1,25 @@
 """LLM service using app_protocols DTOs and a DeepSeek-compatible backend."""
 
+# LLM 的 HTTP/SSE 边界：接收统一请求，执行安全检查，调用 Agent 和模型并返回事件。
+# 主流程：complete_llm/stream_llm -> agent_runtime.prepare -> 模型/工具 -> after_turn。
+# 模型网络调用在本文件，上下文和工具编排见 agent_runtime.py，存储细节见 memory.py。
+# stub 是测试/占位推理分支；实际模型由运行配置选择，不应把默认值当作当前部署状态。
+
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Mapping
+from typing import Any, AsyncGenerator, AsyncIterator, Mapping
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import Field
 
 from app_protocols import EventType, LLMRequest, LLMResponse, Message, MessageRole, StreamEvent, Usage
@@ -20,7 +27,24 @@ from app_protocols.base import ProtocolModel
 from app_protocols.events import sse_encode
 from services.llm.agent_runtime import AgentTurn, LLMAgentRuntime
 from services.llm.auth import authorize_llm_internal_request
+from services.llm.conversation import FollowupStreamTailBuffer, normalize_followup_answer
+from services.llm.agents.tutor_graph import is_contextual_followup
 from services.llm.safety import LocalSafetyGuard, SafetyDecision, SafetyStreamBuffer
+from services.llm.content_safety import AliyunContentSafety, MAX_TEXT_CHARS, enabled as content_safety_enabled
+from services.llm.response_constraints import (
+    AgeResponseStreamLimiter,
+    constrain_age_response,
+    constrain_teaching_response,
+    recommended_age_max_tokens,
+)
+from services.llm.safety_replies import resolve_safety_age
+from services.llm.voice_preview import VoicePreviewCache
+from services.llm.drain import LocalDrainMiddleware, LocalDrainState
+
+
+logger = logging.getLogger(__name__)
+voice_previews = VoicePreviewCache()
+voice_preview_slots = asyncio.BoundedSemaphore(2)
 
 try:
     from dotenv import load_dotenv as _load_dotenv
@@ -76,15 +100,31 @@ _load_dotenv_file(DOTENV_PATH)
 
 _deepseek_clients: dict[float, httpx.AsyncClient] = {}
 agent_runtime = LLMAgentRuntime()
+local_drain = LocalDrainState()
 safety_guard: LocalSafetyGuard = agent_runtime.safety_guard
+content_safety = AliyunContentSafety()
 
 
 @asynccontextmanager
 async def _llm_lifespan(application: FastAPI) -> AsyncIterator[None]:
+    # 先初始化记忆和知识依赖；停机时先等待 Agent 的后台写入，再关闭网络连接池。
     await agent_runtime.initialize()
+    drain_task = asyncio.create_task(local_drain.monitor(agent_runtime))
+    warmup_task = (
+        asyncio.create_task(_warm_deepseek_transport())
+        if _read_bool_env("LLM_UPSTREAM_WARMUP_ENABLED", True)
+        else None
+    )
+    await asyncio.sleep(0)
     try:
         yield
     finally:
+        drain_task.cancel()
+        await asyncio.gather(drain_task, return_exceptions=True)
+        if warmup_task is not None:
+            if not warmup_task.done():
+                warmup_task.cancel()
+            await asyncio.gather(warmup_task, return_exceptions=True)
         await agent_runtime.close()
         for client in list(_deepseek_clients.values()):
             close = getattr(client, "aclose", None)
@@ -93,7 +133,27 @@ async def _llm_lifespan(application: FastAPI) -> AsyncIterator[None]:
         _deepseek_clients.clear()
 
 
+async def _warm_deepseek_transport() -> None:
+    try:
+        settings = load_settings()
+    except HTTPException:
+        return
+    if settings.is_stub:
+        return
+    headers = {"Authorization": f"Bearer {settings.api_key}"} if settings.api_key else {}
+    try:
+        async with asyncio.timeout(_read_float_env("LLM_UPSTREAM_WARMUP_TIMEOUT_SECONDS", 5.0)):
+            response = await _deepseek_client(settings.timeout_seconds).get(
+                _models_url(settings.base_url),
+                headers=headers,
+            )
+            logger.info("LLM upstream transport warmup status=%d", response.status_code)
+    except (TimeoutError, httpx.HTTPError, ValueError) as exc:
+        logger.info("LLM upstream transport warmup skipped error_type=%s", type(exc).__name__)
+
+
 app = FastAPI(title="Xiaowei Agentic LLM Service", version="0.3.0", lifespan=_llm_lifespan)
+app.add_middleware(LocalDrainMiddleware, state=local_drain)
 
 
 @dataclass(frozen=True)
@@ -139,12 +199,24 @@ async def health() -> dict[str, Any]:
     memory = runtime["memory"]
     required = _read_bool_env("LLM_MEMORY_REQUIRED", False)
     ready = not required or all(memory.get(name) == "ok" for name in ("postgres", "redis"))
+    if _read_bool_env("KNOWLEDGE_REQUIRED", False):
+        ready = ready and runtime["knowledge"].get("status") == "ok"
     return {
         "status": "ok" if ready else "degraded",
         "model": settings.model,
         "provider": settings.provider,
         "runtime": runtime,
+        "content_safety": {"enabled": content_safety_enabled(), "provider": "aliyun",
+                           "service": "chat_detection", "output_mode": "buffer_before_review"},
     }
+
+
+@app.get("/ready")
+async def readiness() -> JSONResponse:
+    if local_drain.requested():
+        return JSONResponse({"status": "draining"}, status_code=503)
+    body = await health()
+    return JSONResponse({"status": body["status"]}, status_code=200 if body["status"] == "ok" else 503)
 
 
 @app.get(
@@ -169,6 +241,8 @@ async def inspect_memory(
 ) -> dict[str, Any]:
     """Inspect one user's LLM-owned profile, history, memories, and concepts."""
 
+    # 这是内部管理接口，不是浏览器匿名 API；访问权限由路由的内部鉴权依赖控制。
+    # user_id 选择数据归属，session_id 选择会话，query 用于检索相关记忆。
     return await agent_runtime.memory_store.inspect(
         user_id=user_id,
         session_id=session_id,
@@ -242,38 +316,76 @@ async def clear_memory(user_id: str, session_id: str | None = None) -> dict[str,
 )
 async def complete_llm(request: LLMRequest) -> LLMResponse:
     """Run Agent, Skills, Tools, Memory, and configured inference as one turn."""
+    if request.defer_persistence:
+        if voice_preview_slots.locked():
+            raise HTTPException(status_code=429, detail="Voice preview capacity is full.")
+        async with voice_preview_slots:
+            try:
+                async with asyncio.timeout(30):
+                    return await _complete_llm(request)
+            except TimeoutError as exc:
+                raise HTTPException(status_code=504, detail="Voice preview timed out.") from exc
+    return await _complete_llm(request)
 
-    request, input_decision = _audit_request_input(request)
+
+async def _complete_llm(request: LLMRequest) -> LLMResponse:
+
+    # 输入先审查，再准备上下文，避免把已阻断内容交给模型或工具。
+    # direct_answer 可来自确定性工具/记忆结果；否则选择 stub、原生工具调用或普通推理。
+    # 各成功分支统一经过 _finalize_agent_response，保证输出审查与记忆处理规则一致。
+    safety_age = await _resolve_request_safety_age(request)
+    request, input_decision = _audit_request_input(request, age=safety_age)
+    input_decision = await content_safety.audit(
+        input_decision, stage="input", request_id=request.request_id, age=safety_age,
+    )
     if input_decision.blocked:
         return _blocked_input_response(request, input_decision)
     settings = load_settings()
     turn: AgentTurn | None = None
     try:
+        cached = voice_previews.take(request) if not request.defer_persistence else None
+        if cached is not None:
+            turn, response = cached
+            return await _finalize_agent_response(turn, response, input_decision=input_decision, safety_age=safety_age)
         turn = await agent_runtime.prepare(request)
-        if settings.is_stub:
+        _apply_age_generation_budget(turn.request, _turn_response_policy(turn))
+        if turn.direct_answer is not None:
+            response = LLMResponse(
+                request_id=request.request_id, text=turn.direct_answer, finish_reason="stop",
+                usage=Usage(input_tokens=0, output_tokens=0), metadata={"provider": "llm-direct"},
+            )
+        elif settings.is_stub:
             response = complete_stub(turn.request)
         elif _native_tool_calling_requested(turn.request):
             response = await _complete_deepseek_with_native_tools(turn, settings)
         else:
             response = await complete_deepseek(turn.request, settings)
-        return await _finalize_agent_response(turn, response, input_decision=input_decision)
+        return await _finalize_agent_response(
+            turn, response, input_decision=input_decision, safety_age=safety_age,
+        )
     except httpx.HTTPStatusError as exc:
         if settings.fallback_enabled:
             active_request = turn.request if turn is not None else request
             response = fallback_response(active_request, settings, reason=_extract_upstream_error(exc.response), status_code=exc.response.status_code)
-            return await _finalize_agent_response(turn, response, input_decision=input_decision)
+            return await _finalize_agent_response(
+                turn, response, input_decision=input_decision, safety_age=safety_age,
+            )
         raise HTTPException(status_code=502, detail=_extract_upstream_error(exc.response)) from exc
     except httpx.HTTPError as exc:
         if settings.fallback_enabled:
             active_request = turn.request if turn is not None else request
             response = fallback_response(active_request, settings, reason=f"LLM upstream request failed: {exc}")
-            return await _finalize_agent_response(turn, response, input_decision=input_decision)
+            return await _finalize_agent_response(
+                turn, response, input_decision=input_decision, safety_age=safety_age,
+            )
         raise HTTPException(status_code=502, detail=f"LLM upstream request failed: {exc}") from exc
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         if settings.fallback_enabled:
             active_request = turn.request if turn is not None else request
             response = fallback_response(active_request, settings, reason=f"Invalid LLM upstream response: {exc}")
-            return await _finalize_agent_response(turn, response, input_decision=input_decision)
+            return await _finalize_agent_response(
+                turn, response, input_decision=input_decision, safety_age=safety_age,
+            )
         raise HTTPException(status_code=502, detail=f"Invalid LLM upstream response: {exc}") from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=f"LLM Agent runtime unavailable: {exc}") from exc
@@ -286,24 +398,56 @@ async def complete_llm(request: LLMRequest) -> LLMResponse:
 async def stream_llm(request: LLMRequest) -> StreamingResponse:
     """Stream one complete Agent and inference turn as canonical SSE."""
 
-    request, input_decision = _audit_request_input(request)
+    # 与非流式接口执行同样的 Agent 流程，但用 message.delta 逐步发送正文。
+    # HTTP 响应建立后的运行错误以 SSE 事件传递，不再改变已经发出的响应头。
+    safety_age = await _resolve_request_safety_age(request)
+    request, input_decision = _audit_request_input(request, age=safety_age)
+    input_decision = await content_safety.audit(
+        input_decision, stage="input", request_id=request.request_id, age=safety_age,
+    )
     settings = load_settings()
 
     async def event_source() -> AsyncIterator[str]:
         if input_decision.blocked:
             yield sse_encode(_safety_delta_event(request, input_decision.content))
-            yield sse_encode(_safety_done_event(request, input_decision=input_decision))
+            yield sse_encode(_safety_done_event(request, input_decision=input_decision, age=safety_age))
             return
         try:
+            cached = voice_previews.take(request) if not request.defer_persistence else None
+            if cached is not None:
+                cached_turn, cached_response = cached
+                reviewed = await _finalize_agent_response(
+                    cached_turn, cached_response, input_decision=input_decision, safety_age=safety_age,
+                )
+                for text in _text_chunks(reviewed.text, size=_stream_chunk_chars()):
+                    yield sse_encode(_stream_text_event(request, text, template=None))
+                yield sse_encode(StreamEvent(
+                    event=EventType.MESSAGE_DONE, request_id=request.request_id,
+                    trace_id=request.trace_id, session_id=request.session_id,
+                    data={"message_id": request.request_id, "text": reviewed.text,
+                          "finish_reason": reviewed.finish_reason, "usage": _model_to_dict(reviewed.usage),
+                          **reviewed.metadata},
+                ))
+                return
             turn = await agent_runtime.prepare(request)
+            _apply_age_generation_budget(turn.request, _turn_response_policy(turn))
+            if content_safety_enabled():
+                async for frame in _stream_reviewed_turn(turn, settings, input_decision, safety_age):
+                    yield frame
+                return
             safe_parts: list[str] = []
             raw_parts: list[str] = []
             done_event: StreamEvent | None = None
             delta_template: StreamEvent | None = None
             failed = False
-            stream_safety = SafetyStreamBuffer(safety_guard)
+            # 安全词句和收尾邀请可能跨越多个网络片段，需带状态缓冲，不能逐块独立处理。
+            # safe_parts 收集实际发送的文字，后面用于最终事件和持久化，避免三者不一致。
+            stream_safety = SafetyStreamBuffer(safety_guard, age=safety_age)
+            followup_tail = FollowupStreamTailBuffer(enabled=turn.context is not None and is_contextual_followup(turn.user_text))
+            age_stream = AgeResponseStreamLimiter(_turn_response_policy(turn))
             stream_chunk_chars = _stream_chunk_chars()
-            async for event in _stream_backend_with_fallback(turn.request, settings):
+            source = _stream_direct_answer(turn) if turn.direct_answer is not None else _stream_backend_with_fallback(turn.request, settings)
+            async for event in source:
                 tool_agent_metadata = event.data.get("tool_agent")
                 if isinstance(tool_agent_metadata, dict):
                     turn.metadata["tools"] = {
@@ -316,14 +460,16 @@ async def stream_llm(request: LLMRequest) -> StreamingResponse:
                     delta_template = event
                     raw_text = str(event.data.get("text", ""))
                     raw_parts.append(raw_text)
-                    for safe_text in stream_safety.feed(raw_text):
-                        safe_parts.append(safe_text)
-                        chunks = [safe_text] if stream_safety.blocked else _text_chunks(
-                            safe_text,
-                            size=stream_chunk_chars,
-                        )
-                        for text in chunks:
-                            yield sse_encode(_stream_event_with_text(event, text))
+                    normalized_parts = followup_tail.feed(raw_text)
+                    for safe_text in (part for normalized in normalized_parts for part in stream_safety.feed(normalized)):
+                        for constrained_text in age_stream.feed(safe_text):
+                            safe_parts.append(constrained_text)
+                            chunks = [constrained_text] if stream_safety.blocked else _text_chunks(
+                                constrained_text,
+                                size=stream_chunk_chars,
+                            )
+                            for text in chunks:
+                                yield sse_encode(_stream_event_with_text(event, text))
                     if stream_safety.blocked:
                         break
                     continue
@@ -335,17 +481,27 @@ async def stream_llm(request: LLMRequest) -> StreamingResponse:
                 yield sse_encode(event)
             if failed:
                 return
-            for safe_text in stream_safety.finish():
-                safe_parts.append(safe_text)
-                chunks = [safe_text] if stream_safety.blocked else _text_chunks(
-                    safe_text,
+            tail_parts = [part for normalized in followup_tail.finish() for part in stream_safety.feed(normalized)]
+            constrained_tail = [
+                constrained
+                for safe_text in tail_parts + stream_safety.finish()
+                for constrained in age_stream.feed(safe_text)
+            ]
+            constrained_tail.extend(age_stream.finish())
+            for constrained_text in constrained_tail:
+                safe_parts.append(constrained_text)
+                chunks = [constrained_text] if stream_safety.blocked else _text_chunks(
+                    constrained_text,
                     size=stream_chunk_chars,
                 )
                 for text in chunks:
                     yield sse_encode(_stream_text_event(request, text, template=delta_template))
-            output_decision = stream_safety.decision or safety_guard.audit_output("".join(raw_parts))
+            output_decision = stream_safety.decision or safety_guard.audit_output("".join(raw_parts), age=safety_age)
             if output_decision.changed:
                 safety_guard.log(stage="output", decision=output_decision, request_id=request.request_id)
+            turn.metadata["age_constraints"] = age_stream.metadata()
+            # after_turn 在异步模式下只保证安排写入；persistence.scheduled 不表示落库完成。
+            # 延后发送 message.done，确保缓冲尾部先发完，并附上本轮运行与持久化状态。
             persistence = await agent_runtime.after_turn(turn, "".join(safe_parts))
             final_event = done_event or StreamEvent(
                 event=EventType.MESSAGE_DONE,
@@ -355,6 +511,7 @@ async def stream_llm(request: LLMRequest) -> StreamingResponse:
                 data={"message_id": request.request_id, "finish_reason": "stop"},
             )
             final_data = dict(final_event.data)
+            final_data["text"] = "".join(safe_parts)
             if output_decision.blocked:
                 final_data["finish_reason"] = "safety"
             final_data["runtime"] = turn.metadata
@@ -369,6 +526,76 @@ async def stream_llm(request: LLMRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+async def _stream_direct_answer(turn: AgentTurn) -> AsyncGenerator[StreamEvent, None]:
+    for text in _text_chunks(turn.direct_answer or "", size=_stream_chunk_chars()):
+        yield _stream_text_event(turn.request, text, template=None)
+
+
+async def _stream_reviewed_turn(
+    turn: AgentTurn, settings: LLMSettings, input_decision: SafetyDecision, safety_age: int | None,
+) -> AsyncIterator[str]:
+    request = turn.request
+    parts: list[str] = []
+    total = 0
+    overflow = False
+    failed = False
+    done_data: dict[str, Any] = {}
+    source = _stream_direct_answer(turn) if turn.direct_answer is not None else _stream_backend_with_fallback(request, settings)
+    try:
+        async for event in source:
+            if event.event == EventType.MESSAGE_DELTA:
+                text = str(event.data.get("text", ""))
+                total += len(text)
+                if total > MAX_TEXT_CHARS:
+                    overflow = True
+                    parts.clear()
+                    break
+                parts.append(text)
+            elif event.event == EventType.MESSAGE_DONE:
+                done_data = event.data
+                tool_metadata = done_data.get("tool_agent")
+                if isinstance(tool_metadata, dict):
+                    turn.metadata["tools"] = tool_metadata
+            elif event.event == EventType.ERROR:
+                failed = True
+                break
+    finally:
+        await source.aclose()
+    if failed:
+        yield sse_encode(_error_event(request, "LLM response could not be completed."))
+        return
+    response = LLMResponse(
+        request_id=request.request_id, text="".join(parts),
+        finish_reason=str(done_data.get("finish_reason") or "stop"),
+        usage=Usage(**(done_data.get("usage") or {"input_tokens": 0, "output_tokens": 0})),
+    )
+    if overflow:
+        output_decision = content_safety.unavailable(
+            SafetyDecision("allow", ""), stage="output", error_type="ResponseTooLong", age=safety_age,
+        )
+        reviewed = _response_with_safety_metadata(
+            response, safe_text=output_decision.content,
+            input_decision=input_decision, output_decision=output_decision,
+        )
+    else:
+        reviewed = await _finalize_agent_response(
+            turn, response, input_decision=input_decision, safety_age=safety_age,
+        )
+    for text in _text_chunks(reviewed.text, size=_stream_chunk_chars()):
+        yield sse_encode(StreamEvent(
+            event=EventType.MESSAGE_DELTA, request_id=request.request_id,
+            trace_id=request.trace_id, session_id=request.session_id,
+            data={"text": text, "provider": "safety" if reviewed.finish_reason == "safety" else settings.provider},
+        ))
+    yield sse_encode(StreamEvent(
+        event=EventType.MESSAGE_DONE, request_id=request.request_id,
+        trace_id=request.trace_id, session_id=request.session_id,
+        data={"message_id": request.request_id, "text": reviewed.text,
+              "finish_reason": reviewed.finish_reason, "usage": _model_to_dict(reviewed.usage),
+              **reviewed.metadata},
+    ))
 
 
 def complete_stub(request: LLMRequest) -> LLMResponse:
@@ -413,7 +640,7 @@ async def stream_stub(request: LLMRequest) -> AsyncIterator[StreamEvent]:
 async def _stream_backend_with_fallback(
     request: LLMRequest,
     settings: LLMSettings,
-) -> AsyncIterator[StreamEvent]:
+) -> AsyncGenerator[StreamEvent, None]:
     emitted_content = False
     try:
         if settings.is_stub:
@@ -810,6 +1037,7 @@ async def _iter_deepseek_stream_bodies(
         headers["Authorization"] = f"Bearer {settings.api_key}"
     for attempt in range(2):
         received_data = False
+        first_output_deadline: float | None = asyncio.get_running_loop().time() + settings.timeout_seconds
         try:
             client = _deepseek_client(settings.timeout_seconds)
             async with client.stream(
@@ -819,8 +1047,19 @@ async def _iter_deepseek_stream_bodies(
                 headers=headers,
             ) as response:
                 await _raise_for_status_with_body(response)
-                async for body in _iter_openai_sse(response):
+                bodies = _iter_openai_sse(response)
+                while True:
+                    # Bound heartbeat-only streams without timing the consumer of this generator.
+                    try:
+                        async with asyncio.timeout_at(first_output_deadline):
+                            body = await anext(bodies)
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError as exc:
+                        raise httpx.ReadTimeout("Timed out waiting for the first model output") from exc
                     received_data = True
+                    if _has_stream_output(body):
+                        first_output_deadline = None
                     yield body
             return
         except httpx.TimeoutException:
@@ -828,6 +1067,14 @@ async def _iter_deepseek_stream_bodies(
         except httpx.TransportError:
             if attempt > 0 or received_data:
                 raise
+
+
+def _has_stream_output(body: dict[str, Any]) -> bool:
+    for choice in body.get("choices") or []:
+        delta = choice.get("delta") or {}
+        if delta.get("content") or delta.get("tool_calls") or choice.get("text") or choice.get("finish_reason"):
+            return True
+    return False
 
 
 def _build_deepseek_payload(request: LLMRequest, settings: LLMSettings) -> dict[str, Any]:
@@ -951,17 +1198,23 @@ def _parse_native_tool_calls(raw_calls: Any) -> list[dict[str, Any]]:
 
 
 async def _iter_openai_sse(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
+    completed = False
     async for line in response.aiter_lines():
         line = line.strip()
         if not line.startswith("data:"):
             continue
         raw = line[5:].strip()
-        if not raw or raw == "[DONE]":
+        if raw == "[DONE]":
+            return
+        if not raw:
             continue
         value = json.loads(raw)
         if not isinstance(value, dict):
             raise ValueError("Expected JSON object")
+        completed = completed or any(choice.get("finish_reason") for choice in value.get("choices") or [])
         yield value
+    if not completed:
+        raise httpx.RemoteProtocolError("Model stream ended before completion")
 
 
 def _last_user_text(request: LLMRequest) -> str:
@@ -1045,6 +1298,13 @@ def _chat_completions_url(base_url: str) -> str:
     return f"{trimmed}/chat/completions"
 
 
+def _models_url(base_url: str) -> str:
+    trimmed = base_url.rstrip("/")
+    if trimmed.endswith("/chat/completions"):
+        trimmed = trimmed[: -len("/chat/completions")]
+    return f"{trimmed}/models"
+
+
 def _extract_upstream_error(response: httpx.Response) -> str:
     try:
         body = response.json()
@@ -1101,7 +1361,25 @@ def _model_to_dict(model: Any) -> dict[str, Any]:
     return model.dict()  # type: ignore[no-any-return, attr-defined]
 
 
-def _audit_request_input(request: LLMRequest) -> tuple[LLMRequest, SafetyDecision]:
+async def _resolve_request_safety_age(request: LLMRequest) -> int | None:
+    age = resolve_safety_age(request.metadata)
+    if age is not None:
+        return age
+    try:
+        timeout = _read_float_env("SAFETY_PROFILE_TIMEOUT_SECONDS", 0.5)
+        async with asyncio.timeout(max(0.05, min(timeout, 2.0))):
+            profile = await agent_runtime.memory_store.get_profile(request.user_id.strip() or "anonymous")
+    except Exception as exc:
+        logger.warning(
+            "Safety age profile unavailable request_id=%s error_type=%s",
+            request.request_id,
+            type(exc).__name__,
+        )
+        return None
+    return resolve_safety_age(request.metadata, profile)
+
+
+def _audit_request_input(request: LLMRequest, *, age: int | None = None) -> tuple[LLMRequest, SafetyDecision]:
     user_index = next(
         (
             index
@@ -1111,8 +1389,8 @@ def _audit_request_input(request: LLMRequest) -> tuple[LLMRequest, SafetyDecisio
         None,
     )
     if user_index is None:
-        return request, safety_guard.audit_input("")
-    decision = safety_guard.audit_input(request.messages[user_index].content)
+        return request, safety_guard.audit_input("", age=age)
+    decision = safety_guard.audit_input(request.messages[user_index].content, age=age)
     if decision.changed:
         safety_guard.log(stage="input", decision=decision, request_id=request.request_id)
     if decision.action != "mask":
@@ -1156,15 +1434,20 @@ def _blocked_input_response(request: LLMRequest, decision: SafetyDecision) -> LL
         finish_reason="safety",
         usage=Usage(input_tokens=0, output_tokens=len(decision.content)),
         metadata={
-            "provider": "local-safety",
-            "model": "deterministic-rules",
+            "provider": "aliyun-safety" if decision.external_review else "local-safety",
+            "model": "chat_detection" if decision.external_review else "deterministic-rules",
             "safety": _safety_metadata(decision, safety_guard.audit_output(decision.content)),
         },
     )
 
 
-def _audit_final_output(text: str, *, request_id: str) -> tuple[str, SafetyDecision]:
-    decision = safety_guard.audit_output(text)
+def _audit_final_output(
+    text: str,
+    *,
+    request_id: str,
+    age: int | None = None,
+) -> tuple[str, SafetyDecision]:
+    decision = safety_guard.audit_output(text, age=age)
     if decision.changed:
         safety_guard.log(stage="output", decision=decision, request_id=request_id)
     return decision.content, decision
@@ -1172,8 +1455,9 @@ def _audit_final_output(text: str, *, request_id: str) -> tuple[str, SafetyDecis
 
 def _safety_metadata(input_decision: SafetyDecision, output_decision: SafetyDecision) -> dict[str, Any]:
     return {
-        "engine": "local_rules",
+        "engine": "local_rules+aliyun" if input_decision.external_review or output_decision.external_review else "local_rules",
         "uses_review_model": False,
+        "uses_external_review": bool(input_decision.external_review or output_decision.external_review),
         "input": input_decision.metadata(),
         "output": output_decision.metadata(),
     }
@@ -1225,8 +1509,13 @@ def _safety_delta_event(request: LLMRequest, text: str) -> StreamEvent:
     return _stream_text_event(request, text, template=None)
 
 
-def _safety_done_event(request: LLMRequest, *, input_decision: SafetyDecision) -> StreamEvent:
-    output_decision = safety_guard.audit_output(input_decision.content)
+def _safety_done_event(
+    request: LLMRequest,
+    *,
+    input_decision: SafetyDecision,
+    age: int | None = None,
+) -> StreamEvent:
+    output_decision = safety_guard.audit_output(input_decision.content, age=age)
     return StreamEvent(
         event=EventType.MESSAGE_DONE,
         request_id=request.request_id,
@@ -1254,13 +1543,56 @@ def _response_with_runtime_metadata(
     return response.copy(update=update)
 
 
+def _turn_response_policy(turn: AgentTurn | None) -> dict[str, Any]:
+    if turn is None or turn.context is None:
+        return {}
+    policy = turn.context.tutor_strategy.get("response_policy")
+    return dict(policy) if isinstance(policy, Mapping) else {}
+
+
+def _apply_age_generation_budget(request: LLMRequest, response_policy: Mapping[str, Any] | None) -> None:
+    recommended = recommended_age_max_tokens(response_policy)
+    if recommended is None:
+        return
+    config = request.generation_config
+    configured = config.get("max_tokens")
+    try:
+        configured_tokens = int(configured) if configured is not None else recommended
+    except (TypeError, ValueError):
+        configured_tokens = recommended
+    config["max_tokens"] = min(configured_tokens, recommended)
+    config["age_generation_max_tokens"] = recommended
+
+
 async def _finalize_agent_response(
     turn: AgentTurn | None,
     response: LLMResponse,
     *,
     input_decision: SafetyDecision,
+    safety_age: int | None = None,
 ) -> LLMResponse:
-    safe_text, output_decision = _audit_final_output(response.text, request_id=response.request_id)
+    text = response.text
+    if turn is not None and turn.context is not None and is_contextual_followup(turn.user_text):
+        text = normalize_followup_answer(text)
+    teaching_constraints: dict[str, Any] = {"applied": False, "reason": "not_detailed_teaching"}
+    age_constraints: dict[str, Any] = {"applied": False, "reason": "no_supported_age_policy"}
+    if turn is not None:
+        response_policy = _turn_response_policy(turn)
+        text, teaching_constraints = constrain_teaching_response(text, turn.user_text, response_policy)
+        text, age_constraints = constrain_age_response(text, response_policy)
+        turn.metadata["teaching_constraints"] = teaching_constraints
+        turn.metadata["age_constraints"] = age_constraints
+        response_metadata = dict(response.metadata)
+        response_metadata["teaching_constraints"] = teaching_constraints
+        response_metadata["age_constraints"] = age_constraints
+        response = response.model_copy(update={"text": text, "metadata": response_metadata})
+    safe_text, output_decision = _audit_final_output(
+        text, request_id=response.request_id, age=safety_age,
+    )
+    output_decision = await content_safety.audit(
+        output_decision, stage="output", request_id=response.request_id, age=safety_age,
+    )
+    safe_text = output_decision.content
     safe_response = _response_with_safety_metadata(
         response,
         safe_text=safe_text,
@@ -1269,7 +1601,21 @@ async def _finalize_agent_response(
     )
     if turn is None:
         return safe_response
-    persistence = await agent_runtime.after_turn(turn, safe_text)
+    if turn.original_request.defer_persistence:
+        metadata = dict(safe_response.metadata)
+        if not output_decision.blocked and safe_response.finish_reason == "stop":
+            metadata["voice_preview_token"] = voice_previews.put(turn.original_request, turn, safe_response)
+        metadata["persistence"] = {"saved_turn": False, "reason": "voice_preview"}
+        return safe_response.model_copy(update={"metadata": metadata})
+    if turn.metadata.get("voice_preview_used") and not output_decision.blocked:
+        await agent_runtime._resolve_weather_query(
+            user_id=turn.user_id, session_id=turn.original_request.session_id, user_text=turn.user_text,
+        )
+    persistence = (
+        {"saved_turn": False, "reason": "content_safety"}
+        if output_decision.external_review and output_decision.blocked
+        else await agent_runtime.after_turn(turn, safe_text)
+    )
     return _response_with_runtime_metadata(safe_response, turn, persistence)
 
 

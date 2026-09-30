@@ -22,7 +22,7 @@ CMA_WEATHER_URL = "https://weather.cma.cn/api/weather/view"
 AMAP_WEATHER_URL = "https://restapi.amap.com/v3/weather/weatherInfo"
 DEFAULT_TIMEOUT_SECONDS = 3.0
 DEFAULT_CACHE_TTL_SECONDS = 300.0
-DEFAULT_CITY = "北京"
+DEFAULT_CACHE_MAX_ENTRIES = 200
 DEFAULT_PROVIDER = "amap"
 
 WEATHER_MARKERS = (
@@ -293,23 +293,59 @@ class WeatherToolResult:
 class OpenMeteoWeatherTool:
     """Lookup weather without an API key using Open-Meteo."""
 
-    def __init__(self, *, timeout_seconds: float | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
         self.timeout_seconds = timeout_seconds or _read_float_env("WEATHER_TOOL_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
         self.cache_ttl_seconds = _read_float_env("WEATHER_CACHE_TTL_SECONDS", DEFAULT_CACHE_TTL_SECONDS)
+        self.cache_max_entries = max(1, int(os.getenv("WEATHER_CACHE_MAX_ENTRIES", DEFAULT_CACHE_MAX_ENTRIES)))
         self.max_stale_seconds = _read_float_env("WEATHER_STALE_CACHE_MAX_AGE_SECONDS", 6 * 3600.0)
-        self.default_city = os.getenv("WEATHER_DEFAULT_CITY", DEFAULT_CITY).strip() or DEFAULT_CITY
         self.provider = os.getenv("WEATHER_PROVIDER", DEFAULT_PROVIDER).strip().lower() or DEFAULT_PROVIDER
         self.persistent_cache_enabled = _read_bool_env("WEATHER_PERSISTENT_CACHE_ENABLED", True)
         self.return_stale_while_refreshing = _read_bool_env("WEATHER_RETURN_STALE_WHILE_REFRESHING", True)
         self.cache_file = Path(os.getenv("WEATHER_CACHE_FILE", ".runtime/weather_cache.json")).expanduser()
         self._cache: dict[tuple[str, str, str], tuple[float, WeatherToolResult]] = {}
         self._refreshing: set[tuple[str, str, str]] = set()
+        self._refresh_tasks: set[asyncio.Task[None]] = set()
+        self._client = client
+        self._owns_client = client is None
         self._load_persistent_cache()
+
+    async def aclose(self) -> None:
+        for task in list(self._refresh_tasks):
+            task.cancel()
+        if self._refresh_tasks:
+            await asyncio.gather(*list(self._refresh_tasks), return_exceptions=True)
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    def _http_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.timeout_seconds, trust_env=False)
+        return self._client
 
     def extract_query(self, text: str) -> tuple[str, str] | None:
         if not is_weather_query(text):
             return None
-        return extract_city(text, default_city=self.default_city), extract_day(text)
+        return extract_city(text), extract_day(text)
+
+    def extract_location_reply(self, text: str) -> str | None:
+        candidate = text.strip().strip("，。！？,.!?;；:：")
+        candidate = re.sub(r"^(?:我在|我住在|人在|位置是|地点是|在)", "", candidate).strip()
+        if not candidate or any(marker in candidate for marker in ("不知道", "不用", "算了", "取消", "不查")):
+            return None
+        for city in sorted(KNOWN_CITIES, key=len, reverse=True):
+            if candidate in {city, f"{city}市"}:
+                return city
+        if re.fullmatch(r"[\u4e00-\u9fff]{2,12}(?:省|市|区|县|州|盟|旗)?", candidate):
+            return candidate
+        if re.fullmatch(r"[A-Za-z][A-Za-z .'-]{1,39}", candidate):
+            return candidate
+        return None
 
     async def lookup_from_text(self, text: str) -> WeatherToolResult | None:
         extracted = self.extract_query(text)
@@ -319,7 +355,9 @@ class OpenMeteoWeatherTool:
         return await self.lookup(city=city, day=day)
 
     async def lookup(self, *, city: str, day: str = "today") -> WeatherToolResult:
-        city = city.strip() or self.default_city
+        city = city.strip()
+        if not city:
+            raise ValueError("天气查询需要明确的城市或地区")
         day = normalize_day(day)
         legacy_cache_key = (self.provider, city, day)
         cache_key = (self.provider, _canonical_city_key(city), day)
@@ -348,6 +386,7 @@ class OpenMeteoWeatherTool:
         self._store_cache(cache_key, result)
         if legacy_cache_key != cache_key and legacy_cache_key[0] == cache_key[0]:
             self._cache[legacy_cache_key] = self._cache[cache_key]
+            self._prune_cache(time.time())
             self._save_persistent_cache()
         return result
 
@@ -397,7 +436,25 @@ class OpenMeteoWeatherTool:
         if self.cache_ttl_seconds <= 0:
             return
         self._cache[cache_key] = (time.time(), result)
+        self._prune_cache(time.time())
         self._save_persistent_cache()
+
+    def _prune_cache(self, now: float) -> None:
+        max_age = max(self.cache_ttl_seconds, self.max_stale_seconds)
+        if max_age > 0:
+            expired = [
+                key
+                for key, (saved_at, _result) in self._cache.items()
+                if now - saved_at > max_age
+            ]
+            for key in expired:
+                self._cache.pop(key, None)
+        overflow = len(self._cache) - self.cache_max_entries
+        if overflow <= 0:
+            return
+        oldest = sorted(self._cache.items(), key=lambda item: item[1][0])[:overflow]
+        for key, _entry in oldest:
+            self._cache.pop(key, None)
 
     def _refresh_cache_in_background(self, *, city: str, day: str, cache_key: tuple[str, str, str]) -> None:
         if cache_key in self._refreshing:
@@ -408,7 +465,13 @@ class OpenMeteoWeatherTool:
             return
         self._refreshing.add(cache_key)
         task = loop.create_task(self._refresh_cache(city=city, day=day, cache_key=cache_key))
-        task.add_done_callback(lambda _: self._refreshing.discard(cache_key))
+        self._refresh_tasks.add(task)
+
+        def completed(completed_task: asyncio.Task[None]) -> None:
+            self._refresh_tasks.discard(completed_task)
+            self._refreshing.discard(cache_key)
+
+        task.add_done_callback(completed)
 
     async def _refresh_cache(self, *, city: str, day: str, cache_key: tuple[str, str, str]) -> None:
         try:
@@ -436,6 +499,7 @@ class OpenMeteoWeatherTool:
                     continue
                 key = (str(raw_key[0]), str(raw_key[1]), str(raw_key[2]))
                 self._cache[key] = (float(item.get("saved_at") or 0), WeatherToolResult(**data))
+            self._prune_cache(time.time())
         except Exception:
             self._cache.clear()
 
@@ -446,7 +510,9 @@ class OpenMeteoWeatherTool:
             self.cache_file.parent.mkdir(parents=True, exist_ok=True)
             items = [
                 {"key": list(key), "saved_at": saved_at, "result": result.to_dict()}
-                for key, (saved_at, result) in sorted(self._cache.items(), key=lambda item: item[1][0], reverse=True)[:200]
+                for key, (saved_at, result) in sorted(
+                    self._cache.items(), key=lambda item: item[1][0], reverse=True
+                )[: self.cache_max_entries]
             ]
             self.cache_file.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -491,46 +557,45 @@ class OpenMeteoWeatherTool:
                     task.cancel()
 
     async def _lookup_open_meteo(self, *, city: str, day: str) -> WeatherToolResult:
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            location = CITY_COORDINATES.get(city)
-            if location is None:
-                geo_response = await client.get(
-                    GEOCODING_URL,
-                    params={"name": city, "count": 1, "language": "zh", "format": "json"},
-                )
-                geo_response.raise_for_status()
-                location = _first_location(geo_response.json(), city)
-
-            forecast_response = await client.get(
-                FORECAST_URL,
-                params={
-                    "latitude": location["latitude"],
-                    "longitude": location["longitude"],
-                    "current": ",".join(
-                        [
-                            "temperature_2m",
-                            "relative_humidity_2m",
-                            "apparent_temperature",
-                            "precipitation",
-                            "weather_code",
-                            "wind_speed_10m",
-                            "wind_direction_10m",
-                        ]
-                    ),
-                    "daily": ",".join(
-                        [
-                            "weather_code",
-                            "temperature_2m_max",
-                            "temperature_2m_min",
-                            "precipitation_probability_max",
-                        ]
-                    ),
-                    "forecast_days": 3,
-                    "timezone": "auto",
-                },
+        location = CITY_COORDINATES.get(city)
+        if location is None:
+            geo_response = await self._http_client().get(
+                GEOCODING_URL,
+                params={"name": city, "count": 1, "language": "zh", "format": "json"},
             )
-            forecast_response.raise_for_status()
-            forecast = forecast_response.json()
+            geo_response.raise_for_status()
+            location = _first_location(geo_response.json(), city)
+
+        forecast_response = await self._http_client().get(
+            FORECAST_URL,
+            params={
+                "latitude": location["latitude"],
+                "longitude": location["longitude"],
+                "current": ",".join(
+                    [
+                        "temperature_2m",
+                        "relative_humidity_2m",
+                        "apparent_temperature",
+                        "precipitation",
+                        "weather_code",
+                        "wind_speed_10m",
+                        "wind_direction_10m",
+                    ]
+                ),
+                "daily": ",".join(
+                    [
+                        "weather_code",
+                        "temperature_2m_max",
+                        "temperature_2m_min",
+                        "precipitation_probability_max",
+                    ]
+                ),
+                "forecast_days": 3,
+                "timezone": "auto",
+            },
+        )
+        forecast_response.raise_for_status()
+        forecast = forecast_response.json()
         return _to_result(city=city, day=day, location=location, forecast=forecast)
 
     async def _lookup_amap(self, *, city: str, day: str) -> WeatherToolResult:
@@ -540,45 +605,42 @@ class OpenMeteoWeatherTool:
         city_code = _amap_city_code(city)
         if city_code is None:
             raise ValueError(f"AMap weather adcode not configured for city: {city}")
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.get(
-                AMAP_WEATHER_URL,
-                params={
-                    "key": api_key,
-                    "city": city_code,
-                    "extensions": "all",
-                    "output": "JSON",
-                },
-                headers={"User-Agent": "navi-weather-tool/1.0"},
-            )
-            response.raise_for_status()
-            body = response.json()
+        response = await self._http_client().get(
+            AMAP_WEATHER_URL,
+            params={
+                "key": api_key,
+                "city": city_code,
+                "extensions": "all",
+                "output": "JSON",
+            },
+            headers={"User-Agent": "navi-weather-tool/1.0"},
+        )
+        response.raise_for_status()
+        body = response.json()
         return _to_amap_result(city=city, day=day, body=body)
 
     async def _lookup_cma(self, *, city: str, day: str) -> WeatherToolResult:
         station_id = _cma_station_id(city)
         if station_id is None:
             raise ValueError(f"CMA weather station not configured for city: {city}")
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.get(
-                CMA_WEATHER_URL,
-                params={"stationid": station_id},
-                headers={"User-Agent": "navi-weather-tool/1.0"},
-            )
-            response.raise_for_status()
-            body = response.json()
+        response = await self._http_client().get(
+            CMA_WEATHER_URL,
+            params={"stationid": station_id},
+            headers={"User-Agent": "navi-weather-tool/1.0"},
+        )
+        response.raise_for_status()
+        body = response.json()
         return _to_cma_result(city=city, day=day, body=body)
 
     async def _lookup_wttr(self, *, city: str, day: str) -> WeatherToolResult:
         query = CITY_ALIASES.get(city, city)
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.get(
-                WTTR_URL_TEMPLATE.format(query=quote(query)),
-                params={"format": "j1", "lang": "zh"},
-                headers={"User-Agent": "navi-weather-tool/1.0"},
-            )
-            response.raise_for_status()
-            body = response.json()
+        response = await self._http_client().get(
+            WTTR_URL_TEMPLATE.format(query=quote(query)),
+            params={"format": "j1", "lang": "zh"},
+            headers={"User-Agent": "navi-weather-tool/1.0"},
+        )
+        response.raise_for_status()
+        body = response.json()
         return _to_wttr_result(city=city, day=day, body=body)
 
 
@@ -587,7 +649,7 @@ def is_weather_query(text: str) -> bool:
     return bool(normalized) and any(marker in normalized for marker in WEATHER_MARKERS)
 
 
-def extract_city(text: str, *, default_city: str = DEFAULT_CITY) -> str:
+def extract_city(text: str, *, default_city: str = "") -> str:
     for city in sorted(KNOWN_CITIES, key=len, reverse=True):
         if city in text:
             return city
@@ -855,7 +917,7 @@ def _cache_matches_provider(provider: str, result: WeatherToolResult) -> bool:
 def _unavailable_result(*, city: str, day: str, error: str) -> WeatherToolResult:
     location = CITY_COORDINATES.get(city) or CITY_COORDINATES.get(_canonical_city_key(city)) or {}
     return WeatherToolResult(
-        city=str(location.get("name") or city or DEFAULT_CITY),
+        city=str(location.get("name") or city or "未知地区"),
         country=str(location.get("country") or ""),
         latitude=float(location.get("latitude") or 0.0),
         longitude=float(location.get("longitude") or 0.0),
@@ -906,6 +968,8 @@ def _clean_city_candidate(value: str) -> str:
     text = re.sub(r"(我想|请|帮我|一下|今天|明天|后天|现在|当前|的|会不会|是否|需要|要不要|带伞|穿什么)", "", value)
     text = re.sub(r"(?:会|吗|呢|吧|呀|么)$", "", text)
     text = re.sub(r"[，。！？,.!?;；:：]", "", text).strip()
+    if text in {"本地", "当地", "附近", "这里", "这儿", "这边", "我这", "我这里", "我这儿", "位置", "当前位置", "所在位置"}:
+        return ""
     return text[:40]
 
 

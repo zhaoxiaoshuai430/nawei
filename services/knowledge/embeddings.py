@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import math
 import re
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 
@@ -65,9 +66,53 @@ class OpenAICompatibleEmbeddingProvider:
         await self.client.aclose()
 
 
+class FastEmbedProvider:
+    """CPU-only ONNX embeddings with bounded inference off the event loop."""
+
+    def __init__(self, settings: KnowledgeSettings) -> None:
+        self.dimension = settings.embedding_dimension
+        self.model_id = settings.embedding_model
+        self.cache_dir = settings.embedding_cache_dir or None
+        self.threads = max(1, settings.embedding_threads)
+        self._model: Any = None
+        self._lock = asyncio.Lock()
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        if self._model is None:
+            from fastembed import TextEmbedding
+
+            self._model = TextEmbedding(model_name=self.model_id, cache_dir=self.cache_dir,
+                                        threads=self.threads, providers=["CPUExecutionProvider"], local_files_only=True)
+        vectors = [vector.tolist() for vector in self._model.embed(texts, batch_size=32)]
+        if len(vectors) != len(texts) or any(len(vector) != self.dimension for vector in vectors):
+            raise ValueError("Embedding output does not match the configured count or dimension")
+        if any(not math.isfinite(value) for vector in vectors for value in vector):
+            raise ValueError("Embedding output contains non-finite values")
+        return vectors
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        async with self._lock:
+            task = asyncio.create_task(asyncio.to_thread(self._embed, texts))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._model = None
+
+
 def build_embedding_provider(settings: KnowledgeSettings) -> EmbeddingProvider:
     if settings.embedding_provider in {"openai", "openai_compatible", "http"}:
         return OpenAICompatibleEmbeddingProvider(settings)
+    if settings.embedding_provider == "fastembed":
+        return FastEmbedProvider(settings)
+    if settings.embedding_provider != "hash":
+        raise ValueError("Unknown embedding provider; use hash, fastembed or openai_compatible")
     return HashEmbeddingProvider(
         dimension=settings.embedding_dimension,
         model_id=settings.embedding_model or "hash-embedding-v1",

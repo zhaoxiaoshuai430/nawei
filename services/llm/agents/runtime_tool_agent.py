@@ -1,10 +1,11 @@
-"""LangChain/LangGraph runtime tool agent owned by the LLM service."""
+"""LangChain/LangGraph runtime tool agent for LLM deterministic tools."""
 
 from __future__ import annotations
 
 import asyncio
 import os
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable, NotRequired, TypedDict
 
@@ -21,7 +22,7 @@ except ImportError:  # pragma: no cover
 try:  # pragma: no cover - optional dependency in lightweight installs
     from langgraph.graph import END, StateGraph
 except ImportError:  # pragma: no cover
-    END = "__end__"  # type: ignore[misc,assignment]
+    END = "__end__"  # type: ignore[assignment]
     StateGraph = None  # type: ignore[misc,assignment]
 
 
@@ -56,6 +57,8 @@ class RuntimeToolAgentResult:
 class RuntimeToolAgentState(TypedDict):
     query: str
     default_timeout_seconds: float
+    user_id: NotRequired[str]
+    session_id: NotRequired[str]
     selected_tools: NotRequired[list[RuntimeToolCall]]
     outputs: NotRequired[list[RuntimeToolOutput]]
     metadata: NotRequired[dict[str, Any]]
@@ -71,29 +74,27 @@ class LangChainRuntimeToolAgent:
         calculator_tool: Any,
         unit_converter_tool: Any,
         dictionary_tool: Any,
-        encyclopedia_tool: Any,
         weather_tool: Any,
         format_time: Formatter,
         format_calculator: Formatter,
         format_unit: Formatter,
         format_dictionary: Formatter,
-        format_encyclopedia: Formatter,
         format_weather: Formatter,
         format_web_search: Formatter | None = None,
         web_search_tool: Any | None = None,
+        memory_store: Any | None = None,
     ) -> None:
         self.time_tool = time_tool
         self.calculator_tool = calculator_tool
         self.unit_converter_tool = unit_converter_tool
         self.dictionary_tool = dictionary_tool
-        self.encyclopedia_tool = encyclopedia_tool
         self.weather_tool = weather_tool
         self.web_search_tool = web_search_tool
+        self.memory_store = memory_store
         self.format_time = format_time
         self.format_calculator = format_calculator
         self.format_unit = format_unit
         self.format_dictionary = format_dictionary
-        self.format_encyclopedia = format_encyclopedia
         self.format_weather = format_weather
         self.format_web_search = format_web_search
         self.agent_mode = os.getenv("LLM_TOOL_AGENT_MODE", "langgraph").strip().lower() or "langgraph"
@@ -105,57 +106,47 @@ class LangChainRuntimeToolAgent:
 
     @property
     def registered_tools(self) -> list[str]:
-        """Return the stable names exposed by this runtime."""
+        return [name for name in _TOOL_ORDER if self._tool_enabled(name)]
 
-        return sorted(self._tools.keys()) if self._tools else list(_TOOL_ORDER)
+    async def close(self) -> None:
+        for tool in (self.dictionary_tool, self.weather_tool, self.web_search_tool):
+            close = getattr(tool, "aclose", None)
+            if close is not None:
+                await close()
 
-    def openai_tool_definitions(
-        self,
-        names: list[str] | set[str] | tuple[str, ...] | None = None,
-    ) -> list[dict[str, Any]]:
+    def suggested_tool_names(self, query: str, *, default_timeout_seconds: float = 6.0) -> list[str]:
+        return [call.name for call in self._select_tool_calls(
+            {"query": query, "default_timeout_seconds": default_timeout_seconds}
+        )]
+
+    def openai_tool_definitions(self, names: list[str] | set[str] | tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         """Return enabled runtime tools in OpenAI-compatible function format."""
 
-        enabled = set(self.registered_tools)
-        if names is not None:
-            enabled.intersection_update(names)
-        return [
-            item
-            for item in _openai_tool_definitions()
-            if str(item.get("function", {}).get("name") or "") in enabled
-        ]
-
-    def suggested_tool_names(
-        self,
-        query: str,
-        *,
-        default_timeout_seconds: float = 6.0,
-    ) -> list[str]:
-        """Return deterministic tool candidates without executing them."""
-
-        calls = self._select_tool_calls(
-            {
-                "query": query,
-                "default_timeout_seconds": default_timeout_seconds,
-            }
-        )
-        return [call.name for call in calls]
+        definitions = _openai_tool_definitions()
+        return [item for item in definitions if self._tool_enabled(str(item["function"]["name"])) and (names is None or item["function"]["name"] in names)]
 
     async def collect(
         self,
         *,
         query: str,
         default_timeout_seconds: float,
-        planned_calls: list[dict[str, Any] | RuntimeToolCall] | None = None,
+        planned_calls: Sequence[dict[str, Any] | RuntimeToolCall] | None = None,
+        user_id: str = "",
+        session_id: str = "",
     ) -> RuntimeToolAgentResult:
         state: RuntimeToolAgentState = {
             "query": query,
             "default_timeout_seconds": default_timeout_seconds,
+            "user_id": user_id,
+            "session_id": session_id,
         }
         if planned_calls is not None:
             selected_tools = self._normalize_planned_tool_calls(
                 planned_calls,
                 query=query,
                 default_timeout=default_timeout_seconds,
+                user_id=user_id,
+                session_id=session_id,
             )
             state = {
                 **state,
@@ -214,6 +205,11 @@ class LangChainRuntimeToolAgent:
         default_timeout = state["default_timeout_seconds"]
         calls: list[RuntimeToolCall] = []
 
+        if self.memory_store is not None and state.get("user_id") and _read_bool_env("MEMORY_TOOLS_ENABLED", True):
+            memory_call = self._select_memory_tool_call(query, state)
+            if memory_call is not None:
+                calls.append(memory_call)
+
         if _read_bool_env("TIME_TOOL_ENABLED", True) and self.time_tool.should_run(query):
             calls.append(RuntimeToolCall("time", {}, self._timeout_for("TIME", default_timeout)))
 
@@ -240,32 +236,53 @@ class LangChainRuntimeToolAgent:
                 )
             )
 
-        if not web_query and _read_bool_env("ENCYCLOPEDIA_TOOL_ENABLED", True):
-            encyclopedia_query = self.encyclopedia_tool.extract_query(query)
-            if encyclopedia_query:
-                calls.append(
-                    RuntimeToolCall(
-                        "encyclopedia",
-                        {"query": encyclopedia_query},
-                        self._timeout_for("ENCYCLOPEDIA", default_timeout),
-                    )
-                )
-
         if _read_bool_env("WEATHER_TOOL_ENABLED", True):
             weather_query = self.weather_tool.extract_query(query)
             if weather_query:
                 city, day = weather_query
-                weather_default = max(default_timeout, float(getattr(self.weather_tool, "timeout_seconds", default_timeout)) + 1.0)
-                calls.append(RuntimeToolCall("weather", {"city": city, "day": day}, self._timeout_for("WEATHER", weather_default)))
+                if city:
+                    weather_default = max(default_timeout, float(getattr(self.weather_tool, "timeout_seconds", default_timeout)) + 1.0)
+                    calls.append(RuntimeToolCall("weather", {"city": city, "day": day}, self._timeout_for("WEATHER", weather_default)))
 
         return _dedupe_tool_calls(calls)
 
+    def _select_memory_tool_call(self, query: str, state: RuntimeToolAgentState) -> RuntimeToolCall | None:
+        """Rules fallback for memory tools when the LLM planner is unavailable."""
+
+        if _looks_like_concept_memory_query(query):
+            return RuntimeToolCall(
+                "concept_lookup",
+                self._memory_context_args({"query": query}, state),
+                self._timeout_for("MEMORY", state["default_timeout_seconds"]),
+            )
+        if _looks_like_history_memory_query(query):
+            return RuntimeToolCall(
+                "history_search",
+                self._memory_context_args({"query": query}, state),
+                self._timeout_for("MEMORY", state["default_timeout_seconds"]),
+            )
+        if _looks_like_profile_memory_query(query):
+            return RuntimeToolCall(
+                "profile_lookup",
+                self._memory_context_args({}, state),
+                self._timeout_for("MEMORY", state["default_timeout_seconds"]),
+            )
+        if _looks_like_long_term_memory_query(query):
+            return RuntimeToolCall(
+                "memory_search",
+                self._memory_context_args({"query": query}, state),
+                self._timeout_for("MEMORY", state["default_timeout_seconds"]),
+            )
+        return None
+
     def _normalize_planned_tool_calls(
         self,
-        planned_calls: list[dict[str, Any] | RuntimeToolCall],
+        planned_calls: Sequence[dict[str, Any] | RuntimeToolCall],
         *,
         query: str,
         default_timeout: float,
+        user_id: str = "",
+        session_id: str = "",
     ) -> list[RuntimeToolCall]:
         calls: list[RuntimeToolCall] = []
         for item in planned_calls:
@@ -280,13 +297,27 @@ class LangChainRuntimeToolAgent:
                 continue
 
             name = name.lower().replace("-", "_")
-            normalized = self._normalize_tool_args(name, args, query=query)
+            normalized = self._normalize_tool_args(
+                name,
+                args,
+                query=query,
+                user_id=user_id,
+                session_id=session_id,
+            )
             if normalized is None:
                 continue
             calls.append(RuntimeToolCall(name, normalized, self._timeout_for(_TIMEOUT_PREFIX_BY_TOOL[name], default_timeout)))
         return calls
 
-    def _normalize_tool_args(self, name: str, args: dict[str, Any], *, query: str) -> dict[str, Any] | None:
+    def _normalize_tool_args(
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        query: str,
+        user_id: str = "",
+        session_id: str = "",
+    ) -> dict[str, Any] | None:
         if name not in _TOOL_ORDER or not self._tool_enabled(name):
             return None
         if name == "time":
@@ -302,11 +333,6 @@ class LangChainRuntimeToolAgent:
             if not word:
                 word = str(self.dictionary_tool.extract_word(query) or "").strip()
             return {"word": word} if word else None
-        if name == "encyclopedia":
-            tool_query = str(args.get("query") or args.get("topic") or "").strip()
-            if not tool_query:
-                tool_query = str(self.encyclopedia_tool.extract_query(query) or "").strip()
-            return {"query": tool_query} if tool_query else None
         if name == "web_search":
             tool_query = str(args.get("query") or "").strip()
             if not tool_query and self.web_search_tool is not None:
@@ -315,12 +341,24 @@ class LangChainRuntimeToolAgent:
         if name == "weather":
             city = str(args.get("city") or args.get("location") or "").strip()
             day = str(args.get("day") or "today").strip() or "today"
-            if not city:
-                weather_query = self.weather_tool.extract_query(query)
-                if weather_query:
-                    city, day = weather_query
+            weather_query = self.weather_tool.extract_query(query)
+            if weather_query and not city:
+                parsed_city, parsed_day = weather_query
+                city, day = parsed_city, parsed_day
             return {"city": city, "day": day} if city else None
+        if name in {"memory_search", "history_search", "concept_lookup"}:
+            tool_query = str(args.get("query") or args.get("text") or query).strip()
+            return self._memory_context_args({"query": tool_query}, {"user_id": user_id, "session_id": session_id}) if tool_query else None
+        if name == "profile_lookup":
+            return self._memory_context_args({}, {"user_id": user_id, "session_id": session_id})
         return None
+
+    def _memory_context_args(self, args: dict[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            **args,
+            "user_id": str(state.get("user_id") or ""),
+            "session_id": str(state.get("session_id") or ""),
+        }
 
     def _tool_enabled(self, name: str) -> bool:
         if name == "time":
@@ -331,12 +369,12 @@ class LangChainRuntimeToolAgent:
             return _read_bool_env("UNIT_TOOL_ENABLED", True)
         if name == "dictionary":
             return _read_bool_env("DICTIONARY_TOOL_ENABLED", True)
-        if name == "encyclopedia":
-            return _read_bool_env("ENCYCLOPEDIA_TOOL_ENABLED", True)
         if name == "web_search":
             return self.web_search_tool is not None and _read_bool_env("BOCHA_WEB_SEARCH_ENABLED", True)
         if name == "weather":
             return _read_bool_env("WEATHER_TOOL_ENABLED", True)
+        if name in {"memory_search", "history_search", "profile_lookup", "concept_lookup"}:
+            return self.memory_store is not None and _read_bool_env("MEMORY_TOOLS_ENABLED", True)
         return False
 
     def _selection_metadata(self, selected_tools: list[RuntimeToolCall], *, selector: str) -> dict[str, Any]:
@@ -346,7 +384,7 @@ class LangChainRuntimeToolAgent:
             "selector": selector,
             "langchain_enabled": self.uses_langchain,
             "langgraph_enabled": self.uses_langgraph,
-            "registered_tools": self.registered_tools,
+            "registered_tools": sorted(self._tools.keys()) if self._tools else _TOOL_ORDER,
             "selected_tools": [call.name for call in selected_tools],
             "graph_nodes": ["select_tools", "run_tools", "assemble_results"],
         }
@@ -394,12 +432,18 @@ class LangChainRuntimeToolAgent:
             return await self._unit_from_text(str(call.args.get("text") or ""))
         if call.name == "dictionary":
             return await self._dictionary_lookup(str(call.args.get("word") or ""))
-        if call.name == "encyclopedia":
-            return await self._encyclopedia_lookup(str(call.args.get("query") or ""))
         if call.name == "web_search":
             return await self._web_search_lookup(str(call.args.get("query") or ""))
         if call.name == "weather":
             return await self._weather_lookup(str(call.args.get("city") or ""), str(call.args.get("day") or "today"))
+        if call.name == "memory_search":
+            return await self._memory_search(**call.args)
+        if call.name == "history_search":
+            return await self._history_search(**call.args)
+        if call.name == "profile_lookup":
+            return await self._profile_lookup(**call.args)
+        if call.name == "concept_lookup":
+            return await self._concept_lookup(**call.args)
         raise ValueError(f"Unknown runtime tool: {call.name}")
 
     def _build_tools(self) -> dict[str, Any]:
@@ -426,11 +470,6 @@ class LangChainRuntimeToolAgent:
                 name="dictionary",
                 description="Look up an English word definition.",
             ),
-            "encyclopedia": StructuredTool.from_function(
-                coroutine=self._encyclopedia_lookup,
-                name="encyclopedia",
-                description="Look up a concise encyclopedia summary.",
-            ),
             **(
                 {
                     "web_search": StructuredTool.from_function(
@@ -445,7 +484,33 @@ class LangChainRuntimeToolAgent:
             "weather": StructuredTool.from_function(
                 coroutine=self._weather_lookup,
                 name="weather",
-                description="Look up current or forecast weather for a city.",
+                description="Look up weather for an explicit city or region. A location is required.",
+            ),
+            **(
+                {
+                    "memory_search": StructuredTool.from_function(
+                        coroutine=self._memory_search,
+                        name="memory_search",
+                        description="Search relevant long-term student memories when the current question needs personalization or prior facts.",
+                    ),
+                    "history_search": StructuredTool.from_function(
+                        coroutine=self._history_search,
+                        name="history_search",
+                        description="Search older conversation history across sessions for a prior discussion or answer.",
+                    ),
+                    "profile_lookup": StructuredTool.from_function(
+                        coroutine=self._profile_lookup,
+                        name="profile_lookup",
+                        description="Retrieve the full student profile when the question asks about preferences, identity, grade, or learning background.",
+                    ),
+                    "concept_lookup": StructuredTool.from_function(
+                        coroutine=self._concept_lookup,
+                        name="concept_lookup",
+                        description="Retrieve tracked learning concepts, mastery, weaknesses, and effective teaching strategy.",
+                    ),
+                }
+                if self.memory_store is not None
+                else {}
             ),
         }
 
@@ -469,10 +534,6 @@ class LangChainRuntimeToolAgent:
         result = await self.dictionary_tool.lookup(word)
         return {"prompt": self.format_dictionary(result), "result": result.to_dict()}
 
-    async def _encyclopedia_lookup(self, query: str) -> dict[str, Any]:
-        result = await self.encyclopedia_tool.lookup(query=query)
-        return {"prompt": self.format_encyclopedia(result), "result": result.to_dict()}
-
     async def _web_search_lookup(self, query: str) -> dict[str, Any]:
         if self.web_search_tool is None or self.format_web_search is None:
             return {"prompt": None, "result": None}
@@ -482,6 +543,34 @@ class LangChainRuntimeToolAgent:
     async def _weather_lookup(self, city: str, day: str = "today") -> dict[str, Any]:
         result = await self.weather_tool.lookup(city=city, day=day)
         return {"prompt": self.format_weather(result), "result": result.to_dict()}
+
+    async def _memory_search(self, query: str = "", user_id: str = "", session_id: str = "") -> dict[str, Any]:
+        if self.memory_store is None or not user_id or not query.strip():
+            return {"prompt": "长期记忆查询无结果。", "result": {"memories": [], "query": query}}
+        hits = await self.memory_store.recall_layered(user_id=user_id, query=query, top_k=8)
+        items = [_memory_hit_to_dict(item) for item in hits]
+        prompt = _format_memory_tool_prompt("相关长期记忆", items, query=query)
+        return {"prompt": prompt, "result": {"query": query, "memories": items}}
+
+    async def _history_search(self, query: str = "", user_id: str = "", session_id: str = "") -> dict[str, Any]:
+        if self.memory_store is None or not user_id:
+            return {"prompt": "历史对话查询无结果。", "result": {"history": [], "query": query}}
+        items = await self.memory_store.search_history(user_id=user_id, session_id=session_id, query=query, limit=8)
+        prompt = _format_memory_tool_prompt("历史对话", items, query=query)
+        return {"prompt": prompt, "result": {"query": query, "history": items}}
+
+    async def _profile_lookup(self, user_id: str = "", session_id: str = "") -> dict[str, Any]:
+        if self.memory_store is None or not user_id:
+            return {"prompt": "用户画像无结果。", "result": {"profile": {}}}
+        profile = await self.memory_store.get_profile(user_id)
+        return {"prompt": _format_memory_tool_prompt("完整用户画像", [profile]), "result": {"profile": profile}}
+
+    async def _concept_lookup(self, query: str = "", user_id: str = "", session_id: str = "") -> dict[str, Any]:
+        if self.memory_store is None or not user_id:
+            return {"prompt": "知识点记录无结果。", "result": {"concepts": [], "query": query}}
+        concepts = await self.memory_store.list_concepts(user_id=user_id, query=query, limit=8)
+        items = [_learning_concept_to_dict(item) for item in concepts]
+        return {"prompt": _format_memory_tool_prompt("知识点掌握状态", items, query=query), "result": {"query": query, "concepts": items}}
 
     def _has_unit_conversion(self, query: str) -> bool:
         try:
@@ -493,25 +582,34 @@ class LangChainRuntimeToolAgent:
         return _read_float_env(f"LLM_{prefix}_TOOL_TIMEOUT_SECONDS", _read_float_env(f"{prefix}_TOOL_TIMEOUT_SECONDS", default))
 
 
-_TOOL_ORDER = ["time", "calculator", "unit_converter", "dictionary", "web_search", "encyclopedia", "weather"]
+_TOOL_ORDER = [
+    "time",
+    "calculator",
+    "unit_converter",
+    "dictionary",
+    "web_search",
+    "weather",
+    "memory_search",
+    "history_search",
+    "profile_lookup",
+    "concept_lookup",
+]
 _TIMEOUT_PREFIX_BY_TOOL = {
     "time": "TIME",
     "calculator": "CALCULATOR",
     "unit_converter": "UNIT",
     "dictionary": "DICTIONARY",
     "web_search": "BOCHA_SEARCH",
-    "encyclopedia": "ENCYCLOPEDIA",
     "weather": "WEATHER",
+    "memory_search": "MEMORY",
+    "history_search": "MEMORY",
+    "profile_lookup": "MEMORY",
+    "concept_lookup": "MEMORY",
 }
 
 
 def _openai_tool_definitions() -> list[dict[str, Any]]:
-    def function(
-        name: str,
-        description: str,
-        properties: dict[str, Any],
-        required: list[str],
-    ) -> dict[str, Any]:
+    def function(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
         return {
             "type": "function",
             "function": {
@@ -554,12 +652,6 @@ def _openai_tool_definitions() -> list[dict[str, Any]]:
             ["query"],
         ),
         function(
-            "encyclopedia",
-            "Look up stable encyclopedia facts for a person, place, event, object, or concept.",
-            {"query": query_property},
-            ["query"],
-        ),
-        function(
             "weather",
             "Get weather for an explicit city or region. Ask the user for a location when none is provided.",
             {
@@ -571,6 +663,25 @@ def _openai_tool_definitions() -> list[dict[str, Any]]:
                 },
             },
             ["city", "day"],
+        ),
+        function(
+            "memory_search",
+            "Search relevant long-term student memories when prior facts or personalization are needed.",
+            {"query": query_property},
+            ["query"],
+        ),
+        function(
+            "history_search",
+            "Search older conversation history when the user refers to previous discussions or activities.",
+            {"query": query_property},
+            ["query"],
+        ),
+        function("profile_lookup", "Load the student's full profile when current profile context is insufficient.", {}, []),
+        function(
+            "concept_lookup",
+            "Look up recorded mastery and weakness information for learning concepts.",
+            {"query": query_property},
+            ["query"],
         ),
     ]
 
@@ -598,3 +709,61 @@ def _read_float_env(name: str, default: float) -> float:
     if not raw:
         return default
     return float(raw)
+
+
+def _memory_hit_to_dict(item: Any) -> dict[str, Any]:
+    return {
+        "id": str(getattr(item, "id", "")),
+        "memory_type": str(getattr(item, "memory_type", "")),
+        "content": str(getattr(item, "content", "")),
+        "summary": getattr(item, "summary", None),
+        "importance": int(getattr(item, "importance", 0) or 0),
+        "score": float(getattr(item, "score", 0.0) or 0.0),
+        "confidence": float(getattr(item, "confidence", 0.0) or 0.0),
+        "tags": list(getattr(item, "tags", []) or []),
+    }
+
+
+def _learning_concept_to_dict(item: Any) -> dict[str, Any]:
+    return {
+        "id": str(getattr(item, "id", "")),
+        "subject": str(getattr(item, "subject", "")),
+        "concept": str(getattr(item, "concept", "")),
+        "mastery_score": float(getattr(item, "mastery_score", 0.0) or 0.0),
+        "confidence": float(getattr(item, "confidence", 0.0) or 0.0),
+        "exposure_count": int(getattr(item, "exposure_count", 0) or 0),
+        "weakness_count": int(getattr(item, "weakness_count", 0) or 0),
+        "correct_count": int(getattr(item, "correct_count", 0) or 0),
+        "incorrect_count": int(getattr(item, "incorrect_count", 0) or 0),
+        "effective_strategy": getattr(item, "effective_strategy", None),
+    }
+
+
+def _format_memory_tool_prompt(title: str, items: list[Any], *, query: str = "") -> str:
+    if not items:
+        return f"记忆工具结果：{title}\n查询：{query or '无'}\n结果：无"
+    rendered = "\n".join(
+        f"- {item if isinstance(item, str) else item.get('content') or item.get('concept') or item}"
+        for item in items[:8]
+    )
+    return f"记忆工具结果：{title}\n查询：{query or '无'}\n{rendered}"
+
+
+def _looks_like_long_term_memory_query(query: str) -> bool:
+    markers = ("记得", "记住", "以前", "过去", "长期", "上次", "之前", "我的情况", "我喜欢", "我不喜欢")
+    return any(marker in query for marker in markers)
+
+
+def _looks_like_history_memory_query(query: str) -> bool:
+    markers = ("上次聊", "之前聊", "以前问", "历史对话", "刚才以外", "哪次", "曾经")
+    return any(marker in query for marker in markers)
+
+
+def _looks_like_profile_memory_query(query: str) -> bool:
+    markers = ("我叫什么", "我的名字", "我的年级", "我的偏好", "我喜欢什么", "我的画像", "你了解我")
+    return any(marker in query for marker in markers)
+
+
+def _looks_like_concept_memory_query(query: str) -> bool:
+    markers = ("薄弱", "掌握", "学到哪", "知识点", "学习情况", "不会什么", "错题", "学习记录")
+    return any(marker in query for marker in markers)

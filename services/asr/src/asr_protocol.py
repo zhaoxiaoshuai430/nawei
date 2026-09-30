@@ -46,15 +46,18 @@ async def read_upload_limited(upload: AsyncUpload, *, max_bytes: int = MAX_AUDIO
     return content
 
 
-def streaming_capabilities() -> dict[str, object]:
-    """Describe the actual SenseVoice HTTP streaming semantics."""
+def streaming_capabilities(*, native: bool = False) -> dict[str, object]:
+    """Distinguish native WebSocket decoding from independent HTTP chunks."""
 
     return {
-        "realtime_streaming": False,
-        "streaming_mode": STREAMING_MODE,
+        "realtime_streaming": native,
+        "streaming_mode": "native-online" if native else STREAMING_MODE,
+        "http_streaming_mode": STREAMING_MODE,
         "accepts_audio_chunks": True,
-        "keeps_decoder_state": False,
+        "keeps_decoder_state": native,
         "realtime_input": True,
         "realtime_transport": "websocket-pcm16-vad",
-        "partial_results": False,
+        "partial_results": native,
+        "realtime_model": "paraformer-online" if native else "sensevoice",
+        "legacy_realtime_path": "/api/v1/asr/realtime/sensevoice",
     }

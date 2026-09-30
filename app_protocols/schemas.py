@@ -188,6 +188,7 @@ class ASRDetails(ProtocolModel):
     emotion_hint: Optional[str] = None
     raw_text: Optional[str] = None
     clean_text: Optional[str] = None
+    corrections: List[dict[str, str]] = Field(default_factory=list)
 
 
 class ASRResponse(ProtocolModel):
@@ -227,6 +228,8 @@ class LLMRequest(ProtocolModel):
     user_id: str = Field("anonymous", min_length=1)
     messages: List[Message] = Field(..., min_length=1)
     stream: bool = True
+    defer_persistence: bool = False
+    voice_preview_token: Optional[str] = Field(default=None, max_length=128)
     tools: List[Metadata] = Field(default_factory=list)
     generation_config: Metadata = Field(default_factory=metadata_field)
     metadata: Metadata = Field(default_factory=metadata_field)

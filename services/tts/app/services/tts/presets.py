@@ -3,10 +3,18 @@ from __future__ import annotations
 
 import base64
 import os
+import tempfile
+from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 from app.config import ASSET_DIR
-from app.services.tts.warmup import warm_voice_clone_cache
 from app.utils.cache import get_cached_ref_path
+
+DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 10.0
+DEFAULT_MAX_AUDIO_BYTES = 20 * 1024 * 1024
+DEFAULT_MAX_TRANSCRIPT_BYTES = 1024 * 1024
+DOWNLOAD_USER_AGENT = "NaweiTTS/1.0"
 
 PRESET_TRANSCRIPTS = ASSET_DIR / "samples" / "parity" / "icl_transcripts.txt"
 PRESET_REFS = [
@@ -30,27 +38,106 @@ _TRANSCRIPT_REMOTE = f"{_GITHUB_RAW}/samples/parity/icl_transcripts.txt"
 preset_refs: dict[str, dict] = {}
 
 
-def fetch_preset_assets() -> None:
-    import urllib.request
+def _read_positive_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _valid_wav(path: Path) -> bool:
+    try:
+        if path.stat().st_size < 12:
+            return False
+        with path.open("rb") as handle:
+            header = handle.read(12)
+        return header[:4] == b"RIFF" and header[8:12] == b"WAVE"
+    except OSError:
+        return False
+
+
+def _valid_transcript(path: Path) -> bool:
+    try:
+        return bool(path.read_text(encoding="utf-8").strip())
+    except (OSError, UnicodeError):
+        return False
+
+
+def _download_asset(url: str, destination: Path, *, max_bytes: int) -> None:
+    if urlsplit(url).scheme.lower() != "https":
+        raise ValueError("Preset assets must use HTTPS")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    timeout = _read_positive_float_env("TTS_PRESET_DOWNLOAD_TIMEOUT_SECONDS", DEFAULT_DOWNLOAD_TIMEOUT_SECONDS)
+    request = Request(url, headers={"User-Agent": DOWNLOAD_USER_AGENT, "Accept": "*/*"})
+    temporary_path: Path | None = None
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > max_bytes:
+                raise ValueError(f"Preset asset exceeds {max_bytes} bytes")
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                dir=destination.parent,
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                total = 0
+                while chunk := response.read(64 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"Preset asset exceeds {max_bytes} bytes")
+                    temporary.write(chunk)
+                if total == 0:
+                    raise ValueError("Preset asset is empty")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+        if destination.suffix.lower() == ".wav":
+            valid = _valid_wav(temporary_path)
+        else:
+            valid = _valid_transcript(temporary_path)
+        if not valid:
+            raise ValueError("Preset asset has an invalid format")
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def fetch_preset_assets() -> None:
     ASSET_DIR.mkdir(parents=True, exist_ok=True)
     PRESET_TRANSCRIPTS.parent.mkdir(parents=True, exist_ok=True)
-    if not PRESET_TRANSCRIPTS.exists():
+    max_transcript_bytes = _read_positive_int_env(
+        "TTS_PRESET_MAX_TRANSCRIPT_BYTES", DEFAULT_MAX_TRANSCRIPT_BYTES
+    )
+    max_audio_bytes = _read_positive_int_env("TTS_PRESET_MAX_AUDIO_BYTES", DEFAULT_MAX_AUDIO_BYTES)
+    if not _valid_transcript(PRESET_TRANSCRIPTS):
         try:
-            urllib.request.urlretrieve(_TRANSCRIPT_REMOTE, PRESET_TRANSCRIPTS)
-        except Exception as e:
-            print(f"Warning: could not fetch transcripts: {e}")
+            _download_asset(_TRANSCRIPT_REMOTE, PRESET_TRANSCRIPTS, max_bytes=max_transcript_bytes)
+        except Exception as exc:
+            print(f"Warning: could not fetch transcripts: {exc}")
     for key, path, _ in PRESET_REFS:
-        if (not path.is_file() or path.stat().st_size == 0) and key in _PRESET_REMOTE:
+        if not _valid_wav(path) and key in _PRESET_REMOTE:
             try:
-                urllib.request.urlretrieve(_PRESET_REMOTE[key], path)
+                _download_asset(_PRESET_REMOTE[key], path, max_bytes=max_audio_bytes)
                 print(f"Downloaded {path.name}")
-            except Exception as e:
-                print(f"Warning: could not fetch {key}: {e}")
+            except Exception as exc:
+                print(f"Warning: could not fetch {key}: {exc}")
 
 
 def _load_preset_transcripts() -> dict[str, str]:
-    if not PRESET_TRANSCRIPTS.exists():
+    if not _valid_transcript(PRESET_TRANSCRIPTS):
         return {}
     transcripts = {}
     for line in PRESET_TRANSCRIPTS.read_text(encoding="utf-8").splitlines():
@@ -69,7 +156,7 @@ def load_preset_refs() -> None:
     transcripts = _load_preset_transcripts()
     preset_refs.clear()
     for key, path, label in PRESET_REFS:
-        if not path.is_file() or path.stat().st_size == 0:
+        if not _valid_wav(path):
             continue
         content = path.read_bytes()
         cached_path = get_cached_ref_path(content)
@@ -84,6 +171,8 @@ def load_preset_refs() -> None:
 
 
 def prime_preset_voice_cache(model) -> None:
+    from app.services.tts.warmup import warm_voice_clone_cache
+
     if not preset_refs:
         return
     for preset in preset_refs.values():

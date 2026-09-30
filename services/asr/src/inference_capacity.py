@@ -25,7 +25,7 @@ class CapacitySnapshot:
 class CapacityLease:
     def __init__(self, capacity: "InferenceCapacity") -> None:
         self._capacity = capacity
-        self._released = False
+        self._release_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> "CapacityLease":
         return self
@@ -34,10 +34,10 @@ class CapacityLease:
         await self.release()
 
     async def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        await self._capacity.release()
+        # Share one release operation; a disconnected caller must not cancel it.
+        if self._release_task is None:
+            self._release_task = asyncio.create_task(self._capacity.release())
+        await asyncio.shield(self._release_task)
 
 
 class InferenceCapacity:

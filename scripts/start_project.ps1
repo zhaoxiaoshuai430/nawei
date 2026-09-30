@@ -1,15 +1,18 @@
 param(
-    [int]$TimeoutSeconds = 420,
-    [switch]$SkipInfrastructure
+    [ValidateRange(5, 3600)]
+    [int]$TimeoutSeconds = 900,
+    [switch]$SkipInfrastructure,
+    [switch]$SkipWarmup
 )
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "project_runtime.ps1")
+Initialize-NaweiLocalEnvironment
 
 $modelRestorePython = Join-Path $script:NaweiProjectRoot ".venv\Scripts\python.exe"
 & $modelRestorePython (Join-Path $PSScriptRoot "restore_models.py")
 if ($LASTEXITCODE -ne 0) {
-    throw "Bundled model restoration failed. Ensure Git LFS objects were downloaded."
+    throw "Bundled model restoration failed. Ensure the local model files and required split parts are complete."
 }
 
 if (-not $SkipInfrastructure) {
@@ -27,20 +30,6 @@ if (-not $SkipInfrastructure) {
     }
 }
 
-if (-not $env:DATABASE_URL) { $env:DATABASE_URL = "postgresql://nawei:nawei@127.0.0.1:5432/nawei" }
-if (-not $env:REDIS_URL) { $env:REDIS_URL = "redis://127.0.0.1:6379/0" }
-if (-not $env:QDRANT_URL) { $env:QDRANT_URL = "http://127.0.0.1:6333" }
-if (-not $env:QDRANT_API_KEY) { $env:QDRANT_API_KEY = "nawei-qdrant-local" }
-if (-not $env:NEO4J_URI) { $env:NEO4J_URI = "neo4j://127.0.0.1:7687" }
-if (-not $env:NEO4J_USER) { $env:NEO4J_USER = "neo4j" }
-if (-not $env:NEO4J_PASSWORD) { $env:NEO4J_PASSWORD = "nawei-neo4j-local" }
-if (-not $env:KNOWLEDGE_ENABLED) { $env:KNOWLEDGE_ENABLED = "true" }
-if (-not $env:KNOWLEDGE_REQUIRED) { $env:KNOWLEDGE_REQUIRED = "true" }
-if (-not $env:KNOWLEDGE_RETRIEVE_URL) { $env:KNOWLEDGE_RETRIEVE_URL = "http://127.0.0.1:8003/api/v1/knowledge/retrieve" }
-if (-not $env:KNOWLEDGE_HEALTH_URL) { $env:KNOWLEDGE_HEALTH_URL = "http://127.0.0.1:8003/health" }
-if (-not $env:MEMORY_ENABLED) { $env:MEMORY_ENABLED = "true" }
-if (-not $env:LLM_MEMORY_REQUIRED) { $env:LLM_MEMORY_REQUIRED = "true" }
-
 $services = Get-NaweiServiceDefinitions
 $occupied = @($services | Where-Object { Test-NaweiPortListening $_.Port })
 if ($occupied.Count -gt 0) {
@@ -56,9 +45,9 @@ $records = @()
 foreach ($service in $services) {
     Write-Host "Starting $($service.Name) on port $($service.Port)..." -ForegroundColor Cyan
     $records += Start-NaweiServiceProcess -Service $service -RuntimeDirectory $runtimeDirectory
+    Save-NaweiProcessRecords -Records $records -Path (Join-Path $runtimeDirectory "processes.json")
 }
 
-$records | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $runtimeDirectory "processes.json")
 Set-Content -Encoding UTF8 -Path (Join-Path $script:NaweiProjectRoot "logs\latest-runtime.txt") -Value $runtimeDirectory
 
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -79,10 +68,18 @@ if ($pending.Count -gt 0) {
     throw "Project startup did not complete within $TimeoutSeconds seconds."
 }
 
+if (-not $SkipWarmup) {
+    Write-Host "Warming up TTS and ASR inference..." -ForegroundColor Cyan
+    & $modelRestorePython (Join-Path $PSScriptRoot "warm_voice.py")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Speech inference warmup failed. Services are running; check .runtime\voice-warmup.json and runtime logs."
+    }
+}
+
 Write-Host "All services are ready." -ForegroundColor Green
 Write-Host "Gateway: http://127.0.0.1:8000"
 Write-Host "LLM memory: Redis + PostgreSQL"
 Write-Host "Knowledge GraphRAG: Qdrant + Neo4j"
 Write-Host "Knowledge API: http://127.0.0.1:8003/docs"
-Write-Host "Gateway API docs: http://127.0.0.1:8000/docs"
+Write-Host "Robot OTA: http://127.0.0.1:8000/xiaozhi/ota/"
 Write-Host "Logs: $runtimeDirectory"

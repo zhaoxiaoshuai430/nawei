@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restore model files split for Git LFS hosting."""
+"""Validate bundled model files and restore local split weights."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def restore_models(model_root: Path, prefix: str = "", *, remove_parts: bool = F
         if not target_is_valid:
             if not declared_parts:
                 raise ValueError(
-                    f"Model file is missing or invalid: {target}. Run 'git lfs pull' before starting the project."
+                    f"Model file is missing or invalid: {target}. Restore the matching local model file before starting."
                 )
             parts = [model_root / part for part in declared_parts]
             missing_parts = [part for part in parts if not part.is_file()]

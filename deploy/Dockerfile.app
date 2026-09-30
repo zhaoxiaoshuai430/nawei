@@ -1,4 +1,4 @@
-FROM python:3.11.9-slim-bookworm
+FROM python:3.11.9-slim-bookworm AS app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -24,9 +24,16 @@ COPY --chown=nawei:nawei services/llm /app/services/llm
 COPY --chown=nawei:nawei services/knowledge /app/services/knowledge
 COPY --chown=nawei:nawei deploy/scripts /app/deploy/scripts
 
-RUN mkdir -p /models/huggingface /models/sentence-transformers \
-    && chown -R nawei:nawei /models
+RUN mkdir -p /models/huggingface /models/sentence-transformers /var/lib/nawei \
+    && chown -R nawei:nawei /models /var/lib/nawei
 
 USER nawei
 
 CMD ["python", "-m", "services.gateway.run"]
+
+FROM app AS knowledge
+USER root
+COPY deploy/requirements-embeddings.txt /tmp/requirements-embeddings.txt
+RUN python -m pip install --requirement /tmp/requirements-embeddings.txt
+USER nawei
+CMD ["python", "-m", "services.knowledge.run"]

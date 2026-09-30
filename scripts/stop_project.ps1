@@ -1,5 +1,6 @@
 param(
-    [switch]$KeepInfrastructure
+    [switch]$KeepInfrastructure,
+    [switch]$ForceStop
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,33 +22,12 @@ if (-not (Test-Path $processFile)) {
 }
 
 $records = Get-Content $processFile -Raw | ConvertFrom-Json
-foreach ($record in $records) {
-    $process = Get-Process -Id ([int]$record.pid) -ErrorAction SilentlyContinue
-    if ($null -eq $process) {
-        continue
-    }
-
-    Write-Host "Stopping $($record.name)..." -ForegroundColor Cyan
-    & taskkill.exe /PID ([string]$record.pid) /T /F | Out-Null
-    if ($LASTEXITCODE -ne 0 -and (Get-Process -Id ([int]$record.pid) -ErrorAction SilentlyContinue)) {
-        Write-Warning "Unable to stop $($record.name) process tree (PID $($record.pid))."
-    }
-}
-
-# A Windows virtual-environment launcher can exit while its base Python
-# process keeps serving. Clean up any remaining listeners on project ports.
-foreach ($service in Get-NaweiServiceDefinitions) {
-    $listenerPids = @(
-        Get-NetTCPConnection -State Listen -LocalPort $service.Port -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty OwningProcess -Unique
-    )
-    foreach ($listenerPid in $listenerPids) {
-        Write-Host "Stopping $($service.Name) listener (PID $listenerPid)..." -ForegroundColor Cyan
-        & taskkill.exe /PID ([string]$listenerPid) /T /F | Out-Null
-        if ($LASTEXITCODE -ne 0 -and (Get-Process -Id ([int]$listenerPid) -ErrorAction SilentlyContinue)) {
-            Write-Warning "Unable to stop $($service.Name) listener (PID $listenerPid)."
-        }
-    }
+$definitions = Get-NaweiServiceDefinitions
+foreach ($serviceName in @('llm', 'gateway', 'knowledge', 'asr', 'tts')) {
+    $service = $definitions | Where-Object Name -eq $serviceName
+    $record = $records | Where-Object name -eq $serviceName | Select-Object -First 1
+    Write-Host "Stopping $serviceName..." -ForegroundColor Cyan
+    Stop-NaweiServiceProcess -Service $service -Record $record -ForceStop:$ForceStop
 }
 
 Start-Sleep -Seconds 2

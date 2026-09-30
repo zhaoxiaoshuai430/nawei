@@ -10,13 +10,14 @@
 **/.ruff_cache
 **/.runtime-tools
 /app
-services/asr/SenseVoice
 services/asr/hf_download
 services/tts/data/cache
 services/tts/data/logs
 services/tts/data/sessions
 services/tts/voice_lab/output
 .runtime-logs
+.runtime
+models/embeddings
 logs
 deploy/backups
 services/asr/tests/fixtures

@@ -396,6 +396,86 @@ class AgentSkillManager:
             agent_mode="short_term",
         )
 
+    async def prepare_conversation_context(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        query: str,
+        knowledge_base_id: str,
+        memory_mode: str,
+        memory_timeout: float,
+    ) -> AgentSkillContext:
+        intent = classify_intent({"query": query, "profile": {}, "concepts": []})
+        semantic_route = build_semantic_route(query=query, intent=intent)
+        memory_status = {"mode": memory_mode, "timed_out": False, "error": None}
+
+        async def load_memory() -> tuple[MemoryContext, list[LearningConcept]]:
+            empty = MemoryContext(user_id=user_id, profile={}, history=[], memories=[])
+            if memory_mode == "off":
+                return empty, []
+
+            async def prepare_memory() -> tuple[MemoryContext, list[LearningConcept]]:
+                if memory_mode == "lightweight":
+                    context = await self.memory_skill.prepare_short_term(
+                        user_id=user_id, session_id=session_id, query=query,
+                    )
+                    return context, []
+                await self.memory_skill.memory_store.initialize()
+                context = await self.memory_skill.prepare(
+                    user_id=user_id, session_id=session_id, query=query,
+                )
+                concepts = await self.concept_skill.prepare(
+                    user_id=user_id, session_id=session_id, query=query,
+                ) if intent.get("needs_concept_tracking") else []
+                return context, concepts
+
+            try:
+                return await asyncio.wait_for(prepare_memory(), timeout=memory_timeout)
+            except asyncio.TimeoutError:
+                memory_status["timed_out"] = True
+            except Exception as exc:
+                memory_status["error"] = type(exc).__name__
+            return empty, []
+
+        async def load_knowledge() -> KnowledgeContext:
+            if not should_retrieve_knowledge(intent):
+                return build_skipped_knowledge_context(
+                    knowledge_base_id=knowledge_base_id, query=query, intent=intent,
+                )
+            return await self.knowledge_skill.prepare(
+                knowledge_base_id=knowledge_base_id,
+                query=query,
+                anchor_terms=knowledge_anchor_terms(intent),
+                graph_candidates=[GraphCandidate(**item) for item in semantic_route.get("graph_candidates") or []],
+                expansion=KnowledgeExpansionOptions(**(semantic_route.get("expansion") or {})),
+            )
+
+        (memory_context, concepts), knowledge_context = await asyncio.gather(load_memory(), load_knowledge())
+        context_mode = "short_term" if memory_mode == "lightweight" else memory_mode
+        if self.tutor_graph is not None:
+            context = await self.tutor_graph._prepare(
+                user_id=user_id, session_id=session_id, query=query,
+                knowledge_base_id=knowledge_base_id, context_mode=context_mode,
+                prepared_context={
+                    "memory_context": memory_context, "concepts": concepts,
+                    "knowledge_context": knowledge_context, "intent": intent,
+                    "semantic_route": semantic_route,
+                },
+            )
+        else:
+            context = self._assemble_context(
+                user_id=user_id, query=query, memory_context=memory_context,
+                concepts=concepts, knowledge_context=knowledge_context, agent_mode=context_mode,
+            )
+        context.skill_metadata["memory_preparation"] = memory_status
+        if memory_mode == "off":
+            context.skill_metadata["skills"] = [
+                skill for skill in context.skill_metadata.get("skills", [])
+                if skill not in {"memory", "short_term_memory", "profile", "concept"}
+            ]
+        return context
+
     async def prepare_stateless_context(
         self,
         *,
@@ -578,6 +658,7 @@ class AgentSkillManager:
             context.tutor_strategy.get("active_skill"),
             context.tutor_strategy.get("teaching_methods"),
             subject=str(intent.get("subject") or "unknown"),
+            response_policy=context.tutor_strategy.get("response_policy"),
         )
         followup_directive = ""
         if preserve_followup:

@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import unittest
 
-from app_protocols.persona import XIAOWEI_PERSONA_VERSION, format_response_policy, format_xiaowei_system_prompt
+from app_protocols.persona import (
+    XIAOWEI_PERSONA_VERSION,
+    format_response_policy,
+    format_xiaowei_system_prompt,
+    normalize_assistant_dialect_mode,
+    normalize_assistant_persona_mode,
+)
 
 
 class XiaoweiPersonaTest(unittest.TestCase):
-    def test_prompt_uses_persona_v6(self) -> None:
+    def test_prompt_uses_persona_v8(self) -> None:
         prompt = format_xiaowei_system_prompt("2026-08-26")
 
-        self.assertEqual(XIAOWEI_PERSONA_VERSION, "xiaowei-persona-v6")
-        self.assertIn("persona_version: xiaowei-persona-v6", prompt)
+        self.assertEqual(XIAOWEI_PERSONA_VERSION, "xiaowei-persona-v8")
+        self.assertIn("persona_version: xiaowei-persona-v8", prompt)
         self.assertIn("当前日期：2026-08-26", prompt)
 
     def test_persona_and_response_policy_define_daily_guardian_style(self) -> None:
@@ -28,7 +34,7 @@ class XiaoweiPersonaTest(unittest.TestCase):
             }
         )
 
-        self.assertIn("日常生活和轻松聊天要自然、有生活感", persona)
+        self.assertIn("日常生活和轻松聊天要像真实熟人交流一样自然、有生活感", persona)
         self.assertIn("守护型伙伴", persona)
         self.assertIn("站在用户这边的守护型伙伴", policy)
         self.assertIn("自然加入一处贴合情境的幽默", policy)
@@ -41,6 +47,18 @@ class XiaoweiPersonaTest(unittest.TestCase):
         self.assertIn("不建议把钥匙、凭据或私人信息交给不可信的人", persona)
         self.assertNotIn("\f", persona)
         self.assertNotIn("\b", persona)
+
+    def test_persona_and_dialect_modes_normalize_nested_profile_values(self) -> None:
+        self.assertEqual(normalize_assistant_persona_mode({"assistant_persona": {"mode": "gentle"}}), "gentle")
+        self.assertEqual(normalize_assistant_dialect_mode({"assistant_dialect": {"mode": "beijing"}}), "beijing")
+        self.assertEqual(normalize_assistant_persona_mode("unsupported"), "humorous")
+        self.assertEqual(normalize_assistant_dialect_mode("unsupported"), "mandarin")
+
+        policy = format_response_policy({"dialect_mode": "beijing"})
+        self.assertIn("方言词和刻意儿化合计不得超过 2 处", policy)
+
+        preference_policy = format_response_policy({"interaction_mode": "acknowledge_preference"})
+        self.assertIn("用一到两句自然确认已经记住偏好", preference_policy)
 
 
 if __name__ == "__main__":

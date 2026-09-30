@@ -45,8 +45,25 @@ class DictionaryResult:
 
 
 class DictionaryTool:
-    def __init__(self, *, timeout_seconds: float | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
         self.timeout_seconds = timeout_seconds or _read_float_env("DICTIONARY_TOOL_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
+        self._client = client
+        self._owns_client = client is None
+
+    async def aclose(self) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    def _http_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.timeout_seconds, trust_env=False)
+        return self._client
 
     def extract_word(self, text: str) -> str | None:
         if not any(marker.lower() in text.lower() for marker in DICT_MARKERS):
@@ -79,10 +96,9 @@ class DictionaryTool:
         last_error: httpx.TransportError | None = None
         for _attempt in range(2):
             try:
-                async with httpx.AsyncClient(timeout=attempt_timeout) as client:
-                    response = await client.get(request_url)
-                    response.raise_for_status()
-                    body = response.json()
+                response = await self._http_client().get(request_url, timeout=attempt_timeout)
+                response.raise_for_status()
+                body = response.json()
                 break
             except httpx.TransportError as exc:
                 last_error = exc

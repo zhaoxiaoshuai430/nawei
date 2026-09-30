@@ -92,5 +92,69 @@ record ID, and any source URL present in the workbook. Importing into `default`
 keeps the data available to the existing LLM and voice conversation flow.
 
 The development default uses deterministic hash embeddings and rule extraction
-only to validate infrastructure. Production must configure a semantic embedding
-endpoint and should set `KNOWLEDGE_GRAPH_EXTRACTOR=llm`.
+only to validate infrastructure. Real semantic retrieval requires a local
+FastEmbed model or a configured embedding endpoint. LLM graph extraction is a
+separate option, controlled by `KNOWLEDGE_GRAPH_EXTRACTOR=llm`.
+
+## Local Chinese semantic embeddings
+
+Install the optional CPU dependency in the main virtual environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r deploy/requirements-embeddings.txt
+.\.venv\Scripts\python.exe -c "from fastembed import TextEmbedding; model = TextEmbedding(model_name='BAAI/bge-small-zh-v1.5', cache_dir='.runtime/embedding-cache', threads=2, providers=['CPUExecutionProvider']); print(len(next(model.embed(['test']))))"
+```
+
+The preparation command downloads the model and must print `512`. The service
+itself uses `local_files_only=True`: download the model before starting it.
+It warms the CPU model before reporting readiness and does not use the TTS GPU.
+Inference runs off the event loop with at most one batch per provider instance.
+
+Build a separate index while ingestion/deletion is paused. From the repo root:
+
+```powershell
+. .\scripts\project_runtime.ps1
+Initialize-NaweiLocalEnvironment
+.\.venv\Scripts\python.exe scripts/reindex_semantic.py --source knowledge_chunks_v1 --inspect
+.\.venv\Scripts\python.exe scripts/reindex_semantic.py --source knowledge_chunks_v1 --target knowledge_chunks_bge_zh_20260907
+.\.venv\Scripts\python.exe scripts/evaluate_semantic_pipeline.py --source knowledge_chunks_v1 --target knowledge_chunks_bge_zh_20260907
+```
+
+Migration accepts ready `hash-embedding-v1` payloads only and refuses an existing
+target. It keeps the original collection and chunk IDs, so citations and Neo4j
+links remain valid. The evaluation script compares existing indexes using the
+real hybrid retrieval pipeline. Its small concept-term fixture reports Hit@5
+and MRR@5, not an exhaustive relevance or unanswerable-query benchmark.
+
+After reviewing the reports, set the local `.env.knowledge` to:
+
+```dotenv
+EMBEDDING_PROVIDER=fastembed
+EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+EMBEDDING_DIMENSION=512
+EMBEDDING_THREADS=2
+QDRANT_COLLECTION=knowledge_chunks_bge_zh_20260907
+```
+
+Restart with `scripts/restart_robot_services.ps1 -Names knowledge`; verify
+`GET http://127.0.0.1:8003/health` reports `ready: true` and the BGE model.
+Configuration precedence is process environment, then `.env.knowledge`, then
+`.env`, then code defaults. Explicit process variables can override this file.
+`EMBEDDING_CACHE_DIR` defaults to the repo's `.runtime/embedding-cache`.
+
+Existing collections must match the configured dimension, cosine distance, and
+every point's embedding version. Incompatible collections are rejected, never
+silently recreated. Retrieval cache keys include the collection, provider,
+model, and dimension. `metadata.timings_ms` separates cache lookup, entity
+resolution, embedding, vector/lexical search, and graph expansion.
+
+`.env.knowledge.example` contains the original hash configuration for rollback.
+Restore those values and restart Knowledge only when the old collection still
+matches the shared catalog and graph. It is a migration-time snapshot, not a
+live replica: new ingestion or deletions after activation require reconciliation
+before rollback. Keep writes paused across migration and activation.
+
+Container deployments do not install these optional dependencies automatically.
+Install `deploy/requirements-embeddings.txt` in the Knowledge image, mount the
+prepared model cache, and pass the model/index/cache settings explicitly; do not
+assume the ignored local `.env.knowledge` file is available inside a container.

@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 if load_dotenv is not None:
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env.knowledge", override=False)
     load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
 
@@ -44,6 +45,8 @@ class KnowledgeSettings:
     cache_ttl_seconds: int
     max_context_chars: int
     default_base_id: str
+    embedding_cache_dir: str = ""
+    embedding_threads: int = 2
 
 
 def load_settings() -> KnowledgeSettings:
@@ -77,6 +80,8 @@ def load_settings() -> KnowledgeSettings:
         cache_ttl_seconds=_read_int("KNOWLEDGE_CACHE_TTL_SECONDS", 600),
         max_context_chars=_read_int("KNOWLEDGE_MAX_CONTEXT_CHARS", 6000),
         default_base_id=os.getenv("KNOWLEDGE_DEFAULT_BASE_ID", "default").strip(),
+        embedding_cache_dir=os.getenv("EMBEDDING_CACHE_DIR", str(Path(__file__).resolve().parents[2] / ".runtime/embedding-cache")),
+        embedding_threads=_read_int("EMBEDDING_THREADS", 2),
     )
 
 

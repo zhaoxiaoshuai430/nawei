@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import AsyncMock, patch
 
+from app_protocols import LLMRequest, Message, MessageRole
 from app_protocols.persona import XIAOWEI_PERSONA_VERSION
+from services.llm.agent_runtime import AgentTurn, LLMAgentRuntime
 from services.knowledge.schemas import KnowledgeChunkHit, KnowledgeContext, KnowledgeGraphRelation
-from services.llm.agents.tutor_graph import choose_route, classify_intent
+from services.llm.agents.tutor_graph import build_response_policy, choose_route, classify_intent
 from services.llm.memory import MemoryStore
 from services.llm.skills import AgentSkillManager
 from services.llm.tools import CalculatorTool, UnitConverterTool
@@ -51,8 +54,66 @@ class RecordingKnowledgeClient:
 
 
 class Agent0205UpgradeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_target_policy_replaces_local_answer_format_overrides(self) -> None:
+        for query, depth in [
+            ("一加一等于几？请只回答结果。", "standard"),
+            ("三角函数是什么？请用一句话回答。", "brief"),
+        ]:
+            with self.subTest(query=query):
+                manager = AgentSkillManager(MemoryStore(enabled=False), RecordingKnowledgeClient())
+                context = await manager.prepare_context(user_id="brief", session_id="brief", query=query)
+                policy = context.tutor_strategy["response_policy"]
+                self.assertEqual(policy["response_depth"], depth)
+                self.assertNotIn("answer_format", policy)
+                self.assertNotIn("allow_followup", policy)
+                prompt = manager.render_system_prompt(context)
+                if context.tutor_strategy.get("active_skill"):
+                    self.assertIn("全文问号数必须等于1", prompt)
+                self.assertIn("参考来源", prompt)
+
+    async def test_detailed_answer_uses_target_teaching_contract(self) -> None:
+        manager = AgentSkillManager(MemoryStore(enabled=False), RecordingKnowledgeClient())
+        context = await manager.prepare_context(
+            user_id="detailed", session_id="detailed", query="详细介绍三角函数，不要反问。",
+        )
+        self.assertEqual(context.tutor_strategy["response_policy"]["response_depth"], "detailed")
+        prompt = manager.render_system_prompt(context)
+        self.assertIn("全文问号数必须等于1", prompt)
+        self.assertNotIn("本轮不添加探索式收尾", prompt)
+
+    def test_brief_policy_preserves_safety_and_negative_request(self) -> None:
+        query = "我正在考试，直接给答案，只回答结果"
+        policy = build_response_policy(query=query, profile={}, intent=classify_intent({"query": query}))
+        self.assertEqual(policy["scene"], "academic_integrity")
+        policy = build_response_policy(query="不要只回答结果", profile={}, intent={"category": "explain"})
+        self.assertNotIn("answer_format", policy)
+
+    async def test_turn_history_persists_user_before_assistant(self) -> None:
+        store = MemoryStore(enabled=False)
+        runtime = LLMAgentRuntime(memory_store=store)
+        persisted = []
+
+        async def delayed_persist(**kwargs: object) -> None:
+            if kwargs["role"] == "user":
+                await asyncio.sleep(0.02)
+            persisted.append(kwargs["role"])
+
+        request = LLMRequest(
+            request_id="ordered", trace_id="ordered", session_id="ordered", user_id="ordered",
+            messages=[Message(role=MessageRole.USER, content="hello")],
+        )
+        context = await runtime.skill_manager.prepare_context(
+            user_id="ordered", session_id="ordered", query="你好",
+        )
+        turn = AgentTurn(request=request, original_request=request, user_id="ordered", user_text="hello", context=context)
+        with patch.object(store, "persist_message", side_effect=delayed_persist), patch.object(
+            runtime.skill_manager, "after_turn", new=AsyncMock(return_value={})
+        ), patch.dict("os.environ", {"LLM_AGENT_ENABLED": "true", "MEMORY_POST_TURN_ASYNC": "false"}):
+            await runtime.after_turn(turn, "hello back")
+        self.assertEqual(persisted, ["user", "assistant"])
+
     def test_persona_and_scene_routes_match_05(self) -> None:
-        self.assertEqual(XIAOWEI_PERSONA_VERSION, "xiaowei-persona-v6")
+        self.assertEqual(XIAOWEI_PERSONA_VERSION, "xiaowei-persona-v8")
         self.assertEqual(classify_intent({"query": "好的"})["category"], "followup")
         self.assertEqual(
             classify_intent({"query": "验证码能不能发给同学"})["category"],

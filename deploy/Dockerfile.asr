@@ -25,6 +25,7 @@ RUN python -m pip install --upgrade pip \
 WORKDIR /app/services/asr
 COPY --chown=nawei:nawei services/asr /app/services/asr
 COPY --chown=nawei:nawei models/asr /app/models/asr
+COPY --chown=nawei:nawei deploy/scripts/healthcheck.py /app/deploy/scripts/healthcheck.py
 RUN mkdir -p /app/services/asr/hf_download/modelscope /app/services/asr/hf_download/huggingface \
     && chown -R nawei:nawei /app/services/asr/hf_download
 

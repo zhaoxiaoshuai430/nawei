@@ -5,6 +5,12 @@ client packages are unavailable, development keeps running with an in-memory
 fallback so local protocol tests remain fast and deterministic.
 """
 
+# 用户记忆的统一存储入口，不负责知识文档向量化，也不直接操作 Qdrant/Neo4j。
+# 三层职责：进程字典提供低延迟本地上下文，Redis 保存有限近期历史，PostgreSQL 保存持久数据。
+# user_id 隔离用户；近期消息再按 session_id 隔离，画像和长期记忆可以跨该用户的会话复用。
+# 阅读顺序：build_context/build_short_term_context -> get_history -> cache_message/persist_message -> remember。
+# 降级字典仅在当前进程存活期间有效，不能把“仍能对话”误认为“持久化正常”。
+
 from __future__ import annotations
 
 import asyncio
@@ -14,11 +20,14 @@ import logging
 import os
 import re
 import time
+import uuid
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from services.llm.age_policy import audience_profile_from_profile
 
 
 logger = logging.getLogger(__name__)
@@ -39,21 +48,16 @@ except ImportError:  # pragma: no cover - optional dependency
     httpx = None  # type: ignore[assignment]
 
 
-def _consume_background_task_exception(task: asyncio.Task[Any]) -> None:
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        logger.exception("Background memory task failed")
-
-
 DEFAULT_DATABASE_URL = "postgresql://llm:llm@127.0.0.1:5432/llm"
 DEFAULT_REDIS_URL = "redis://127.0.0.1:6379/0"
 MAX_HISTORY_MESSAGES = 20
 HISTORY_TTL_SECONDS = 24 * 3600
 PROFILE_CACHE_TTL_SECONDS = 3600
 MIN_MEMORY_IMPORTANCE = 4
+DEFAULT_FALLBACK_MAX_USERS = 1000
+DEFAULT_FALLBACK_MAX_SESSIONS = 2000
+DEFAULT_FALLBACK_MAX_ITEMS_PER_USER = 200
+DEFAULT_FALLBACK_MAX_CONCEPTS_PER_USER = 100
 DEFAULT_PROMPT_VERSION = "navi-memory-v2"
 DEFAULT_MEMORY_EXTRACTOR_URL = "http://127.0.0.1:8002/api/v1/llm"
 DEFAULT_MEMORY_EXTRACTOR_TIMEOUT_SECONDS = 60.0
@@ -159,6 +163,7 @@ class MemoryStore:
         database_url: str | None = None,
         redis_url: str | None = None,
         enabled: bool | None = None,
+        extractor_client: Any = None,
     ) -> None:
         raw_enabled = os.getenv("MEMORY_ENABLED", "true").strip().lower()
         self.enabled = enabled if enabled is not None else raw_enabled not in {"0", "false", "no", "off"}
@@ -169,11 +174,24 @@ class MemoryStore:
         self._redis: Any = None
         self._init_lock = asyncio.Lock()
         self._init_lock_loop: asyncio.AbstractEventLoop | None = None
+        self._redis_init_lock = asyncio.Lock()
+        self._redis_init_lock_loop: asyncio.AbstractEventLoop | None = None
         self._memory_messages: dict[str, list[dict[str, Any]]] = {}
         self._memory_profiles: dict[str, dict[str, Any]] = {}
         self._memory_items: dict[str, list[dict[str, Any]]] = {}
         self._memory_concepts: dict[str, list[dict[str, Any]]] = {}
         self._profile_process_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._fallback_user_order: dict[str, None] = {}
+        self.fallback_max_users = max(1, _read_int_env("MEMORY_FALLBACK_MAX_USERS", DEFAULT_FALLBACK_MAX_USERS))
+        self.fallback_max_sessions = max(1, _read_int_env("MEMORY_FALLBACK_MAX_SESSIONS", DEFAULT_FALLBACK_MAX_SESSIONS))
+        self.fallback_max_items_per_user = max(
+            1,
+            _read_int_env("MEMORY_FALLBACK_MAX_ITEMS_PER_USER", DEFAULT_FALLBACK_MAX_ITEMS_PER_USER),
+        )
+        self.fallback_max_concepts_per_user = max(
+            1,
+            _read_int_env("MEMORY_FALLBACK_MAX_CONCEPTS_PER_USER", DEFAULT_FALLBACK_MAX_CONCEPTS_PER_USER),
+        )
         self._postgres_retry_after = 0.0
         self._redis_retry_after = 0.0
         self._redis_last_error: str | None = None
@@ -181,11 +199,46 @@ class MemoryStore:
         self.extractor_enabled = os.getenv("MEMORY_EXTRACTOR_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
         self.extractor_url = os.getenv("MEMORY_EXTRACTOR_URL", DEFAULT_MEMORY_EXTRACTOR_URL).strip()
         self.extractor_timeout_seconds = _read_float_env("MEMORY_EXTRACTOR_TIMEOUT_SECONDS", DEFAULT_MEMORY_EXTRACTOR_TIMEOUT_SECONDS)
+        self._extractor_client: Any = extractor_client
+        self._owns_extractor_client = extractor_client is None
         self.last_error: str | None = None
+
+    def _touch_fallback_user(self, user_id: str) -> None:
+        if user_id in self._fallback_user_order:
+            self._fallback_user_order.pop(user_id)
+            self._fallback_user_order[user_id] = None
+            return
+        while len(self._fallback_user_order) >= self.fallback_max_users:
+            evicted_user_id = next(iter(self._fallback_user_order))
+            self._fallback_user_order.pop(evicted_user_id, None)
+            self._memory_profiles.pop(evicted_user_id, None)
+            self._memory_items.pop(evicted_user_id, None)
+            self._memory_concepts.pop(evicted_user_id, None)
+            self._profile_process_cache.pop(evicted_user_id, None)
+            history_prefix = f"navi:history:v2:{_redis_key_component(evicted_user_id)}:"
+            for key in [key for key in self._memory_messages if key.startswith(history_prefix)]:
+                self._memory_messages.pop(key, None)
+        self._fallback_user_order[user_id] = None
+
+    def _fallback_messages(self, *, user_id: str, session_id: str) -> list[dict[str, Any]]:
+        self._touch_fallback_user(user_id)
+        key = self._history_key(user_id, session_id)
+        if key in self._memory_messages:
+            items = self._memory_messages.pop(key)
+            self._memory_messages[key] = items
+            return items
+        while len(self._memory_messages) >= self.fallback_max_sessions:
+            oldest_key = next(iter(self._memory_messages))
+            self._memory_messages.pop(oldest_key, None)
+        new_items: list[dict[str, Any]] = []
+        self._memory_messages[key] = new_items
+        return new_items
 
     async def initialize(self) -> None:
         """Create database objects and connect Redis when available."""
 
+        # 连接池与异步锁绑定事件循环，重建循环时不能复用旧资源。
+        # 重连退避避免依赖宕机后每轮都立即重复连接；必需依赖的启动检查由 AgentRuntime 执行。
         if not self.enabled:
             return
         current_loop = asyncio.get_running_loop()
@@ -206,24 +259,25 @@ class MemoryStore:
                 self.last_error = "asyncpg is not installed; using in-memory memory fallback."
                 await self._ensure_redis()
                 return
+            pool = None
             try:
                 connect_timeout = _read_float_env("MEMORY_CONNECT_TIMEOUT_SECONDS", 3.0)
-                self._pool = await asyncio.wait_for(
-                    asyncpg.create_pool(
+                async with asyncio.timeout(connect_timeout + 0.5):
+                    pool = await asyncpg.create_pool(
                         self.database_url,
                         min_size=1,
                         max_size=_read_int_env("MEMORY_POSTGRES_POOL_SIZE", 5),
                         timeout=connect_timeout,
-                    ),
-                    timeout=connect_timeout + 0.5,
-                )
+                    )
+                    async with pool.acquire() as conn:
+                        async with conn.transaction():
+                            await conn.execute(
+                                "SELECT pg_advisory_xact_lock(hashtext('nawei_llm_memory_schema'))"
+                            )
+                            # 数据库事务级咨询锁协调多个进程的建表操作，不用于日常对话写入排序。
+                            await conn.execute(_SCHEMA_SQL)
+                self._pool = pool
                 self._pool_loop = current_loop
-                async with self._pool.acquire() as conn:
-                    async with conn.transaction():
-                        await conn.execute(
-                            "SELECT pg_advisory_xact_lock(hashtext('nawei_llm_memory_schema'))"
-                        )
-                        await conn.execute(_SCHEMA_SQL)
                 self.last_error = None
                 self._postgres_retry_after = 0.0
             except Exception as exc:  # pragma: no cover - depends on local services
@@ -231,64 +285,100 @@ class MemoryStore:
                 self._postgres_retry_after = time.monotonic() + _read_float_env("MEMORY_RETRY_INTERVAL_SECONDS", 10.0)
                 self._pool = None
                 self._pool_loop = None
+            finally:
+                if pool is not None and pool is not self._pool:
+                    pool.terminate()
 
             await self._ensure_redis()
 
     async def _ensure_redis(self) -> None:
         if self._redis is not None or aioredis is None:
             return
-        if time.monotonic() < self._redis_retry_after:
+        current_loop = asyncio.get_running_loop()
+        if self._redis_init_lock_loop is not current_loop:
+            self._redis_init_lock = asyncio.Lock()
+            self._redis_init_lock_loop = current_loop
+        async with self._redis_init_lock:
+            if self._redis is not None or time.monotonic() < self._redis_retry_after:
+                return
+            redis_client = None
+            try:
+                connect_timeout = _read_float_env("MEMORY_CONNECT_TIMEOUT_SECONDS", 3.0)
+                async with asyncio.timeout(connect_timeout):
+                    redis_client = aioredis.from_url(
+                        self.redis_url,
+                        decode_responses=True,
+                        socket_connect_timeout=connect_timeout,
+                        socket_timeout=connect_timeout,
+                    )
+                    if not await redis_client.ping():
+                        raise ConnectionError("Redis ping failed")
+                self._redis = redis_client
+                self._redis_retry_after = 0.0
+                if self._redis_last_error is not None:
+                    logger.info("Redis memory cache connection restored")
+                    self._redis_last_error = None
+            except Exception as exc:
+                self._record_redis_failure(exc)
+            finally:
+                if redis_client is not None and redis_client is not self._redis:
+                    await self._close_redis_client(redis_client)
+
+    def _record_redis_failure(self, exc: Exception) -> None:
+        self._redis_retry_after = time.monotonic() + _read_float_env("MEMORY_RETRY_INTERVAL_SECONDS", 10.0)
+        error = f"{type(exc).__name__}: {exc}"
+        if error != self._redis_last_error:
+            logger.warning("Redis memory cache unavailable; retrying with fallback: %s", error)
+            self._redis_last_error = error
+
+    async def _discard_redis(self, redis_client: Any, exc: Exception) -> None:
+        if self._redis is not redis_client:
             return
+        self._redis = None
+        self._record_redis_failure(exc)
+        await self._close_redis_client(redis_client)
+
+    @staticmethod
+    async def _close_redis_client(redis_client: Any) -> None:
         try:
-            connect_timeout = _read_float_env("MEMORY_CONNECT_TIMEOUT_SECONDS", 3.0)
-            self._redis = aioredis.from_url(
-                self.redis_url,
-                decode_responses=True,
-                socket_connect_timeout=connect_timeout,
-                socket_timeout=connect_timeout,
-            )
-            await self._redis.ping()
-            self._redis_retry_after = 0.0
-            if self._redis_last_error is not None:
-                logger.info("Redis memory cache connection restored")
-                self._redis_last_error = None
-        except Exception as exc:
-            self._redis = None
-            self._redis_retry_after = time.monotonic() + _read_float_env("MEMORY_RETRY_INTERVAL_SECONDS", 10.0)
-            error = f"{type(exc).__name__}: {exc}"
-            if error != self._redis_last_error:
-                logger.warning("Redis memory cache unavailable; retrying with fallback: %s", error)
-                self._redis_last_error = error
+            close = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
+            if close is not None:
+                try:
+                    result = close(close_connection_pool=True)
+                except TypeError:
+                    result = close()
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception:
+            pass
+        try:
+            pool = getattr(redis_client, "connection_pool", None)
+            disconnect = getattr(pool, "disconnect", None)
+            if disconnect is not None:
+                try:
+                    result = disconnect(inuse_connections=True)
+                except TypeError:
+                    result = disconnect()
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception:
+            pass
 
     async def close(self) -> None:
         """Close optional PostgreSQL and Redis clients owned by this store."""
 
+        if self._owns_extractor_client and self._extractor_client is not None:
+            extractor_client = self._extractor_client
+            self._extractor_client = None
+            try:
+                await extractor_client.aclose()
+            except Exception:
+                pass
+
         if self._redis is not None:
             redis_client = self._redis
             self._redis = None
-            try:
-                close = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
-                if close is not None:
-                    try:
-                        result = close(close_connection_pool=True)
-                    except TypeError:
-                        result = close()
-                    if asyncio.iscoroutine(result):
-                        await result
-            except Exception:
-                pass
-            try:
-                pool = getattr(redis_client, "connection_pool", None)
-                disconnect = getattr(pool, "disconnect", None)
-                if disconnect is not None:
-                    try:
-                        result = disconnect(inuse_connections=True)
-                    except TypeError:
-                        result = disconnect()
-                    if asyncio.iscoroutine(result):
-                        await result
-            except Exception:
-                pass
+            await self._close_redis_client(redis_client)
 
         if self._pool is not None:
             pool = self._pool
@@ -311,33 +401,46 @@ class MemoryStore:
                 "vector": "disabled",
                 "last_error": self.last_error,
             }
-        pg_ok = self._pool is not None
-        redis_ok = False
-        if self._redis is not None:
+        pg_ok = False
+        last_error = self.last_error
+        if self._pool is not None:
             try:
-                redis_ok = bool(await self._redis.ping())
-            except Exception:
-                self._redis = None
-                redis_ok = False
+                async with asyncio.timeout(_read_float_env("MEMORY_CONNECT_TIMEOUT_SECONDS", 3.0)):
+                    pg_ok = await self._pool.fetchval("SELECT 1") == 1
+            except Exception as exc:
+                last_error = f"PostgreSQL health check failed: {type(exc).__name__}"
+        redis_ok = False
+        redis_client = self._redis
+        if redis_client is not None:
+            try:
+                redis_ok = bool(await redis_client.ping())
+                if not redis_ok:
+                    raise ConnectionError("Redis ping failed")
+            except Exception as exc:
+                await self._discard_redis(redis_client, exc)
         if not redis_ok:
             await self._ensure_redis()
-            if self._redis is not None:
+            redis_client = self._redis
+            if redis_client is not None:
                 try:
-                    redis_ok = bool(await self._redis.ping())
-                except Exception:
-                    self._redis = None
-                    redis_ok = False
+                    redis_ok = bool(await redis_client.ping())
+                    if not redis_ok:
+                        raise ConnectionError("Redis ping failed")
+                except Exception as exc:
+                    await self._discard_redis(redis_client, exc)
         return {
             "enabled": self.enabled,
             "postgres": "ok" if pg_ok else "fallback",
             "redis": "ok" if redis_ok else "fallback",
             "vector": "removed",
-            "last_error": self.last_error,
+            "last_error": last_error,
         }
 
     async def build_context(self, *, user_id: str, session_id: str, query: str, lightweight: bool = False) -> MemoryContext:
         """Load profile, short-term history, and relevant long-term memories."""
 
+        # 并发读取画像、近期消息和相关长期记忆，再按当前问题过滤画像，减少无关提示词。
+        # lightweight 仍会召回基础记忆；它与下面完全不召回长期记忆的 short_term 不同。
         await self.initialize()
         if lightweight:
             profile, history, memories = await asyncio.gather(
@@ -368,6 +471,8 @@ class MemoryStore:
     ) -> MemoryContext:
         """Load only profile and recent history for the current turn."""
 
+        # 快速追问可优先使用本地消息，避免等异步落库；命中该分支时不额外加载画像。
+        # 未命中或未开启该策略时，仍走正常存储读取，而不是默认历史为空。
         limit = history_limit if history_limit is not None else _read_int_env("MEMORY_SHORT_TERM_HISTORY_LIMIT", 8)
         limit = max(1, min(limit, MAX_HISTORY_MESSAGES))
         if prefer_local_history:
@@ -485,6 +590,7 @@ class MemoryStore:
             return []
 
         if self._pool is None:
+            self._touch_fallback_user(user_id)
             updated: list[LearningConcept] = []
             bucket = self._memory_concepts.setdefault(user_id, [])
             for signal in signals:
@@ -528,6 +634,7 @@ class MemoryStore:
                 existing["effective_strategy"] = signal.get("effective_strategy") or existing.get("effective_strategy")
                 existing["evidence"] = signal["evidence"]
                 updated.append(_concept_from_item(existing))
+            del bucket[:-self.fallback_max_concepts_per_user]
             return updated
 
         updated_rows: list[Any] = []
@@ -595,44 +702,55 @@ class MemoryStore:
             return
         await self.extract_and_store(user_id=user_id, session_id=session_id, user_text=user_text, use_llm=False)
         if self._should_run_llm_extractor(user_text):
-            task = asyncio.create_task(self.extract_and_store(user_id=user_id, session_id=session_id, user_text=user_text, use_rules=False))
-            task.add_done_callback(_consume_background_task_exception)
+            await self.extract_and_store(user_id=user_id, session_id=session_id, user_text=user_text, use_rules=False)
 
     async def add_message(self, *, user_id: str, session_id: str, role: str, content: str) -> None:
         """Save a message to Redis and PostgreSQL."""
 
-        content = self.cache_message(user_id=user_id, session_id=session_id, role=role, content=content)
+        message_id = uuid.uuid4().hex
+        content = self.cache_message(user_id=user_id, session_id=session_id, role=role, content=content, message_id=message_id)
         if not content:
             return
-        await self.persist_message(user_id=user_id, session_id=session_id, role=role, content=content)
+        await self.persist_message(user_id=user_id, session_id=session_id, role=role, content=content, message_id=message_id)
 
-    def cache_message(self, *, user_id: str, session_id: str, role: str, content: str) -> str:
+    def cache_message(self, *, user_id: str, session_id: str, role: str, content: str, message_id: str | None = None) -> str:
         """Make a message immediately available to same-process follow-up turns."""
 
+        # 这是进程内缓存，函数名中的 cache 不表示已经写入 Redis 或数据库。
+        # 只保留最近 MAX_HISTORY_MESSAGES 条，避免一个长会话无限增长内存。
         content = content.strip()
         if not content:
             return ""
-        key = self._history_key(user_id, session_id)
-        items = self._memory_messages.setdefault(key, [])
-        items.append({"role": role, "content": content, "ts": time.time()})
+        items = self._fallback_messages(user_id=user_id, session_id=session_id)
+        items.append({"role": role, "content": content, "ts": time.time(), "user_id": user_id, "session_id": session_id,
+                      "message_id": message_id or uuid.uuid4().hex, "redis_persisted": False})
         del items[:-MAX_HISTORY_MESSAGES]
         return content
 
-    async def persist_message(self, *, user_id: str, session_id: str, role: str, content: str) -> None:
+    async def persist_message(self, *, user_id: str, session_id: str, role: str, content: str, message_id: str | None = None) -> None:
         """Persist an already locally cached message to Redis and PostgreSQL."""
 
+        # Redis 列表有长度上限与 TTL，数据库保存消息记录；两者不是同一个原子事务。
+        # Redis 写失败会退化为其他读取路径；数据库连接池缺失时只保留已有缓存，不能保证落盘。
         content = content.strip()
         if not content:
             return
         key = self._history_key(user_id, session_id)
-        if self._redis is not None:
+        local_message = next((item for item in self._memory_messages.get(key, [])
+                              if item.get("message_id") == message_id), None) if message_id else None
+        redis_client = self._redis
+        if redis_client is not None:
             try:
-                payload = json.dumps({"role": role, "content": content, "ts": time.time()}, ensure_ascii=False)
-                await self._redis.rpush(key, payload)
-                await self._redis.ltrim(key, -MAX_HISTORY_MESSAGES, -1)
-                await self._redis.expire(key, HISTORY_TTL_SECONDS)
-            except Exception:
-                self._redis = None
+                payload = json.dumps({"role": role, "content": content,
+                                      "ts": local_message["ts"] if local_message else time.time(),
+                                      "message_id": message_id or uuid.uuid4().hex}, ensure_ascii=False)
+                await redis_client.rpush(key, payload)
+                await redis_client.ltrim(key, -MAX_HISTORY_MESSAGES, -1)
+                await redis_client.expire(key, HISTORY_TTL_SECONDS)
+                if local_message is not None:
+                    local_message["redis_persisted"] = True
+            except Exception as exc:
+                await self._discard_redis(redis_client, exc)
 
         if self._pool is None:
             return
@@ -666,7 +784,7 @@ class MemoryStore:
         if self._pool is None:
             rows: list[dict[str, str]] = []
             for key, items in self._memory_messages.items():
-                if not key.startswith(f"hist:{user_id}:"):
+                if not key.startswith(self._history_key(user_id, "").rsplit(":", 1)[0] + ":"):
                     continue
                 for item in items:
                     if item.get("role") != "user":
@@ -674,8 +792,9 @@ class MemoryStore:
                     ts = float(item.get("ts") or 0)
                     created_at = datetime.fromtimestamp(ts, tz)
                     if start <= created_at < end:
-                        rows.append({"content": str(item.get("content") or ""), "created_at": created_at.isoformat(), "session_id": key.rsplit(":", 1)[-1]})
-            return rows[-limit:]
+                        rows.append({"content": str(item.get("content") or ""), "created_at": created_at.isoformat(), "session_id": str(item.get("session_id") or "")})
+            rows.sort(key=lambda item: item["created_at"])
+            return rows[:limit]
 
         async with self._pool.acquire() as conn:
             db_rows = await conn.fetch(
@@ -706,14 +825,24 @@ class MemoryStore:
     async def get_history(self, *, user_id: str, session_id: str, limit: int = 10) -> list[dict[str, str]]:
         """Return recent short-term messages in chronological order."""
 
-        if self._redis is not None:
+        key = self._history_key(user_id, session_id)
+        pending = [dict(item) for item in self._memory_messages.get(key, []) if not item.get("redis_persisted")]
+        redis_client = self._redis
+        if redis_client is not None:
             try:
-                key = self._history_key(user_id, session_id)
-                raw_items = await self._redis.lrange(key, -limit, -1)
+                raw_items = await redis_client.lrange(key, -limit, -1)
                 if raw_items:
-                    return [_compact_message(json.loads(item)) for item in raw_items]
-            except Exception:
-                self._redis = None
+                    shared = [json.loads(item) for item in raw_items]
+                    pending.extend(dict(item) for item in self._memory_messages.get(key, []) if not item.get("redis_persisted"))
+                    seen = {item.get("message_id") for item in shared if item.get("message_id")}
+                    for item in pending:
+                        if item.get("message_id") not in seen:
+                            shared.append(item)
+                            seen.add(item.get("message_id"))
+                    shared.sort(key=lambda item: float(item.get("ts") or 0))
+                    return [_compact_message(item) for item in shared[-limit:]]
+            except Exception as exc:
+                await self._discard_redis(redis_client, exc)
         key = self._history_key(user_id, session_id)
         memory_items = self._memory_messages.get(key, [])[-limit:]
         if memory_items:
@@ -743,22 +872,110 @@ class MemoryStore:
         items = self._memory_messages.get(self._history_key(user_id, session_id), [])[-limit:]
         return [_compact_message(item) for item in items]
 
+    async def get_pending_weather_day(self, *, user_id: str, session_id: str) -> str | None:
+        if self._redis is None:
+            return None
+        key = f"navi:weather:{_redis_key_component(user_id)}:{_redis_key_component(session_id)}"
+        try:
+            day = await asyncio.wait_for(self._redis.get(key), timeout=0.2)
+            if isinstance(day, bytes):
+                day = day.decode("utf-8")
+            return day if day in {"today", "tomorrow", "day_after_tomorrow"} else None
+        except Exception:
+            return None
+
+    async def set_pending_weather_day(self, *, user_id: str, session_id: str, day: str | None) -> None:
+        if self._redis is None:
+            return
+        key = f"navi:weather:{_redis_key_component(user_id)}:{_redis_key_component(session_id)}"
+        try:
+            operation = self._redis.setex(key, 300, day) if day else self._redis.delete(key)
+            await asyncio.wait_for(operation, timeout=0.2)
+        except Exception:
+            return
+
+    async def search_history(
+        self,
+        *,
+        user_id: str,
+        query: str = "",
+        session_id: str = "",
+        limit: int = 8,
+    ) -> list[dict[str, str]]:
+        """Search persisted conversation history across sessions when available."""
+
+        await self.initialize()
+        query = _clean_space(query)
+        limit = max(1, min(int(limit), 30))
+        if self._pool is None:
+            rows: list[dict[str, str]] = []
+            for key, items in self._memory_messages.items():
+                if not key.startswith(self._history_key(user_id, "").rsplit(":", 1)[0] + ":"):
+                    continue
+                if session_id and key == self._history_key(user_id, session_id):
+                    continue
+                for item in items:
+                    item_session_id = str(item.get("session_id") or "")
+                    content = str(item.get("content") or "")
+                    if query and not _history_query_relevant(content, query):
+                        continue
+                    rows.append(
+                        {
+                            "session_id": item_session_id,
+                            "role": str(item.get("role") or "user"),
+                            "content": content,
+                            "created_at": str(item.get("ts") or ""),
+                        }
+                    )
+            rows.sort(key=lambda item: float(item.get("created_at") or 0), reverse=True)
+            return rows[:limit]
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT session_id, role, content, created_at
+                FROM navi_messages
+                WHERE user_id = $1
+                  AND ($2 = '' OR strpos(content, $2) > 0)
+                  AND ($3 = '' OR session_id <> $3)
+                ORDER BY created_at DESC
+                LIMIT $4
+                """,
+                user_id,
+                query[:80],
+                session_id,
+                limit,
+            )
+        return [
+            {
+                "session_id": str(row["session_id"]),
+                "role": str(row["role"]),
+                "content": str(row["content"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
     async def get_profile(self, user_id: str) -> dict[str, Any]:
         """Read a user profile from Redis cache or PostgreSQL."""
 
+        self._touch_fallback_user(user_id)
         cached_profile = self._profile_process_cache.get(user_id)
         if cached_profile and time.time() - cached_profile[0] <= PROFILE_CACHE_TTL_SECONDS:
             return dict(cached_profile[1])
+        if cached_profile:
+            self._profile_process_cache.pop(user_id, None)
 
-        if self.profile_redis_cache_enabled and self._redis is not None:
+        redis_client = self._redis
+        if self.profile_redis_cache_enabled and redis_client is not None:
             try:
-                raw = await self._redis.get(self._profile_key(user_id))
+                raw = await redis_client.get(self._profile_key(user_id))
                 if raw:
                     profile = dict(json.loads(raw))
                     self._profile_process_cache[user_id] = (time.time(), profile)
                     return dict(profile)
-            except Exception:
-                self._redis = None
+            except Exception as exc:
+                await self._discard_redis(redis_client, exc)
 
         if self._pool is not None:
             async with self._pool.acquire() as conn:
@@ -768,11 +985,12 @@ class MemoryStore:
             profile = dict(self._memory_profiles.get(user_id, {}))
         profile = _normalize_education_profile(profile)
 
-        if self.profile_redis_cache_enabled and self._redis is not None:
+        redis_client = self._redis
+        if self.profile_redis_cache_enabled and redis_client is not None:
             try:
-                await self._redis.setex(self._profile_key(user_id), PROFILE_CACHE_TTL_SECONDS, json.dumps(profile))
-            except Exception:
-                self._redis = None
+                await redis_client.setex(self._profile_key(user_id), PROFILE_CACHE_TTL_SECONDS, json.dumps(profile))
+            except Exception as exc:
+                await self._discard_redis(redis_client, exc)
         self._profile_process_cache[user_id] = (time.time(), profile)
         return profile
 
@@ -796,7 +1014,8 @@ class MemoryStore:
                         _jsonb_to_dict(row["profile_data"]) if row and row["profile_data"] else {}
                     )
                     merged = _normalize_education_profile(_merge_profile(current, normalized_changes))
-                    if merged == current:
+                    stored_profile = _profile_for_storage(merged)
+                    if stored_profile == _profile_for_storage(current):
                         return
                     await conn.execute(
                         """
@@ -810,9 +1029,9 @@ class MemoryStore:
                             updated_at = now()
                         """,
                         user_id,
-                        json.dumps(merged, ensure_ascii=False),
-                        len(merged),
-                        min(len(merged) / 20.0, 1.0),
+                        json.dumps(stored_profile, ensure_ascii=False),
+                        len(stored_profile),
+                        min(len(stored_profile) / 20.0, 1.0),
                     )
                     await self._obsolete_profile_conflicts(
                         conn=conn,
@@ -823,16 +1042,22 @@ class MemoryStore:
         else:
             current = await self.get_profile(user_id)
             merged = _normalize_education_profile(_merge_profile(current, normalized_changes))
-            if merged == current:
+            stored_profile = _profile_for_storage(merged)
+            if stored_profile == _profile_for_storage(current):
                 return
-            self._memory_profiles[user_id] = merged
+            self._touch_fallback_user(user_id)
+            self._memory_profiles[user_id] = stored_profile
             self._obsolete_profile_conflicts_in_memory(user_id=user_id, changes=normalized_changes)
 
-        if self._redis is not None:
+        # The in-memory fallback reads the old profile while merging and caches it.
+        # Invalidate again after the write so the next turn observes the update.
+        self._profile_process_cache.pop(user_id, None)
+        redis_client = self._redis
+        if redis_client is not None:
             try:
-                await self._redis.delete(self._profile_key(user_id))
-            except Exception:
-                self._redis = None
+                await redis_client.delete(self._profile_key(user_id))
+            except Exception as exc:
+                await self._discard_redis(redis_client, exc)
 
     async def _obsolete_profile_conflicts(self, *, conn: Any, user_id: str, changes: dict[str, Any], session_id: str) -> None:
         signatures = _profile_signatures_from_changes(changes)
@@ -1017,6 +1242,9 @@ class MemoryStore:
     ) -> str | None:
         """Write or merge one governed long-term memory."""
 
+        # 长期记忆不是原始聊天记录：先筛选值得保存的事实，再规范重要度、置信度与敏感度。
+        # 相同/相似事实尽量合并，画像字段冲突要淘汰旧值，避免同时召回相互矛盾的事实。
+        # 返回记忆 ID；None 表示内容未通过记忆筛选，而非一定发生数据库异常。
         content = _clean_space(content)
         if not _should_remember(content, importance):
             return None
@@ -1034,6 +1262,7 @@ class MemoryStore:
         decay_category = "high" if importance >= 8 else "low" if importance <= 5 else "medium"
 
         if self._pool is None:
+            self._touch_fallback_user(user_id)
             incoming_record = {
                 "content": content,
                 "memory_type": memory_type,
@@ -1063,7 +1292,8 @@ class MemoryStore:
                     changes={profile_signature[0]: profile_signature[1]},
                 )
             memory_id = hashlib.sha1(f"{user_id}:{content}".encode("utf-8")).hexdigest()[:16]
-            self._memory_items.setdefault(user_id, []).append(
+            bucket = self._memory_items.setdefault(user_id, [])
+            bucket.append(
                 {
                     "id": memory_id,
                     "memory_type": memory_type,
@@ -1079,6 +1309,7 @@ class MemoryStore:
                     "is_deleted": False,
                 }
             )
+            del bucket[:-self.fallback_max_items_per_user]
             return memory_id
 
         async with self._pool.acquire() as conn:
@@ -1244,6 +1475,16 @@ class MemoryStore:
             and not _looks_like_memory_question(user_text)
         )
 
+    def _extractor_http_client(self) -> Any:
+        if httpx is None:
+            return None
+        if self._extractor_client is None:
+            self._extractor_client = httpx.AsyncClient(
+                timeout=self.extractor_timeout_seconds,
+                trust_env=False,
+            )
+        return self._extractor_client
+
     async def extract_with_llm(self, *, user_id: str, session_id: str, user_text: str) -> dict[str, Any] | None:
         """Use the configured LLM service to produce structured memory JSON."""
 
@@ -1271,10 +1512,15 @@ class MemoryStore:
             internal_api_key = os.getenv("LLM_INTERNAL_API_KEY", "").strip()
             if internal_api_key:
                 headers["X-Internal-API-Key"] = internal_api_key
-            async with httpx.AsyncClient(timeout=self.extractor_timeout_seconds) as client:
-                response = await client.post(self.extractor_url, json=payload, headers=headers)
-                response.raise_for_status()
-                raw_text = str((response.json() or {}).get("text") or "")
+            drain_token = os.getenv("LLM_DRAIN_TOKEN", "")
+            if drain_token:
+                headers["X-Nawei-Drain-Token"] = drain_token
+            client = self._extractor_http_client()
+            if client is None:
+                return None
+            response = await client.post(self.extractor_url, json=payload, headers=headers)
+            response.raise_for_status()
+            raw_text = str((response.json() or {}).get("text") or "")
             extraction = _parse_llm_memory_extraction(raw_text)
             return extraction
         except Exception:  # pragma: no cover - depends on live LLM service
@@ -1392,24 +1638,26 @@ class MemoryStore:
         self._profile_process_cache.pop(user_id, None)
         self._memory_items.pop(user_id, None)
         self._memory_concepts.pop(user_id, None)
+        self._fallback_user_order.pop(user_id, None)
         if session_id:
             self._memory_messages.pop(self._history_key(user_id, session_id), None)
         else:
-            history_prefix = self._history_key(user_id, "")
+            history_prefix = self._history_key(user_id, "").rsplit(":", 1)[0] + ":"
             for key in [key for key in self._memory_messages if key.startswith(history_prefix)]:
                 self._memory_messages.pop(key, None)
 
-        if self._redis is not None:
+        redis_client = self._redis
+        if redis_client is not None:
             try:
-                await self._redis.delete(self._profile_key(user_id))
+                await redis_client.delete(self._profile_key(user_id))
                 if session_id:
-                    await self._redis.delete(self._history_key(user_id, session_id))
+                    await redis_client.delete(self._history_key(user_id, session_id))
                 else:
-                    history_keys = [key async for key in self._redis.scan_iter(match=self._history_key(user_id, "*"))]
+                    history_keys = [key async for key in redis_client.scan_iter(match=self._history_key(user_id, "*"))]
                     if history_keys:
-                        await self._redis.delete(*history_keys)
-            except Exception:
-                self._redis = None
+                        await redis_client.delete(*history_keys)
+            except Exception as exc:
+                await self._discard_redis(redis_client, exc)
 
         if self._pool is None:
             return
@@ -1583,11 +1831,11 @@ def _compact_message(item: dict[str, Any]) -> dict[str, str]:
     return {"role": str(item.get("role") or "user"), "content": str(item.get("content") or "")}
 
 
-def _safe_zoneinfo(name: str) -> ZoneInfo:
+def _safe_zoneinfo(name: str) -> ZoneInfo | timezone:
     try:
         return ZoneInfo(name)
     except Exception:
-        return ZoneInfo("Asia/Shanghai")
+        return timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 def _jsonb_to_dict(value: Any) -> dict[str, Any]:
@@ -1611,6 +1859,7 @@ def _normalize_education_profile(profile: dict[str, Any]) -> dict[str, Any]:
     subject_states = dict(normalized.get("subject_states") or {})
     interaction_style = dict(normalized.get("interaction_style") or {})
     risk_flags = dict(normalized.get("risk_flags") or {})
+    audience_profile = audience_profile_from_profile(normalized)
 
     if normalized.get("nickname"):
         identity["nickname"] = normalized["nickname"]
@@ -1655,7 +1904,17 @@ def _normalize_education_profile(profile: dict[str, Any]) -> dict[str, Any]:
     normalized["subject_states"] = subject_states
     normalized["interaction_style"] = interaction_style
     normalized["risk_flags"] = risk_flags
+    if audience_profile:
+        normalized["audience_profile"] = audience_profile
+    else:
+        normalized.pop("audience_profile", None)
     return {key: value for key, value in normalized.items() if value not in (None, "", [], {})}
+
+
+def _profile_for_storage(profile: dict[str, Any]) -> dict[str, Any]:
+    """Remove request-time derived fields before persisting the source profile."""
+
+    return {key: value for key, value in dict(profile).items() if key != "audience_profile"}
 
 
 def _profile_for_query(profile: dict[str, Any], query: str) -> dict[str, Any]:
@@ -1664,7 +1923,10 @@ def _profile_for_query(profile: dict[str, Any], query: str) -> dict[str, Any]:
     if not profile or not query.strip():
         return profile
     filtered: dict[str, Any] = {}
-    for key in ("nickname", "grade", "identity", "interaction_style", "risk_flags"):
+    for key in (
+        "nickname", "grade", "grade_code", "identity", "interaction_style", "risk_flags",
+        "assistant_persona", "assistant_dialect", "audience_profile",
+    ):
         if key in profile:
             filtered[key] = profile[key]
     preferences = _preferences_for_query(profile.get("preferences"), query)
@@ -2036,7 +2298,18 @@ def _clamp_float(value: Any, minimum: float, maximum: float) -> float:
     return max(minimum, min(parsed, maximum))
 
 
+def _memory_rule_text(text: str) -> str:
+    # Online ASR omits punctuation; separate explicit self-description clauses
+    # only for rule extraction, preserving the original transcript and history.
+    return re.sub(
+        r"(?<=[\u4e00-\u9fffA-Za-z0-9_])(?=我(?:最喜欢|最不喜欢|喜欢|不喜欢|讨厌|害怕|想学|正在|最近|现在|今年|叫|的名字是)|请(?:你)?(?:记住|记得)|帮我记住)",
+        "，",
+        text,
+    )
+
+
 def _extract_profile_changes(text: str) -> dict[str, Any]:
+    text = _memory_rule_text(text)
     changes: dict[str, Any] = {}
     nickname = _first_match(text, [r"(?:我叫|叫我|我的名字是)([\u4e00-\u9fffA-Za-z0-9_]{1,12})"])
     if nickname and not _looks_like_unknown_answer(nickname):
@@ -2049,16 +2322,45 @@ def _extract_profile_changes(text: str) -> dict[str, Any]:
         changes["subjects"] = subjects
     likes = _first_match(
         text,
-        [r"(?:我喜欢(?!的|什么|啥|哪种|哪个|哪些)|我爱(?!的)|我想学|我对)([^，。！？；;,.!?\n]{1,30})(?:感兴趣)?"],
+        [r"(?:我(?:最)?喜欢(?!的|什么|啥|哪种|哪个|哪些)|我爱(?!的)|我想学|我对)([^，。！？；;,.!?\n]{1,30})(?:感兴趣)?"],
     )
     if likes:
         changes["preferences"] = {"topics_enjoy": [_strip_interest_suffix(likes)]}
     avoids = _first_match(
         text,
-        [r"(?:我不喜欢(?!的|什么|啥|哪种|哪个|哪些)|我讨厌|我害怕)([^，。！？；;,.!?\n]{1,30})"],
+        [r"(?:我(?:最)?不喜欢(?!的|什么|啥|哪种|哪个|哪些)|我讨厌|我害怕)([^，。！？；;,.!?\n]{1,30})"],
     )
     if avoids:
-        changes["preferences"] = {"topics_avoid": [avoids.strip()]}
+        changes.setdefault("preferences", {})["topics_avoid"] = [avoids.strip()]
+    interaction_style: dict[str, str] = {}
+    if any(marker in text for marker in ("回答短一点", "回答简短", "说短一点", "简洁一点", "以后简短")):
+        interaction_style["response_length"] = "brief"
+    elif any(marker in text for marker in ("回答详细", "讲详细点", "详细一点", "展开讲", "讲透一点")):
+        interaction_style["response_length"] = "detailed"
+    if any(marker in text for marker in ("多用生活例子", "用生活例子", "多举例", "结合例子")):
+        interaction_style["preferred_explanation"] = "life_examples"
+    elif any(marker in text for marker in ("一步一步讲", "分步骤讲", "按步骤讲")):
+        interaction_style["preferred_explanation"] = "step_by_step"
+    if any(marker in text for marker in ("语气轻松", "说话轻松", "活泼一点", "幽默一点", "生动有趣", "有趣一点")):
+        interaction_style["tone"] = "light"
+    elif any(marker in text for marker in ("直接一点", "说话直接", "别绕弯子")):
+        interaction_style["tone"] = "direct"
+    if interaction_style:
+        changes["interaction_style"] = interaction_style
+    persistent_persona = re.search(
+        r"(?:以后|今后|从现在开始|一直|默认|切换(?:到|成)?|改成|设为).{0,10}(温柔|柔和|幽默|有趣)",
+        text,
+    )
+    if persistent_persona:
+        mode = "gentle" if persistent_persona.group(1) in {"温柔", "柔和"} else "humorous"
+        changes["assistant_persona"] = {"mode": mode}
+    persistent_dialect = re.search(
+        r"(?:以后|今后|从现在开始|一直|默认|切换(?:到|成)?|改成|设为).{0,10}(普通话|北京话|北京方言)",
+        text,
+    )
+    if persistent_dialect:
+        mode = "beijing" if persistent_dialect.group(1) in {"北京话", "北京方言"} else "mandarin"
+        changes["assistant_dialect"] = {"mode": mode}
     focus = _first_match(
         text,
         [
@@ -2071,14 +2373,14 @@ def _extract_profile_changes(text: str) -> dict[str, Any]:
 
 
 def _extract_memory_records(text: str) -> list[dict[str, Any]]:
-    text = _clean_space(text)
-    if not text or len(text) < 6:
+    text = _memory_rule_text(_clean_space(text))
+    if not text or len(text) < 3:
         return []
     boundary = "[^\uff0c\u3002\uff01\uff1f\uff1b;,.!?\\n]"
     patterns = [
         ("(?:\u6211(?:\u6700\u8fd1|\u73b0\u5728)?(?:\u6b63\u5728)?(?:\u5728)?(?:\u5b66|\u5b66\u4e60)|\u6700\u8fd1(?:\u5728)?(?:\u5b66|\u5b66\u4e60)|\u6b63\u5728(?:\u5b66|\u5b66\u4e60))" + boundary + "{1,40}", 6, "learning_state"),
         ("(?:\u6211)?(?:\u603b\u662f|\u4e00\u76f4|\u7ecf\u5e38|\u8001\u662f|\u6709\u70b9|\u6bd4\u8f83)?(?:\u4e0d\u592a\u4f1a|\u4e0d\u4f1a|\u4e0d\u61c2|\u6ca1\u5f04\u61c2|\u641e\u4e0d\u61c2|\u770b\u4e0d\u61c2|\u5361\u5728|\u5361\u4f4f|\u8584\u5f31|\u5f31\u5728)" + boundary + "{1,40}", 8, "weakness"),
-        ("(?:\u6211\u559c\u6b22(?!\u7684|\u4ec0\u4e48|\u5565|\u54ea\u79cd|\u54ea\u4e2a|\u54ea\u4e9b)|\u6211\u7231(?!\u7684)|\u6211\u60f3\u5b66|\u6211\u4e0d\u559c\u6b22(?!\u7684|\u4ec0\u4e48|\u5565|\u54ea\u79cd|\u54ea\u4e2a|\u54ea\u4e9b)|\u6211\u8ba8\u538c|\u6211\u5bb3\u6015)" + boundary + "{1,40}", 6, "preference"),
+        ("(?:\u6211(?:\u6700)?\u559c\u6b22(?!\u7684|\u4ec0\u4e48|\u5565|\u54ea\u79cd|\u54ea\u4e2a|\u54ea\u4e9b)|\u6211\u7231(?!\u7684)|\u6211\u60f3\u5b66|\u6211(?:\u6700)?\u4e0d\u559c\u6b22(?!\u7684|\u4ec0\u4e48|\u5565|\u54ea\u79cd|\u54ea\u4e2a|\u54ea\u4e9b)|\u6211\u8ba8\u538c|\u6211\u5bb3\u6015)" + boundary + "{1,40}", 6, "preference"),
         ("(?:\u6211\u8981|\u6211\u51c6\u5907|\u4e0b\u5468|\u660e\u5929|\u4eca\u5929)" + boundary + "{2,50}", 5, "plan"),
         ("(?:\u8003\u8bd5|\u4f5c\u4e1a|\u8bfe\u7a0b|\u8001\u5e08|\u5b66\u6821|\u9898\u76ee|\u77e5\u8bc6\u70b9)" + boundary + "{0,50}", 5, "learning_event"),
         ("(?:\u6211\u53eb|\u53eb\u6211|\u6211\u7684\u540d\u5b57\u662f)" + boundary + "{1,20}", 8, "profile_fact"),
@@ -2088,7 +2390,8 @@ def _extract_memory_records(text: str) -> list[dict[str, Any]]:
     for pattern, importance, memory_type in patterns:
         for match in re.findall(pattern, text):
             content = _clean_space(match)
-            if content and not _looks_like_memory_question(content):
+            explicit_name = memory_type == "profile_fact" and bool(_extract_profile_changes(content).get("nickname"))
+            if content and (explicit_name or not _looks_like_memory_question(content)):
                 records.append(
                     {
                         "content": content,
@@ -2355,6 +2658,15 @@ def _looks_like_memory_question(text: str) -> bool:
     )
 
 
+
+
+def _history_query_relevant(content: str, query: str) -> bool:
+    """Use simple token overlap for the in-memory fallback history search."""
+
+    if query in content:
+        return True
+    terms = [term for term in _tokenize(query) if len(term) >= 2]
+    return bool(terms) and any(term in content for term in terms)
 
 
 def _tokenize(text: str) -> list[str]:

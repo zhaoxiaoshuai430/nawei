@@ -213,6 +213,7 @@ def format_active_skill_prompt(
     methods: list[str] | None = None,
     *,
     subject: str = "unknown",
+    response_policy: dict[str, Any] | None = None,
 ) -> str:
     """Render a compact, actionable Skill block for the final LLM."""
 

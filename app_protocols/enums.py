@@ -54,6 +54,7 @@ class EventType(str, Enum):
     AUDIO_STARTED = "audio.started"
     AUDIO_DELTA = "audio.delta"
     AUDIO_DONE = "audio.done"
+    RESPONSE_INTERRUPTED = "response.interrupted"
     ERROR = "error"
 
 

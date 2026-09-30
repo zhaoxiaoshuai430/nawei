@@ -33,6 +33,7 @@ RUN python -m pip install --upgrade pip \
 
 WORKDIR /app/services/tts
 COPY --chown=nawei:nawei services/tts /app/services/tts
+COPY --chown=nawei:nawei deploy/scripts/healthcheck.py /app/deploy/scripts/healthcheck.py
 COPY --from=tts-models --chown=nawei:nawei /app/models/tts /app/models/tts
 COPY --from=tts-models --chown=nawei:nawei /app/models/manifest.json /app/models/manifest.json
 RUN mkdir -p /app/services/tts/data/cache /app/services/tts/data/logs /app/services/tts/data/sessions \

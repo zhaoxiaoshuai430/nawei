@@ -885,7 +885,7 @@ class SenseVoiceSmall(nn.Module):
             if kwargs.get("output_dir") is not None:
                 if not hasattr(self, "writer"):
                     self.writer = DatadirWriter(kwargs.get("output_dir"))
-                ibest_writer = self.writer[f"1best_recog"]
+                ibest_writer = self.writer["1best_recog"]
 
             mask = yseq != self.blank_id
             token_int = yseq[mask].tolist()

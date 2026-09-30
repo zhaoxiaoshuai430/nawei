@@ -15,6 +15,7 @@ import httpx
 BOCHA_WEB_SEARCH_URL = "https://api.bochaai.com/v1/web-search"
 DEFAULT_TIMEOUT_SECONDS = 8.0
 DEFAULT_COUNT = 5
+DEFAULT_CACHE_MAX_ENTRIES = 256
 SEARCH_MARKERS = (
     "联网搜索",
     "全网搜索",
@@ -109,15 +110,33 @@ class WebSearchResult:
 
 
 class BochaWebSearchTool:
-    def __init__(self, *, timeout_seconds: float | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
         self.timeout_seconds = timeout_seconds or _read_float_env("BOCHA_SEARCH_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
         self.api_key = os.getenv("BOCHA_API_KEY", os.getenv("BOCHA_SEARCH_API_KEY", "")).strip()
         self.resource_package_id = os.getenv("BOCHA_RESOURCE_PACKAGE_ID", "").strip()
         self.endpoint = os.getenv("BOCHA_WEB_SEARCH_URL", BOCHA_WEB_SEARCH_URL).strip() or BOCHA_WEB_SEARCH_URL
         self.default_count = _read_int_env("BOCHA_SEARCH_COUNT", DEFAULT_COUNT)
         self.summary_enabled = _read_bool_env("BOCHA_SEARCH_SUMMARY_ENABLED", True)
-        self._cache: dict[tuple[str, int], tuple[float, WebSearchResult]] = {}
+        self._cache: dict[tuple[str, int, str], tuple[float, WebSearchResult]] = {}
         self.cache_ttl_seconds = _read_float_env("BOCHA_SEARCH_CACHE_TTL_SECONDS", 300.0)
+        self.cache_max_entries = max(1, _read_int_env("BOCHA_SEARCH_CACHE_MAX_ENTRIES", DEFAULT_CACHE_MAX_ENTRIES))
+        self._client = client
+        self._owns_client = client is None
+
+    async def aclose(self) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    def _http_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.timeout_seconds, trust_env=False)
+        return self._client
 
     def extract_query(self, text: str) -> str | None:
         normalized = _normalize_text(text)
@@ -143,8 +162,9 @@ class BochaWebSearchTool:
         if not query:
             raise ValueError("Search query is required")
         count = max(1, min(int(count or self.default_count), 10))
-        cache_key = (query.lower(), count)
+        cache_key = (query.lower(), count, (freshness or "").strip().lower())
         now = time.monotonic()
+        self._prune_cache(now)
         cached = self._cache.get(cache_key)
         if cached and self.cache_ttl_seconds > 0 and now - cached[0] <= self.cache_ttl_seconds:
             return cached[1]
@@ -152,14 +172,18 @@ class BochaWebSearchTool:
         queries = _expanded_world_cup_result_queries(query) + [query]
         results: list[WebSearchItem] = []
         last_error: Exception | None = None
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            for current_query in _unique_queries(queries):
-                try:
-                    partial = await self._lookup_once(client=client, query=current_query, count=count, freshness=freshness)
-                    results.extend(partial.results)
-                except Exception as exc:
-                    last_error = exc
-                    continue
+        for current_query in _unique_queries(queries):
+            try:
+                partial = await self._lookup_once(
+                    client=self._http_client(),
+                    query=current_query,
+                    count=count,
+                    freshness=freshness,
+                )
+                results.extend(partial.results)
+            except Exception as exc:
+                last_error = exc
+                continue
         merged = _dedupe_search_items(results)
         if not merged:
             if last_error is not None:
@@ -168,7 +192,24 @@ class BochaWebSearchTool:
         result = WebSearchResult(query=query, results=merged[:count], resource_package_id=self.resource_package_id)
         if self.cache_ttl_seconds > 0:
             self._cache[cache_key] = (now, result)
+            self._prune_cache(now)
         return result
+
+    def _prune_cache(self, now: float) -> None:
+        if self.cache_ttl_seconds > 0:
+            expired = [
+                key
+                for key, (saved_at, _result) in self._cache.items()
+                if now - saved_at > self.cache_ttl_seconds
+            ]
+            for key in expired:
+                self._cache.pop(key, None)
+        overflow = len(self._cache) - self.cache_max_entries
+        if overflow <= 0:
+            return
+        oldest = sorted(self._cache.items(), key=lambda item: item[1][0])[:overflow]
+        for key, _entry in oldest:
+            self._cache.pop(key, None)
 
     async def _lookup_once(self, *, client: httpx.AsyncClient, query: str, count: int, freshness: str | None = None) -> WebSearchResult:
         payload: dict[str, Any] = {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 
 import uvicorn
 
@@ -23,7 +24,9 @@ def main() -> None:
         port=PORT,
         reload=False,
         workers=WORKERS,
+        loop="services.llm.event_loop:SharedSocketSelectorEventLoop" if sys.platform == "win32" and WORKERS > 1 else "auto",
         app_dir=str(PROJECT_ROOT),
+        timeout_graceful_shutdown=45,
     )
 
 

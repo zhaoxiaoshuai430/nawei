@@ -138,7 +138,7 @@ class Agent02LLMAdaptationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("- 资料N：机构或网站《资料标题》", prompt)
         self.assertIn("禁止向用户展示.json", prompt)
         self.assertIn("知识图谱关系", prompt)
-        self.assertIn("xiaowei-persona-v6", prompt)
+        self.assertIn("xiaowei-persona-v8", prompt)
 
     async def test_daily_life_uses_guardian_policy_without_replacing_knowledge(self) -> None:
         store = MemoryStore(enabled=False)
@@ -155,11 +155,53 @@ class Agent02LLMAdaptationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.tutor_strategy["intent"]["category"], "daily_life")
         self.assertEqual(context.tutor_strategy["route"], "daily_companion")
         self.assertEqual(policy["companion_style"], "reliable_guardian")
-        self.assertEqual(policy["humor_level"], "lively")
+        self.assertEqual(policy["humor_level"], "playful")
         self.assertEqual(policy["care_focus"], "practical_solution_and_risk")
         self.assertEqual(policy["response_depth"], "conversational")
         self.assertIn("不得建议把备用钥匙藏在鞋柜", policy["safety_note"])
         self.assertEqual(context.knowledge.knowledge_base_id, "education")
+
+    async def test_persistent_profile_reaches_tutor_graph_and_turn_override_wins(self) -> None:
+        store = MemoryStore(enabled=False)
+        await store.update_profile(
+            user_id="student-profile",
+            session_id="session-profile",
+            reason="test",
+            changes={"birth_date": "2016-05-20"},
+        )
+        manager = self.manager(store)
+        preference_context = await manager.prepare_context(
+            user_id="student-profile",
+            session_id="session-profile",
+            query="以后温柔一点，默认使用普通话",
+        )
+        await manager.memory_skill.after_turn(
+            user_id="student-profile",
+            session_id="session-profile",
+            user_text="以后温柔一点，默认使用普通话",
+            assistant_text="好，我记住了。",
+            context=preference_context,
+        )
+
+        stored = await manager.prepare_context(
+            user_id="student-profile",
+            session_id="session-profile",
+            query="解释光合作用",
+        )
+        stored_policy = stored.tutor_strategy["response_policy"]
+        self.assertEqual(stored_policy["persona_mode"], "gentle")
+        self.assertEqual(stored_policy["dialect_mode"], "mandarin")
+        self.assertEqual(stored_policy["audience_profile"]["age_stage"], "S2")
+
+        overridden = await manager.prepare_context(
+            user_id="student-profile",
+            session_id="session-profile",
+            query="这次幽默一点，使用北京话解释光合作用",
+        )
+        override_policy = overridden.tutor_strategy["response_policy"]
+        self.assertEqual(override_policy["persona_mode"], "humorous")
+        self.assertEqual(override_policy["dialect_mode"], "beijing")
+        self.assertEqual(override_policy["audience_profile"]["age_stage"], "S2")
 
 
 if __name__ == "__main__":

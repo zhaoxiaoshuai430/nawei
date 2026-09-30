@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -13,6 +14,9 @@ from services.llm import main as llm_main
 from services.llm.agent_runtime import AgentTurn, LLMAgentRuntime
 from services.llm.agents.runtime_tool_agent import RuntimeToolAgentResult, RuntimeToolOutput
 from services.llm.memory import MemoryStore
+from services.llm.tools.dictionary import DictionaryTool
+from services.llm.tools.weather import OpenMeteoWeatherTool, WeatherToolResult
+from services.llm.tools.web_search import BochaWebSearchTool
 
 
 def _request(text: str = "13乘以27等于多少") -> LLMRequest:
@@ -34,13 +38,147 @@ def test_runtime_exposes_current_project_tools_as_openai_functions() -> None:
         for item in runtime.tool_agent.openai_tool_definitions()
     }
 
-    assert {"time", "calculator", "unit_converter", "dictionary", "encyclopedia", "weather"} <= names
-    assert "memory_search" not in names
-    assert "concept_lookup" not in names
+    assert {"time", "calculator", "unit_converter", "dictionary", "weather"} <= names
+    assert {"memory_search", "history_search", "profile_lookup", "concept_lookup"} <= names
+    assert "encyclopedia" not in names
 
 
 @pytest.mark.asyncio
-async def test_native_tool_schemas_are_skipped_for_plain_casual_turns(
+async def test_dictionary_tool_reuses_injected_http_client_without_owning_it() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "word": "light",
+                    "phonetic": "/laɪt/",
+                    "meanings": [
+                        {
+                            "partOfSpeech": "noun",
+                            "definitions": [{"definition": "Visible electromagnetic radiation."}],
+                        }
+                    ],
+                }
+            ],
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    tool = DictionaryTool(client=client)
+
+    first = await tool.lookup("light")
+    second = await tool.lookup("light")
+    await tool.aclose()
+
+    assert first.word == second.word == "light"
+    assert len(requests) == 2
+    assert not client.is_closed
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_web_search_cache_is_freshness_aware_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOCHA_API_KEY", "test-key")
+    monkeypatch.setenv("BOCHA_SEARCH_CACHE_MAX_ENTRIES", "2")
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        freshness = str(payload.get("freshness") or "all")
+        query = str(payload["query"])
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "webPages": {
+                        "value": [
+                            {
+                                "name": f"{query}:{freshness}",
+                                "url": f"https://example.test/{query}/{freshness}",
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    tool = BochaWebSearchTool(client=client)
+
+    one_day = await tool.lookup(query="example", freshness="oneDay")
+    one_week = await tool.lookup(query="example", freshness="oneWeek")
+    one_day_cached = await tool.lookup(query="example", freshness="oneDay")
+
+    assert one_day.results[0].title == one_day_cached.results[0].title == "example:oneDay"
+    assert one_week.results[0].title == "example:oneWeek"
+    assert len(requests) == 2
+
+    for query in ("alpha", "beta", "gamma"):
+        await tool.lookup(query=query)
+
+    assert len(tool._cache) == 2
+    await tool.aclose()
+    assert not client.is_closed
+    await client.aclose()
+
+
+def test_weather_cache_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WEATHER_CACHE_MAX_ENTRIES", "2")
+    monkeypatch.setenv("WEATHER_PERSISTENT_CACHE_ENABLED", "false")
+    tool = OpenMeteoWeatherTool()
+
+    def result(city: str) -> WeatherToolResult:
+        return WeatherToolResult(
+            city=city,
+            country="CN",
+            latitude=0.0,
+            longitude=0.0,
+            timezone="Asia/Shanghai",
+            day="today",
+            date="2026-09-17",
+            condition="clear",
+            temperature_c=20.0,
+            apparent_temperature_c=20.0,
+            humidity_percent=50,
+            precipitation_mm=0.0,
+            wind_speed_kmh=1.0,
+            wind_direction_degree=0,
+            temp_max_c=22.0,
+            temp_min_c=18.0,
+            precipitation_probability_max_percent=0,
+        )
+
+    tool._cache = {
+        ("amap", "alpha", "today"): (1.0, result("alpha")),
+        ("amap", "beta", "today"): (2.0, result("beta")),
+        ("amap", "gamma", "today"): (3.0, result("gamma")),
+    }
+
+    tool._prune_cache(3.0)
+
+    assert len(tool._cache) == 2
+    assert ("amap", "alpha", "today") not in tool._cache
+
+
+@pytest.mark.asyncio
+async def test_runtime_closes_owned_tool_http_clients() -> None:
+    runtime = LLMAgentRuntime(memory_store=MemoryStore(enabled=False))
+    clients = [
+        runtime.tool_agent.dictionary_tool._http_client(),
+        runtime.tool_agent.weather_tool._http_client(),
+        runtime.tool_agent.web_search_tool._http_client(),
+    ]
+
+    await runtime.close()
+
+    assert all(client.is_closed for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_native_tool_schemas_follow_target_for_plain_casual_turns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LLM_PROVIDER", "deepseek")
@@ -49,9 +187,8 @@ async def test_native_tool_schemas_are_skipped_for_plain_casual_turns(
 
     turn = await runtime.prepare(_request("你好"))
 
-    assert turn.request.tools == []
-    assert turn.metadata["tools"]["registered_tools"] == []
-    assert turn.metadata["tools"]["schema_selection_reason"] == "intent:casual:skipped"
+    assert turn.request.tools == runtime.tool_agent.openai_tool_definitions()
+    assert turn.metadata["tools"]["schema_selection_reason"] == "target_branch:all_enabled"
 
 
 @pytest.mark.asyncio
@@ -65,14 +202,14 @@ async def test_casual_turn_preserves_explicit_time_tool_candidate(
     turn = await runtime.prepare(_request("你好，现在几点了"))
     names = [str(item.get("function", {}).get("name") or "") for item in turn.request.tools]
 
-    assert names == ["time"]
+    assert "time" in names
     assert turn.metadata["tools"]["schema_selection_reason"] == (
-        "intent:casual:deterministic_candidates"
+        "target_branch:all_enabled"
     )
 
 
 @pytest.mark.asyncio
-async def test_realtime_turn_only_exposes_live_search_schema(
+async def test_realtime_turn_exposes_live_search_with_other_target_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LLM_PROVIDER", "deepseek")
@@ -82,9 +219,9 @@ async def test_realtime_turn_only_exposes_live_search_schema(
     turn = await runtime.prepare(_request("2026年世界杯最新赛程"))
     names = [str(item.get("function", {}).get("name") or "") for item in turn.request.tools]
 
-    assert names == ["web_search"]
+    assert "web_search" in names
     assert turn.metadata["tools"]["schema_selection_reason"] == (
-        "intent:realtime:deterministic_candidates"
+        "target_branch:all_enabled"
     )
 
 
@@ -110,6 +247,7 @@ async def test_native_tool_followup_sanitizes_results_before_second_round() -> N
 
     runtime.tool_agent = FakeToolAgent()  # type: ignore[assignment]
     request = _request("查询测试信息")
+    request = request.model_copy(update={"tools": [{"function": {"name": "web_search"}}]})
     followup, metadata = await runtime.execute_native_tool_calls(
         request,
         calls=[{"id": "call_search", "name": "web_search", "args": {"query": "测试"}}],
@@ -133,16 +271,14 @@ async def test_native_tool_followup_preserves_multiple_calls_to_same_tool() -> N
         registered_tools = ["weather"]
 
         async def collect(self, **kwargs: Any) -> RuntimeToolAgentResult:
-            assert kwargs["planned_calls"] == [
-                {"name": "weather", "args": {"city": "北京", "day": "today"}},
-                {"name": "weather", "args": {"city": "上海", "day": "today"}},
-            ]
+            assert len(kwargs["planned_calls"]) == 1
+            city = kwargs["planned_calls"][0]["args"]["city"]
             return RuntimeToolAgentResult(
                 outputs=[
                     RuntimeToolOutput(
                         name="weather",
-                        prompt="北京天气",
-                        result={"city": "北京", "temperature": 30},
+                        prompt=f"{city}天气",
+                        result={"city": city, "temperature": 30},
                         error=None,
                         elapsed_ms=1,
                     ),
@@ -159,7 +295,7 @@ async def test_native_tool_followup_preserves_multiple_calls_to_same_tool() -> N
 
     runtime.tool_agent = FakeToolAgent()  # type: ignore[assignment]
     followup, metadata = await runtime.execute_native_tool_calls(
-        _request("北京和上海今天天气如何"),
+        _request("北京和上海今天天气如何").model_copy(update={"tools": [{"function": {"name": "weather"}}]}),
         calls=[
             {"id": "call_beijing", "name": "weather", "args": {"city": "北京", "day": "today"}},
             {"id": "call_shanghai", "name": "weather", "args": {"city": "上海", "day": "today"}},
@@ -348,3 +484,69 @@ async def test_stream_timeout_does_not_retry(monkeypatch: pytest.MonkeyPatch) ->
         _ = [body async for body in llm_main._iter_deepseek_stream_bodies({}, settings)]
 
     assert client.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role_only", [False, True])
+async def test_stream_first_output_deadline_closes_heartbeat_stream(
+    monkeypatch: pytest.MonkeyPatch, role_only: bool,
+) -> None:
+    class HeartbeatResponse(_StreamResponse):
+        closed = False
+
+        async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+            self.closed = True
+
+        async def aiter_lines(self):
+            while True:
+                await asyncio.sleep(0.005)
+                yield 'data: {"choices": [{"delta": {"role": "assistant"}}]}' if role_only else ": keepalive"
+
+    response = HeartbeatResponse()
+
+    class Client:
+        calls = 0
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> HeartbeatResponse:
+            self.calls += 1
+            return response
+
+    client = Client()
+    monkeypatch.setattr(llm_main, "_deepseek_client", lambda _timeout: client)
+    settings = llm_main.LLMSettings(timeout_seconds=0.05)
+
+    async with asyncio.timeout(2):
+        with pytest.raises(httpx.ReadTimeout, match="first model output"):
+            _ = [body async for body in llm_main._iter_deepseek_stream_bodies({}, settings)]
+
+    assert response.closed
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", [
+    {"delta": {"content": "answer"}},
+    {"delta": {"tool_calls": [{"index": 0, "function": {"name": "calculator"}}]}},
+    {"text": "answer"},
+    {"finish_reason": "stop"},
+])
+async def test_stream_first_output_deadline_allows_later_output(
+    monkeypatch: pytest.MonkeyPatch, choice: dict[str, Any],
+) -> None:
+    class SlowResponse(_StreamResponse):
+        async def aiter_lines(self):
+            yield f'data: {json.dumps({"choices": [choice]})}'
+            await asyncio.sleep(0.1)
+            yield 'data: {"choices": [{"delta": {"content": "later"}}]}'
+            yield "data: [DONE]"
+
+    class Client:
+        def stream(self, *_args: Any, **_kwargs: Any) -> SlowResponse:
+            return SlowResponse()
+
+    monkeypatch.setattr(llm_main, "_deepseek_client", lambda _timeout: Client())
+    settings = llm_main.LLMSettings(timeout_seconds=0.05)
+    bodies = [body async for body in llm_main._iter_deepseek_stream_bodies({}, settings)]
+
+    assert len(bodies) == 2
+    assert bodies[-1]["choices"][0]["delta"]["content"] == "later"

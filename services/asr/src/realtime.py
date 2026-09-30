@@ -68,12 +68,13 @@ class RealtimeVadEvent:
 class PCM16VadSegmenter:
     """Split little-endian mono PCM16 into utterances using RMS energy."""
 
-    def __init__(self, config: RealtimeVadConfig) -> None:
+    def __init__(self, config: RealtimeVadConfig, *, emit_chunks: bool = False) -> None:
         if config.sample_rate <= 0 or config.frame_ms <= 0:
             raise ValueError("sample_rate and frame_ms must be positive.")
         if config.rms_threshold < 0:
             raise ValueError("rms_threshold cannot be negative.")
         self.config = config
+        self.emit_chunks = emit_chunks
         self._pending = bytearray()
         self._pre_roll: deque[bytes] = deque(maxlen=max(config.pre_roll_frames, config.start_frames))
         self._segment = bytearray()
@@ -98,14 +99,17 @@ class PCM16VadSegmenter:
         return events
 
     def flush(self) -> list[RealtimeVadEvent]:
+        events: list[RealtimeVadEvent] = []
         if self._pending and self._in_speech:
             usable = len(self._pending) - (len(self._pending) % 2)
             self._segment.extend(self._pending[:usable])
+            if self.emit_chunks and usable:
+                events.append(RealtimeVadEvent("audio", bytes(self._pending[:usable])))
         self._pending.clear()
         if not self._in_speech:
             self._reset_idle()
             return []
-        return self._finish_segment()
+        return events + self._finish_segment()
 
     def _process_frame(self, frame: bytes) -> list[RealtimeVadEvent]:
         voiced = _pcm16_rms(frame) >= self.config.rms_threshold
@@ -118,16 +122,20 @@ class PCM16VadSegmenter:
             self._segment = bytearray().join(self._pre_roll)
             self._pre_roll.clear()
             self._silence_run = 0
-            return [RealtimeVadEvent("speech_started")]
+            events = [RealtimeVadEvent("speech_started")]
+            if self.emit_chunks:
+                events.append(RealtimeVadEvent("audio", bytes(self._segment)))
+            return events
 
         self._segment.extend(frame)
+        events = [RealtimeVadEvent("audio", frame)] if self.emit_chunks else []
         self._silence_run = 0 if voiced else self._silence_run + 1
         if (
             self._silence_run >= self.config.end_silence_frames
             or len(self._segment) >= self.config.max_segment_bytes
         ):
-            return self._finish_segment()
-        return []
+            return events + self._finish_segment()
+        return events
 
     def _finish_segment(self) -> list[RealtimeVadEvent]:
         segment = bytes(self._segment)
@@ -137,8 +145,8 @@ class PCM16VadSegmenter:
         self._silence_run = 0
         self._pre_roll.clear()
         if len(segment) < self.config.min_segment_bytes:
-            return []
-        return [RealtimeVadEvent("segment", segment)]
+            return [RealtimeVadEvent("discard")] if self.emit_chunks else []
+        return [RealtimeVadEvent("segment", b"" if self.emit_chunks else segment)]
 
     def _reset_idle(self) -> None:
         self._pre_roll.clear()

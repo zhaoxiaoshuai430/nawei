@@ -4,13 +4,19 @@ The graph prepares the context that will be injected into the LLM prompt. It
 does not own ASR, TTS, WebSocket streaming, or the final model call.
 """
 
+# TutorGraph 是“回答前的上下文规划图”，不是另一个对外服务，也不是最终模型调用器。
+# 五个节点依次加载资料、判断意图、选择回答风格、规划教学策略并汇总 AgentSkillContext。
+# 这里决定如何使用 Skills；具体提示词渲染在 skills/manager.py，推理在 llm/main.py。
+
 from __future__ import annotations
 
 import asyncio
 import re
 from typing import Any, NotRequired, TypedDict
 
+from app_protocols.persona import normalize_assistant_dialect_mode, normalize_assistant_persona_mode
 from services.knowledge.schemas import GraphCandidate, KnowledgeContext, KnowledgeExpansionOptions
+from services.llm.age_policy import audience_profile_from_profile
 from services.llm.agents.semantic_router import build_semantic_route
 from services.llm.memory import DEFAULT_PROMPT_VERSION, LearningConcept, MemoryContext, MemoryHit
 from services.llm.skills.base import AgentSkillContext
@@ -27,19 +33,24 @@ except ImportError:  # pragma: no cover - fallback keeps Gateway usable
     END = "__end__"  # type: ignore[assignment]
     StateGraph = None  # type: ignore[misc,assignment]
 
-class TutorGraphState(TypedDict):
+class PreparedTutorContext(TypedDict, total=False):
+    memory_context: MemoryContext
+    concepts: list[LearningConcept]
+    knowledge_context: KnowledgeContext
+    intent: dict[str, Any]
+    semantic_route: dict[str, Any]
+
+
+class TutorGraphState(PreparedTutorContext):
     """State passed between tutor-agent graph nodes."""
 
+    # 各节点通过返回新字典增补状态；NotRequired 字段由后续节点逐步产生。
+    # user_id/session_id 控制个性化范围，knowledge_base_id 控制公共知识检索范围。
     user_id: str
     session_id: str
     query: str
     knowledge_base_id: str
     context_mode: NotRequired[str]
-    memory_context: NotRequired[MemoryContext]
-    concepts: NotRequired[list[LearningConcept]]
-    knowledge_context: NotRequired[KnowledgeContext]
-    intent: NotRequired[dict[str, Any]]
-    semantic_route: NotRequired[dict[str, Any]]
     response_policy: NotRequired[dict[str, Any]]
     tutor_strategy: NotRequired[dict[str, Any]]
     context: NotRequired[AgentSkillContext]
@@ -112,6 +123,7 @@ class TutorGraph:
         query: str,
         knowledge_base_id: str,
         context_mode: str,
+        prepared_context: PreparedTutorContext | None = None,
     ) -> AgentSkillContext:
         state: TutorGraphState = {
             "user_id": user_id,
@@ -119,6 +131,7 @@ class TutorGraph:
             "query": query,
             "knowledge_base_id": knowledge_base_id,
             "context_mode": context_mode,
+            **(prepared_context or {}),
         }
         if self._graph is None:
             state = await self._run_fallback(state)
@@ -127,6 +140,8 @@ class TutorGraph:
         return state["context"]
 
     def _compile_graph(self) -> Any:
+        # 当前拓扑是固定顺序的准备流水线，而不是无限循环的自主 Agent。
+        # 未安装可选 LangGraph 依赖时，_run_fallback 以相同顺序直接调用这些节点。
         graph = StateGraph(TutorGraphState)
         graph.add_node("load_context", self._load_context)
         graph.add_node("classify_intent", self._classify_intent)
@@ -149,6 +164,10 @@ class TutorGraph:
         return await self._assemble_context(state)
 
     async def _load_context(self, state: TutorGraphState) -> TutorGraphState:
+        # 已由 SkillManager 准备的记忆/知识直接复用，避免同一轮重复检索。
+        # 先做轻量意图判断，确定是否需要知识、概念锚点和图谱候选实体。
+        if "memory_context" in state and "knowledge_context" in state:
+            return state
         short_term = state.get("context_mode") == "short_term"
         local_followup = short_term and is_contextual_followup(state["query"])
         if not local_followup:
@@ -164,6 +183,8 @@ class TutorGraph:
         expansion = KnowledgeExpansionOptions(**(semantic_route.get("expansion") or {}))
 
         if short_term:
+            # 短期模式只装载画像与近期历史；上下文追问可跳过新知识检索，延续当前话题。
+            # 非追问且需要知识时，让记忆读取和知识请求并发，减少串行等待。
             memory_task = asyncio.create_task(
                 self.memory_skill.prepare_short_term(
                     user_id=state["user_id"],
@@ -268,6 +289,7 @@ class TutorGraph:
         return {**state, "intent": intent}
 
     async def _plan_response_style(self, state: TutorGraphState) -> TutorGraphState:
+        # 回答长度、语气与互动限制由问题、画像和已有对话共同决定，不在网关拼提示词。
         memory_context = state["memory_context"]
         policy = build_response_policy(
             query=state["query"],
@@ -278,6 +300,7 @@ class TutorGraph:
         return {**state, "response_policy": policy}
 
     async def _plan_tutoring_strategy(self, state: TutorGraphState) -> TutorGraphState:
+        # 日常/非教学意图允许走非教学策略，避免把所有聊天都强行变成课程讲解。
         memory_context = state["memory_context"]
         concepts = state.get("concepts", [])
         intent = state.get("intent", {})
@@ -310,6 +333,8 @@ class TutorGraph:
         return {**state, "tutor_strategy": strategy}
 
     async def _assemble_context(self, state: TutorGraphState) -> TutorGraphState:
+        # 将记忆、学习概念、检索证据和策略封装为同一上下文，同时记录可诊断的路由元数据。
+        # metadata 用于解释本轮为何采用某策略，不是新的用户消息或模型回答。
         memory_context = state["memory_context"]
         concepts = state.get("concepts", [])
         knowledge_context = state.get(
@@ -338,7 +363,7 @@ class TutorGraph:
             "skills": skills,
             "agent": "TutorGraph",
             "agent_mode": "langgraph" if self.uses_langgraph else "fallback_graph",
-            "context_mode": "short_term" if short_term else "full",
+            "context_mode": state.get("context_mode", "full"),
             "langgraph_enabled": self.uses_langgraph,
             "langchain_enabled": self.uses_langchain,
             "graph_nodes": graph_nodes,
@@ -440,6 +465,14 @@ def is_contextual_followup(query: str) -> bool:
     """Recognize short replies whose meaning depends on the previous assistant turn."""
 
     compact = re.sub(r"[\s，。！？!?、,.]+", "", str(query or "").strip())
+    if 0 < len(compact) <= 24:
+        step = r"第[一二三四五六七八九十百两0-9]{1,4}(?:步|点|个步骤)"
+        prefix = r"(?:请|麻烦)?(?:你)?"
+        if re.fullmatch(
+            prefix + rf"(?:把)?{step}(?:再)?(?:讲清楚|解释一下|展开讲讲|展开讲|详细讲讲|讲一下|怎么做|为什么(?:这样做)?|没听懂|是什么意思)?",
+            compact,
+        ) or re.fullmatch(prefix + rf"(?:再)?(?:解释一下|讲一下|讲讲|详细讲讲|展开讲讲){step}", compact):
+            return True
     if not compact or len(compact) > 12:
         return False
     exact_replies = {
@@ -624,14 +657,13 @@ def build_response_policy(
     """Build deterministic expression controls for the final LLM response."""
 
     category = str(intent.get("category") or "explain")
-    interaction_style_value = profile.get("interaction_style")
-    interaction_style: dict[str, Any] = (
-        interaction_style_value if isinstance(interaction_style_value, dict) else {}
-    )
-    preferences_value = profile.get("preferences")
-    preferences: dict[str, Any] = (
-        preferences_value if isinstance(preferences_value, dict) else {}
-    )
+    interaction_style = profile.get("interaction_style")
+    if not isinstance(interaction_style, dict):
+        interaction_style = {}
+    preferences = profile.get("preferences")
+    if not isinstance(preferences, dict):
+        preferences = {}
+    audience_profile = audience_profile_from_profile(profile)
 
     emotion = _infer_emotion(query)
     urgent = any(marker in query for marker in ("快点", "赶时间", "马上", "来不及", "急用"))
@@ -710,6 +742,24 @@ def build_response_policy(
         category,
         ("professional_tutor", "none", "learning_accuracy"),
     )
+    persona_mode = _explicit_persona_mode(query) or normalize_assistant_persona_mode(profile)
+    dialect_mode = _explicit_dialect_mode(query) or normalize_assistant_dialect_mode(profile)
+    learning_categories = {
+        "followup", "knowledge_exploration", "practice", "mistake_review", "review", "remediation", "explain",
+    }
+    if persona_mode == "gentle":
+        humor_level = "none"
+        if category in {"casual", "daily_life", "identity", "preference"}:
+            companion_style = "gentle_guardian"
+        elif category in learning_categories:
+            companion_style = "gentle_mentor"
+    elif category in {"casual", "daily_life", "identity", "preference"}:
+        companion_style = "reliable_guardian" if category == "daily_life" else "familiar_guardian"
+        humor_level = "playful"
+    elif category in learning_categories:
+        companion_style = "witty_tutor"
+        humor_level = "light"
+
     if category == "crisis_support" or _looks_like_immediate_risk(query):
         companion_style, humor_level, care_focus = "safety_guardian", "none", "immediate_safety"
     elif _looks_like_serious_topic(query):
@@ -730,6 +780,8 @@ def build_response_policy(
     return {
         "scene": category,
         "emotion": emotion,
+        "persona_mode": persona_mode,
+        "dialect_mode": dialect_mode,
         "tone": tone,
         "response_depth": response_depth,
         "interaction_mode": interaction_mode,
@@ -741,7 +793,32 @@ def build_response_policy(
         "avoid": str(interaction_style.get("avoid") or "").strip(),
         "familiarity": "returning" if history_count >= 2 else "new",
         "audience": _minor_audience(profile),
+        "audience_profile": audience_profile,
     }
+
+
+def _explicit_persona_mode(query: str) -> str | None:
+    normalized = re.sub(r"\s+", "", query)
+    context_markers = ("这次", "这一轮", "现在", "接下来", "以后", "今后", "从现在开始", "说话", "回答", "切换", "改成", "设为")
+    if not any(marker in normalized for marker in context_markers) and normalized not in {"温柔一点", "幽默一点", "有趣一点"}:
+        return None
+    if any(marker in normalized for marker in ("温柔", "柔和")):
+        return "gentle"
+    if any(marker in normalized for marker in ("幽默", "有趣")):
+        return "humorous"
+    return None
+
+
+def _explicit_dialect_mode(query: str) -> str | None:
+    normalized = re.sub(r"\s+", "", query)
+    context_markers = ("这次", "这一轮", "现在", "接下来", "以后", "今后", "从现在开始", "说", "回答", "切换", "改成", "设为", "使用")
+    if not any(marker in normalized for marker in context_markers) and normalized not in {"普通话", "北京话", "北京方言"}:
+        return None
+    if any(marker in normalized for marker in ("北京话", "北京方言")):
+        return "beijing"
+    if "普通话" in normalized:
+        return "mandarin"
+    return None
 
 
 def _looks_like_crisis_signal(query: str) -> bool:
@@ -916,10 +993,23 @@ def _daily_safety_note(query: str) -> str:
 
 
 def _minor_audience(profile: dict[str, Any]) -> str:
-    grade = str(profile.get("grade") or profile.get("grade_level") or profile.get("school_grade") or "").strip()
+    audience = audience_profile_from_profile(profile)
+    grade = str(
+        profile.get("grade")
+        or profile.get("grade_code")
+        or profile.get("grade_level")
+        or profile.get("school_grade")
+        or ""
+    ).strip()
+    if audience:
+        grade_note = f"，已知年级={grade}" if grade else ""
+        return (
+            f"{audience['age_years']} 岁学生，年龄阶段={audience['age_stage']}"
+            f"（{audience['age_band']} 岁）{grade_note}；按年龄调整词汇、抽象程度、例子和信息量"
+        )
     if grade:
-        return f"未成年学生，已知年级={grade}；按该年级调整词汇、抽象程度、例子和信息量"
-    return "未成年学生，年级未知；先用中性易懂表达，只有任务难度确实依赖年级时才追问"
+        return f"3 至 17 岁学生，年龄未知，已知年级={grade}；按该年级使用中性易懂表达"
+    return "年龄未设置、年级未知；不套用分龄字数限制，先用中性易懂表达，只有任务难度确实依赖年龄或年级时才追问"
 
 
 def _infer_emotion(query: str) -> str:

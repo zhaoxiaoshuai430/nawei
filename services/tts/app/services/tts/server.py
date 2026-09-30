@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Standalone TTS API service (no ASR / LLM). Default port 19000."""
+# TTS 进程启动入口，仅负责环境准备、音色参考加载、模型预加载和 API 服务启动。
+# 请求参数校验与音频响应见 app/api/routes.py，实际模型加载与推理见 services/tts/engine.py。
+# 网关决定朗读什么及如何分段；本服务负责把传入文字转换为指定格式的音频。
 from __future__ import annotations
 
 import argparse
@@ -35,6 +38,8 @@ DEFAULT_PORT = int(os.environ.get("TTS_PORT", "19000"))
 
 
 def create_app() -> FastAPI:
+    # 应用创建与模型加载分离：注册路由本身不代表模型已经就绪。
+    # CORS 只按配置开放浏览器来源，不替代各接口上的内部/管理员身份校验。
     application = FastAPI(
         title="Qwen3 TTS API",
         description="Standalone text-to-speech service (CustomVoice, voice clone, voice design).",
@@ -70,6 +75,7 @@ def get_app() -> FastAPI:
 
 
 def initialize_tts_service() -> None:
+    # 幂等初始化避免重复加载预设参考素材；这里准备参考音色，不直接加载模型权重。
     global _initialized
     if _initialized:
         return
@@ -81,6 +87,8 @@ def initialize_tts_service() -> None:
 
 
 def run_tts_service(argv: list[str] | None = None) -> None:
+    # argv 支持启动脚本传入模型、端口和监听地址；默认先完成模型预加载再启动 Uvicorn。
+    # --no-preload 仅跳过启动时加载，模型仍需通过加载接口准备好后才能正常合成。
     initialize_tts_service()
     app = get_app()
 

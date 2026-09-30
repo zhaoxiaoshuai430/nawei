@@ -11,6 +11,7 @@ x-app-service: &app-service
   build:
     context: ..
     dockerfile: deploy/Dockerfile.app
+    target: app
   restart: unless-stopped
   init: true
   read_only: true
@@ -45,6 +46,7 @@ services:
       retries: 20
       start_period: 10s
     restart: unless-stopped
+    mem_limit: 2g
     init: true
     security_opt:
       - no-new-privileges:true
@@ -64,6 +66,7 @@ services:
       retries: 20
       start_period: 5s
     restart: unless-stopped
+    mem_limit: 512m
     init: true
     read_only: true
     tmpfs:
@@ -87,6 +90,7 @@ services:
       retries: 30
       start_period: 10s
     restart: unless-stopped
+    mem_limit: 2g
     init: true
     security_opt:
       - no-new-privileges:true
@@ -98,6 +102,9 @@ services:
     image: ${NEO4J_IMAGE:?Set NEO4J_IMAGE}
     environment:
       NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512m
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
@@ -108,6 +115,7 @@ services:
       retries: 30
       start_period: 20s
     restart: unless-stopped
+    mem_limit: 3g
     init: true
     security_opt:
       - no-new-privileges:true
@@ -117,27 +125,38 @@ services:
 
   knowledge:
     <<: *app-service
+    image: nawei/knowledge:${NAWEI_IMAGE_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.app
+      target: knowledge
+    volumes:
+      - ../models/embeddings:/models/embeddings:ro
     command: ["python", "-m", "services.knowledge.run"]
     environment:
       NAWEI_ENV: production
       KNOWLEDGE_HOST: 0.0.0.0
       KNOWLEDGE_PORT: 8003
+      KNOWLEDGE_STARTUP_WARMUP_ENABLED: ${KNOWLEDGE_STARTUP_WARMUP_ENABLED:-true}
+      KNOWLEDGE_STARTUP_WARMUP_TIMEOUT_SECONDS: ${KNOWLEDGE_STARTUP_WARMUP_TIMEOUT_SECONDS:-60}
       KNOWLEDGE_ENABLED: ${KNOWLEDGE_ENABLED:-true}
       KNOWLEDGE_REQUIRED: ${KNOWLEDGE_REQUIRED:-true}
       KNOWLEDGE_INTERNAL_API_KEY: ${KNOWLEDGE_INTERNAL_API_KEY:?Set KNOWLEDGE_INTERNAL_API_KEY}
       KNOWLEDGE_ADMIN_API_KEY: ${KNOWLEDGE_ADMIN_API_KEY:?Set KNOWLEDGE_ADMIN_API_KEY}
       QDRANT_URL: http://qdrant:6333
       QDRANT_API_KEY: ${QDRANT_API_KEY:?Set QDRANT_API_KEY}
-      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-knowledge_chunks_v1}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-knowledge_chunks_bge_zh_20260907}
       NEO4J_URI: neo4j://neo4j:7687
       NEO4J_USER: ${NEO4J_USER:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:?Set EMBEDDING_PROVIDER}
-      EMBEDDING_API_BASE_URL: ${EMBEDDING_API_BASE_URL:?Set EMBEDDING_API_BASE_URL}
-      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:?Set EMBEDDING_API_KEY}
+      EMBEDDING_API_BASE_URL: ${EMBEDDING_API_BASE_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:?Set EMBEDDING_MODEL}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:?Set EMBEDDING_DIMENSION}
+      EMBEDDING_CACHE_DIR: /models/embeddings
+      EMBEDDING_THREADS: ${EMBEDDING_THREADS:-2}
       KNOWLEDGE_GRAPH_EXTRACTOR: ${KNOWLEDGE_GRAPH_EXTRACTOR:-llm}
       KNOWLEDGE_LLM_EXTRACTOR_URL: http://llm:8002/api/v1/llm
       LLM_INTERNAL_API_KEY: ${LLM_INTERNAL_API_KEY:?Set LLM_INTERNAL_API_KEY}
@@ -159,9 +178,9 @@ services:
       neo4j:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=3)"]
+      test: ["CMD", "python", "/app/deploy/scripts/healthcheck.py", "knowledge"]
       interval: 10s
-      timeout: 5s
+      timeout: 10s
       retries: 12
       start_period: 20s
     networks:
@@ -176,10 +195,20 @@ services:
   llm:
     <<: *app-service
     command: ["python", "-m", "services.llm.run"]
+    stop_grace_period: 210s
     environment:
       NAWEI_ENV: production
+      LLM_HOST: 0.0.0.0
+      LLM_PORT: 8002
+      LLM_WORKERS: ${LLM_WORKERS:-1}
       LLM_INTERNAL_API_KEY: ${LLM_INTERNAL_API_KEY:?Set LLM_INTERNAL_API_KEY}
       LLM_PROVIDER: ${LLM_PROVIDER:-deepseek}
+      ALIYUN_CONTENT_SAFETY_ENABLED: ${ALIYUN_CONTENT_SAFETY_ENABLED:-false}
+      ALIBABA_CLOUD_ACCESS_KEY_ID: ${ALIBABA_CLOUD_ACCESS_KEY_ID:-}
+      ALIBABA_CLOUD_ACCESS_KEY_SECRET: ${ALIBABA_CLOUD_ACCESS_KEY_SECRET:-}
+      ALIYUN_GREEN_REGION_ID: ${ALIYUN_GREEN_REGION_ID:-cn-shanghai}
+      ALIYUN_GREEN_ENDPOINT: ${ALIYUN_GREEN_ENDPOINT:-green-cip.cn-shanghai.aliyuncs.com}
+      ALIYUN_CONTENT_SAFETY_TIMEOUT_SECONDS: ${ALIYUN_CONTENT_SAFETY_TIMEOUT_SECONDS:-12}
       LLM_API_BASE_URL: ${LLM_API_BASE_URL:-https://api.deepseek.com}
       LLM_API_KEY: ${LLM_API_KEY:?Set LLM_API_KEY}
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-pro}
@@ -193,6 +222,10 @@ services:
       LLM_TOOL_TIMEOUT_SECONDS: ${LLM_TOOL_TIMEOUT_SECONDS:-6}
       MEMORY_ENABLED: ${MEMORY_ENABLED:-true}
       LLM_MEMORY_REQUIRED: ${LLM_MEMORY_REQUIRED:-true}
+      LLM_MEMORY_STARTUP_TIMEOUT_SECONDS: ${LLM_MEMORY_STARTUP_TIMEOUT_SECONDS:-30}
+      MEMORY_POST_TURN_MAX_PENDING: ${MEMORY_POST_TURN_MAX_PENDING:-64}
+      MEMORY_POST_TURN_TIMEOUT_SECONDS: ${MEMORY_POST_TURN_TIMEOUT_SECONDS:-120}
+      MEMORY_SHUTDOWN_TIMEOUT_SECONDS: ${MEMORY_SHUTDOWN_TIMEOUT_SECONDS:-130}
       MEMORY_EXTRACTOR_ENABLED: ${MEMORY_EXTRACTOR_ENABLED:-true}
       MEMORY_EXTRACTOR_URL: ${MEMORY_EXTRACTOR_URL:-http://llm:8002/api/v1/llm}
       MEMORY_PROFILE_REDIS_CACHE: ${MEMORY_PROFILE_REDIS_CACHE:-true}
@@ -213,7 +246,7 @@ services:
       KNOWLEDGE_RETRIEVE_URL: http://knowledge:8003/api/v1/knowledge/retrieve
       KNOWLEDGE_HEALTH_URL: http://knowledge:8003/health
       KNOWLEDGE_DEFAULT_BASE_ID: ${KNOWLEDGE_DEFAULT_BASE_ID:-default}
-      KNOWLEDGE_TIMEOUT_SECONDS: ${KNOWLEDGE_TIMEOUT_SECONDS:-8}
+      KNOWLEDGE_TIMEOUT_SECONDS: ${KNOWLEDGE_TIMEOUT_SECONDS:-30}
     depends_on:
       config-check:
         condition: service_completed_successfully
@@ -227,9 +260,9 @@ services:
       - /tmp:size=256m,mode=1777
       - /app/.runtime-tools:size=64m,mode=1777
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=3)"]
+      test: ["CMD", "python", "/app/deploy/scripts/healthcheck.py", "llm"]
       interval: 10s
-      timeout: 5s
+      timeout: 10s
       retries: 12
       start_period: 20s
     networks:
@@ -249,7 +282,12 @@ services:
     environment:
       NAWEI_ENV: production
       ASR_INTERNAL_API_KEY: ${ASR_INTERNAL_API_KEY:?Set ASR_INTERNAL_API_KEY}
-      ASR_DEVICE: ${ASR_DEVICE:-cuda:0}
+      ASR_DEVICE: ${ASR_DEVICE:-cpu}
+      ASR_REALTIME_BACKEND: ${ASR_REALTIME_BACKEND:-paraformer}
+      ASR_STREAMING_MODEL_PATH: /app/models/asr/paraformer-online
+      ASR_STREAMING_DEVICE: ${ASR_STREAMING_DEVICE:-cpu}
+      ASR_STREAMING_THREADS: ${ASR_STREAMING_THREADS:-2}
+      ASR_STREAMING_WORKERS: ${ASR_STREAMING_WORKERS:-2}
       ASR_MAX_CONCURRENT_INFERENCES: ${ASR_MAX_CONCURRENT_INFERENCES:-1}
       ASR_MAX_QUEUE_SIZE: ${ASR_MAX_QUEUE_SIZE:-16}
       ASR_QUEUE_TIMEOUT_SECONDS: ${ASR_QUEUE_TIMEOUT_SECONDS:-30}
@@ -270,7 +308,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)"]
+      test: ["CMD", "python", "/app/deploy/scripts/healthcheck.py", "asr"]
       interval: 15s
       timeout: 10s
       retries: 30
@@ -282,13 +320,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "6.0"
-          memory: 12G
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+          cpus: "2.0"
+          memory: 4G
 
   tts:
     image: nawei/tts:${NAWEI_IMAGE_TAG:-latest}
@@ -301,7 +334,8 @@ services:
       TTS_ADMIN_API_KEY: ${TTS_ADMIN_API_KEY:?Set TTS_ADMIN_API_KEY}
       NAWEI_MODEL_ROOT: /app/models
       VOICE_LAB_SPEAKER: ${VOICE_LAB_SPEAKER:-liliya}
-      TTS_MAX_QUEUE_SIZE: ${TTS_MAX_QUEUE_SIZE:-8}
+      TTS_SKIP_PRESET_FETCH: "1"
+      TTS_MAX_QUEUE_SIZE: ${TTS_MAX_QUEUE_SIZE:-16}
       TTS_QUEUE_TIMEOUT_SECONDS: ${TTS_QUEUE_TIMEOUT_SECONDS:-120}
       TTS_STREAM_QUEUE_SIZE: ${TTS_STREAM_QUEUE_SIZE:-8}
       TTS_STREAM_QUEUE_PUT_TIMEOUT_SECONDS: ${TTS_STREAM_QUEUE_PUT_TIMEOUT_SECONDS:-5}
@@ -318,7 +352,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:19000/api/v1/status', timeout=5)"]
+      test: ["CMD", "python", "/app/deploy/scripts/healthcheck.py", "tts"]
       interval: 15s
       timeout: 10s
       retries: 40
@@ -329,8 +363,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "8.0"
-          memory: 24G
+          cpus: "4.0"
+          memory: 10G
         reservations:
           devices:
             - driver: nvidia
@@ -340,9 +374,16 @@ services:
   gateway:
     <<: *app-service
     command: ["python", "-m", "services.gateway.run"]
+    volumes:
+      - gateway_devices:/var/lib/nawei
     environment:
+      XIAOZHI_ENABLED: ${XIAOZHI_ENABLED:-true}
+      XIAOZHI_DATABASE_PATH: /var/lib/nawei/devices.sqlite3
+      NAWEI_PUBLIC_ROBOT_URL: ${NAWEI_PUBLIC_ROBOT_URL:-https://robot.example.com}
+      XIAOZHI_PUBLIC_WEBSOCKET_URL: ${XIAOZHI_PUBLIC_WEBSOCKET_URL:-wss://robot.example.com/xiaozhi/v1/}
       NAWEI_ENV: production
       GATEWAY_AUTH_MODE: jwt
+      GATEWAY_FORWARDED_ALLOW_IPS: "*"
       GATEWAY_ENABLE_DIAGNOSTICS: "false"
       GATEWAY_JWT_SECRET: ${GATEWAY_JWT_SECRET:?Set GATEWAY_JWT_SECRET}
       GATEWAY_JWT_ISSUER: ${GATEWAY_JWT_ISSUER:-nawei-auth}
@@ -360,20 +401,26 @@ services:
       GATEWAY_LLM_HEALTH_URL: ${GATEWAY_LLM_HEALTH_URL:-http://llm:8002/health}
       GATEWAY_TTS_HEALTH_URL: ${GATEWAY_TTS_HEALTH_URL:-http://tts:19000/api/v1/status}
       GATEWAY_ASR_TIMEOUT_SECONDS: ${GATEWAY_ASR_TIMEOUT_SECONDS:-300}
-      GATEWAY_LLM_TIMEOUT_SECONDS: ${GATEWAY_LLM_TIMEOUT_SECONDS:-60}
+      GATEWAY_LLM_TIMEOUT_SECONDS: ${GATEWAY_LLM_TIMEOUT_SECONDS:-150}
       GATEWAY_TTS_TIMEOUT_SECONDS: ${GATEWAY_TTS_TIMEOUT_SECONDS:-300}
-      GATEWAY_HEALTH_TIMEOUT_SECONDS: ${GATEWAY_HEALTH_TIMEOUT_SECONDS:-3}
-      GATEWAY_MAX_CONCURRENT_REQUESTS: ${GATEWAY_MAX_CONCURRENT_REQUESTS:-20}
-      GATEWAY_MAX_CONCURRENT_REQUESTS_PER_USER: ${GATEWAY_MAX_CONCURRENT_REQUESTS_PER_USER:-2}
-      GATEWAY_MAX_QUEUED_REQUESTS: ${GATEWAY_MAX_QUEUED_REQUESTS:-100}
-      GATEWAY_MAX_QUEUED_REQUESTS_PER_USER: ${GATEWAY_MAX_QUEUED_REQUESTS_PER_USER:-4}
+      GATEWAY_HEALTH_TIMEOUT_SECONDS: ${GATEWAY_HEALTH_TIMEOUT_SECONDS:-10}
+      GATEWAY_MAX_CONCURRENT_REQUESTS: ${GATEWAY_MAX_CONCURRENT_REQUESTS:-6}
+      GATEWAY_MAX_CONCURRENT_REQUESTS_PER_USER: ${GATEWAY_MAX_CONCURRENT_REQUESTS_PER_USER:-1}
+      GATEWAY_MAX_QUEUED_REQUESTS: ${GATEWAY_MAX_QUEUED_REQUESTS:-12}
+      GATEWAY_MAX_QUEUED_REQUESTS_PER_USER: ${GATEWAY_MAX_QUEUED_REQUESTS_PER_USER:-1}
       GATEWAY_CONCURRENCY_WAIT_TIMEOUT_SECONDS: ${GATEWAY_CONCURRENCY_WAIT_TIMEOUT_SECONDS:-10}
       GATEWAY_REALTIME_START_TIMEOUT_SECONDS: ${GATEWAY_REALTIME_START_TIMEOUT_SECONDS:-10}
       GATEWAY_VOICE_TTS_SEGMENT_QUEUE_SIZE: ${GATEWAY_VOICE_TTS_SEGMENT_QUEUE_SIZE:-8}
+      GATEWAY_VOICE_PREVIEW_ENABLED: ${GATEWAY_VOICE_PREVIEW_ENABLED:-false}
+      GATEWAY_VOICE_PREVIEW_STABLE_SECONDS: ${GATEWAY_VOICE_PREVIEW_STABLE_SECONDS:-0.25}
+      GATEWAY_VOICE_PREVIEW_MIN_CHARS: ${GATEWAY_VOICE_PREVIEW_MIN_CHARS:-6}
+      GATEWAY_VOICE_PREVIEW_MAX_ATTEMPTS: ${GATEWAY_VOICE_PREVIEW_MAX_ATTEMPTS:-4}
+      GATEWAY_VOICE_PREVIEW_FINAL_WAIT_SECONDS: ${GATEWAY_VOICE_PREVIEW_FINAL_WAIT_SECONDS:-8}
       GATEWAY_TTS_SOFT_SEGMENT_MIN_CHARS: ${GATEWAY_TTS_SOFT_SEGMENT_MIN_CHARS:-8}
       GATEWAY_TTS_FIRST_SEGMENT_CHARS: ${GATEWAY_TTS_FIRST_SEGMENT_CHARS:-6}
       GATEWAY_TTS_EAGER_SEGMENT_CHARS: ${GATEWAY_TTS_EAGER_SEGMENT_CHARS:-48}
       GATEWAY_TTS_STREAM_CHUNK_SIZE: ${GATEWAY_TTS_STREAM_CHUNK_SIZE:-8}
+      GATEWAY_TTS_CONTINUATION_CHUNK_SIZE: ${GATEWAY_TTS_CONTINUATION_CHUNK_SIZE:-12}
     depends_on:
       config-check:
         condition: service_completed_successfully
@@ -384,9 +431,9 @@ services:
       tts:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      test: ["CMD", "python", "/app/deploy/scripts/healthcheck.py", "gateway"]
       interval: 10s
-      timeout: 5s
+      timeout: 20s
       retries: 12
       start_period: 30s
     networks:
@@ -395,8 +442,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "4.0"
-          memory: 4G
+          cpus: "2.0"
+          memory: 1G
 
   caddy:
     image: caddy:2-alpine
@@ -475,6 +522,7 @@ networks:
   egress:
 
 volumes:
+  gateway_devices:
   asr_models:
   tts_data:
   postgres_data:

@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 
+import anyio
 from fastapi import HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -23,6 +24,16 @@ from app.utils.cache import get_cached_ref_path
 
 
 logger = logging.getLogger(__name__)
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # A failed send can leave the generator suspended at its last yield.
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
 
 
 @dataclass
@@ -318,27 +329,27 @@ async def generate_stream(
                 if msg is None:
                     break
                 yield f"data: {msg}\n\n"
-        except asyncio.CancelledError:
+        finally:
             consumer_closed.set()
             stop_requested.set()
-            if not acquire_task.done():
-                acquire_task.cancel()
-            raise
-        finally:
-            stop_requested.set()
-            if worker is not None and worker.is_alive():
-                await run_blocking_until_complete(worker.join)
-            if lease is not None:
-                await lease.release()
-            elif acquire_task.done() and not acquire_task.cancelled():
-                try:
-                    acquired_after_cancel = acquire_task.result()
-                except CapacityRejected:
-                    pass
-                else:
-                    await acquired_after_cancel.release()
+            # StreamingResponse keeps cancelling awaits after a disconnect.
+            with anyio.CancelScope(shield=True):
+                if not acquire_task.done():
+                    acquire_task.cancel()
+                await asyncio.gather(acquire_task, return_exceptions=True)
+                if worker is not None and worker.is_alive():
+                    await run_blocking_until_complete(worker.join)
+                if lease is not None:
+                    await lease.release()
+                elif acquire_task.done() and not acquire_task.cancelled():
+                    try:
+                        acquired_after_cancel = acquire_task.result()
+                    except CapacityRejected:
+                        pass
+                    else:
+                        await acquired_after_cancel.release()
 
-    return StreamingResponse(
+    return _ClosingStreamingResponse(
         sse(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

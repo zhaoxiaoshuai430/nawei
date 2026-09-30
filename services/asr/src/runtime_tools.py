@@ -3,8 +3,22 @@
 from __future__ import annotations
 
 import os
+import io
+import wave
 import shutil
 from pathlib import Path
+
+
+def is_native_pcm_wav(content: bytes) -> bool:
+    """Accept complete PCM16 mono 16 kHz WAV without transcoding."""
+    try:
+        with wave.open(io.BytesIO(content), "rb") as audio:
+            if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate(), audio.getcomptype()) != (1, 2, 16000, "NONE"):
+                return False
+            frames = audio.getnframes()
+            return frames > 0 and len(audio.readframes(frames)) == frames * 2
+    except (wave.Error, EOFError, OSError):
+        return False
 
 
 def ensure_ffmpeg_on_path(runtime_dir: Path | None = None) -> Path | None:

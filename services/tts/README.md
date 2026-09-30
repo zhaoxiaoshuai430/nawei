@@ -30,6 +30,11 @@ $env:TTS_SKIP_PRESET_FETCH="1"
 .\cuda_env\Scripts\python.exe -m app.services.tts.server --model voice_lab/liliya --port 19000
 ```
 
+When preset fetching is enabled, downloads require HTTPS and are installed
+atomically after size and format validation. The limits can be adjusted with
+`TTS_PRESET_DOWNLOAD_TIMEOUT_SECONDS`, `TTS_PRESET_MAX_AUDIO_BYTES`, and
+`TTS_PRESET_MAX_TRANSCRIPT_BYTES`.
+
 Health check:
 
 ```text

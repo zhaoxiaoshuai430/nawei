@@ -34,7 +34,7 @@ class ConcurrencyLease:
     def __init__(self, limiter: "KeyedConcurrencyLimiter", key: str) -> None:
         self._limiter = limiter
         self._key = key
-        self._released = False
+        self._release_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> "ConcurrencyLease":
         return self
@@ -43,10 +43,10 @@ class ConcurrencyLease:
         await self.release()
 
     async def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        await self._limiter.release(self._key)
+        # Share one release operation; a disconnected caller must not cancel it.
+        if self._release_task is None:
+            self._release_task = asyncio.create_task(self._limiter.release(self._key))
+        await asyncio.shield(self._release_task)
 
 
 class KeyedConcurrencyLimiter:

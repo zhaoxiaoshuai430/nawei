@@ -1,5 +1,11 @@
 """Gateway/BFF composing ASR, LLM, and TTS through app_protocols."""
 
+# 核心阅读入口：机器人通过网关调用完整语音链路。
+# 本文件负责 HTTP 适配、用户鉴权、容量控制及浏览器实时语音编排；
+# Agent 决策、历史记录和长期记忆由独立 LLM 服务管理，不能在这里另建一份。
+# 阅读顺序：HTTP*Provider -> stream_text -> realtime_voice_completion -> _stream_voice_response。
+# 机器人接入见 xiaozhi/router.py。
+
 from __future__ import annotations
 
 import asyncio
@@ -9,12 +15,11 @@ import os
 import re
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, AsyncIterator, NoReturn, Optional, Sequence
+from typing import Any, AsyncGenerator, AsyncIterator, NoReturn, Optional, Sequence
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import Field
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed
@@ -45,25 +50,31 @@ from app_protocols.base import Metadata, ProtocolModel, metadata_field
 from app_protocols.orchestrator import ConversationOrchestrator
 from services.gateway.auth import authenticate_user, authorize_request_user
 from services.gateway.concurrency import ConcurrencyLease, ConcurrencyRejected, KeyedConcurrencyLimiter
+from services.gateway.keyword_filter import (
+    KeywordFilterDecision,
+    KeywordFilterError,
+    KeywordFilterSettings,
+    check_keyword_filter,
+)
+from services.gateway.xiaozhi.router import router as xiaozhi_router
+from services.gateway.voice_preview import VoicePreview
 
 
 DEFAULT_LLM_URL = "http://127.0.0.1:8002/api/v1/llm"
 DEFAULT_LLM_STREAM_URL = "http://127.0.0.1:8002/api/v1/llm/stream"
-DEFAULT_LLM_TIMEOUT_SECONDS = 60.0
+DEFAULT_LLM_TIMEOUT_SECONDS = 150.0
 DEFAULT_ASR_URL = "http://127.0.0.1:8001/api/v1/audio/transcriptions/base64"
 DEFAULT_ASR_REALTIME_URL = "ws://127.0.0.1:8001/api/v1/asr/realtime"
 DEFAULT_ASR_TIMEOUT_SECONDS = 300.0
 DEFAULT_TTS_URL = "http://127.0.0.1:19000/api/v1/audio/speech"
 DEFAULT_TTS_STREAM_URL = "http://127.0.0.1:19000/api/v1/audio/speech/stream"
 DEFAULT_TTS_TIMEOUT_SECONDS = 300.0
+DEFAULT_KEYWORD_FILTER_TIMEOUT_SECONDS = 3.0
 DEFAULT_ASR_HEALTH_URL = "http://127.0.0.1:8001/health"
 DEFAULT_LLM_HEALTH_URL = "http://127.0.0.1:8002/health"
 DEFAULT_TTS_HEALTH_URL = "http://127.0.0.1:19000/api/v1/status"
-DEFAULT_HEALTH_TIMEOUT_SECONDS = 3.0
-TEST_PAGE_PATH = Path(__file__).resolve().parent / "static" / "test.html"
-TEST_PCM_WORKLET_PATH = Path(__file__).resolve().parent / "static" / "pcm_capture_worklet.js"
-DIAGNOSTIC_PATHS = frozenset({"/test", "/docs", "/redoc", "/openapi.json"})
-DIAGNOSTIC_PREFIXES = ("/test/",)
+DEFAULT_HEALTH_TIMEOUT_SECONDS = 10.0
+DIAGNOSTIC_PATHS = frozenset({"/openapi.json"})
 logger = logging.getLogger(__name__)
 
 
@@ -79,6 +90,8 @@ def _diagnostics_enabled() -> bool:
 
 @asynccontextmanager
 async def _gateway_lifespan(application: FastAPI) -> AsyncIterator[None]:
+    # 按超时时间复用 HTTP 连接池，避免每轮 ASR/LLM/TTS 调用都重新建立连接。
+    # AsyncExitStack 统一关闭连接池；trust_env=False 避免本机服务请求被系统代理接管。
     max_connections = int(os.getenv("GATEWAY_HTTP_MAX_CONNECTIONS", "50"))
     max_keepalive_connections = int(os.getenv("GATEWAY_HTTP_MAX_KEEPALIVE_CONNECTIONS", "20"))
     keepalive_expiry = _read_float_env("GATEWAY_HTTP_KEEPALIVE_EXPIRY_SECONDS", 30.0)
@@ -91,6 +104,7 @@ async def _gateway_lifespan(application: FastAPI) -> AsyncIterator[None]:
         _read_float_env("GATEWAY_ASR_TIMEOUT_SECONDS", DEFAULT_ASR_TIMEOUT_SECONDS),
         _read_float_env("GATEWAY_LLM_TIMEOUT_SECONDS", DEFAULT_LLM_TIMEOUT_SECONDS),
         _read_float_env("GATEWAY_TTS_TIMEOUT_SECONDS", DEFAULT_TTS_TIMEOUT_SECONDS),
+        _read_float_env("GATEWAY_KEYWORD_FILTER_TIMEOUT_SECONDS", DEFAULT_KEYWORD_FILTER_TIMEOUT_SECONDS),
         _read_float_env("GATEWAY_HEALTH_TIMEOUT_SECONDS", DEFAULT_HEALTH_TIMEOUT_SECONDS),
     }
     async with AsyncExitStack() as stack:
@@ -101,8 +115,39 @@ async def _gateway_lifespan(application: FastAPI) -> AsyncIterator[None]:
             for timeout in timeouts
         }
         application.state.http_clients = clients
-        yield
-        application.state.http_clients = {}
+        warmup_task = (
+            asyncio.create_task(_warm_gateway_upstream_connections(clients))
+            if _read_bool_env("GATEWAY_STARTUP_WARMUP_ENABLED", True)
+            else None
+        )
+        await asyncio.sleep(0)
+        try:
+            yield
+        finally:
+            if warmup_task is not None:
+                if not warmup_task.done():
+                    warmup_task.cancel()
+                await asyncio.gather(warmup_task, return_exceptions=True)
+            application.state.http_clients = {}
+
+
+async def _warm_gateway_upstream_connections(clients: dict[float, httpx.AsyncClient]) -> None:
+    timeout = _read_float_env("GATEWAY_HEALTH_TIMEOUT_SECONDS", DEFAULT_HEALTH_TIMEOUT_SECONDS)
+    client = clients[timeout]
+    upstreams = (
+        ("asr", os.getenv("GATEWAY_ASR_HEALTH_URL", DEFAULT_ASR_HEALTH_URL)),
+        ("llm", os.getenv("GATEWAY_LLM_HEALTH_URL", DEFAULT_LLM_HEALTH_URL)),
+        ("tts", os.getenv("GATEWAY_TTS_HEALTH_URL", DEFAULT_TTS_HEALTH_URL)),
+    )
+
+    async def warm(name: str, url: str) -> None:
+        try:
+            response = await client.get(url)
+            logger.info("Gateway startup warmup upstream=%s status=%d", name, response.status_code)
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.info("Gateway startup warmup skipped upstream=%s error_type=%s", name, type(exc).__name__)
+
+    await asyncio.gather(*(warm(name, url) for name, url in upstreams))
 
 
 _initial_diagnostics_enabled = _diagnostics_enabled()
@@ -110,15 +155,16 @@ app = FastAPI(
     title="Navi Gateway Service",
     version="0.1.0",
     lifespan=_gateway_lifespan,
-    docs_url="/docs" if _initial_diagnostics_enabled else None,
-    redoc_url="/redoc" if _initial_diagnostics_enabled else None,
+    docs_url=None,
+    redoc_url=None,
     openapi_url="/openapi.json" if _initial_diagnostics_enabled else None,
 )
+app.include_router(xiaozhi_router)
 
 
 @app.middleware("http")
 async def protect_diagnostic_routes(request: Request, call_next: Any) -> Response:
-    diagnostic_path = request.url.path in DIAGNOSTIC_PATHS or request.url.path.startswith(DIAGNOSTIC_PREFIXES)
+    diagnostic_path = request.url.path in DIAGNOSTIC_PATHS
     if diagnostic_path and not _diagnostics_enabled():
         return Response(status_code=404)
     return await call_next(request)
@@ -138,6 +184,8 @@ async def _gateway_http_client(timeout_seconds: float) -> AsyncIterator[httpx.As
 class RealtimeVoiceStart(ProtocolModel):
     """Initial WebSocket message for realtime voice input."""
 
+    # user_id 是经服务端核验的记忆归属，session_id 关联同一会话的多轮历史。
+    # request_id 标识请求，trace_id 用于串联上下游日志；令牌只用于入口鉴权。
     type: str = "start"
     request_id: str = Field(..., min_length=1)
     trace_id: str = Field(..., min_length=1)
@@ -160,6 +208,7 @@ class RealtimeVoiceRequest(ProtocolModel):
     trace_id: str
     session_id: str
     user_id: str
+    voice_preview_token: str | None = None
     language: str = "auto"
     output_audio: bool = True
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
@@ -175,6 +224,8 @@ class RealtimeVoiceRequest(ProtocolModel):
 class HTTPASRProvider:
     """ASR provider that calls the standalone ASR service over HTTP."""
 
+    # Provider 把统一 DTO 转为远端请求，再把模型输出转回标准响应。
+    # 内部 API Key 与用户登录令牌用途不同，不把用户令牌当成服务间凭证。
     def __init__(self, url: str = DEFAULT_ASR_URL, timeout_seconds: float = DEFAULT_ASR_TIMEOUT_SECONDS) -> None:
         self.url = url
         self.timeout_seconds = timeout_seconds
@@ -345,9 +396,9 @@ class HTTPLLMProvider:
                             if tail and last_delta is not None:
                                 yield _stream_event_with_text(last_delta, tail)
                         yield event
-                    tail = reference_filter.feed("", flush=True)
-                    if tail and last_delta is not None:
-                        yield _stream_event_with_text(last_delta, tail)
+                        if event.event in {EventType.MESSAGE_DONE, EventType.ERROR}:
+                            return
+                    raise ValueError("LLM stream ended before a terminal event")
         except httpx.HTTPStatusError as exc:
             _raise_upstream_http_status("LLM stream", exc)
         except httpx.HTTPError as exc:
@@ -392,6 +443,7 @@ class HTTPTTSProvider:
 
     async def stream_synthesize(self, request: TTSRequest) -> AsyncIterator[StreamEvent]:
         payload = _model_to_dict(request)
+        received_audio = False
         headers: dict[str, str] = {}
         internal_api_key = os.getenv("TTS_INTERNAL_API_KEY", "").strip()
         if internal_api_key:
@@ -406,6 +458,9 @@ class HTTPTTSProvider:
                     async for body in _iter_sse_json(response):
                         event_type = body.get("type")
                         if event_type == "chunk":
+                            if not isinstance(body.get("audio_b64"), str) or not body["audio_b64"]:
+                                raise ValueError("TTS stream returned an empty audio chunk")
+                            received_audio = True
                             yield StreamEvent(
                                 event=EventType.AUDIO_DELTA,
                                 request_id=request.request_id,
@@ -422,11 +477,16 @@ class HTTPTTSProvider:
                                     "elapsed_ms": body.get("elapsed_ms"),
                                 },
                             )
+                        elif event_type == "done":
+                            if not received_audio:
+                                raise ValueError("TTS stream completed without audio")
+                            return
                         elif event_type == "error":
                             raise HTTPException(
                                 status_code=502,
                                 detail=str(body.get("message") or "TTS stream failed."),
                             )
+                    raise ValueError("TTS stream ended before a terminal event")
         except httpx.HTTPStatusError as exc:
             _raise_upstream_http_status("TTS stream", exc)
         except httpx.HTTPError as exc:
@@ -448,6 +508,13 @@ def _read_int_env(name: str, default: int) -> int:
     if value < 1:
         raise ValueError(f"{name} must be at least 1")
     return value
+
+
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 orchestrator = ConversationOrchestrator(
     asr_provider=HTTPASRProvider(
@@ -504,37 +571,12 @@ async def service_root() -> dict[str, str]:
         "health": "/health",
         "status": "/api/v1/status",
         "realtime_voice": "/api/v1/voice/realtime",
+        "robot_ota": "/xiaozhi/ota/",
+        "robot_websocket": "/xiaozhi/v1/",
     }
     if _diagnostics_enabled():
-        routes["docs"] = "/docs"
-        routes["test"] = "/test"
+        routes["openapi"] = "/openapi.json"
     return routes
-
-
-@app.get("/test", include_in_schema=False)
-async def test_page() -> FileResponse:
-    """Serve the local end-to-end audio test console."""
-
-    if not _diagnostics_enabled():
-        raise HTTPException(status_code=404, detail="Not found.")
-    return FileResponse(
-        TEST_PAGE_PATH,
-        media_type="text/html; charset=utf-8",
-        headers={"Cache-Control": "no-store"},
-    )
-
-
-@app.get("/test/pcm-capture-worklet.js", include_in_schema=False)
-async def test_pcm_capture_worklet() -> FileResponse:
-    """Serve the local realtime PCM AudioWorklet module."""
-
-    if not _diagnostics_enabled():
-        raise HTTPException(status_code=404, detail="Not found.")
-    return FileResponse(
-        TEST_PCM_WORKLET_PATH,
-        media_type="application/javascript; charset=utf-8",
-        headers={"Cache-Control": "no-store"},
-    )
 
 
 @app.get("/health")
@@ -557,6 +599,13 @@ async def dependency_status() -> dict[str, object]:
     """Return public dependency readiness without exposing internal metadata."""
 
     return await _dependency_status(include_details=False)
+
+
+@app.get("/ready")
+async def readiness() -> Response:
+    body = await _dependency_status(include_details=False)
+    return Response(content=json.dumps(body), media_type="application/json",
+                    status_code=200 if body["status"] == "ready" else 503)
 
 
 @app.get("/api/v1/status/details")
@@ -604,9 +653,13 @@ def _public_dependency_result(result: dict[str, object]) -> dict[str, object]:
 async def _probe_dependency(client: httpx.AsyncClient, name: str, url: str) -> dict[str, object]:
     started = asyncio.get_running_loop().time()
     try:
-        response = await client.get(url)
-        response.raise_for_status()
-        body = response.json()
+        timeout = _read_float_env("GATEWAY_HEALTH_TIMEOUT_SECONDS", DEFAULT_HEALTH_TIMEOUT_SECONDS)
+        async with asyncio.timeout(timeout):
+            response = await client.get(url)
+            response.raise_for_status()
+            body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("Health response must be a JSON object")
         ready = bool(body.get("loaded")) if name == "tts" else body.get("status") == "ok"
         return {
             "name": name,
@@ -614,12 +667,14 @@ async def _probe_dependency(client: httpx.AsyncClient, name: str, url: str) -> d
             "latency_ms": round((asyncio.get_running_loop().time() - started) * 1000),
             "detail": body,
         }
-    except (httpx.HTTPError, TypeError, ValueError) as exc:
+    except (TimeoutError, httpx.HTTPError, TypeError, ValueError) as exc:
+        logger.warning("Dependency health probe failed service=%s error_type=%s", name, type(exc).__name__)
         return {
             "name": name,
             "ready": False,
             "latency_ms": round((asyncio.get_running_loop().time() - started) * 1000),
             "error": str(exc),
+            "error_type": type(exc).__name__,
         }
 
 
@@ -674,6 +729,8 @@ async def complete_text(request: ChatCompletionRequest, http_request: Request) -
 async def stream_text(request: ChatCompletionRequest, http_request: Request) -> StreamingResponse:
     """Stream a text turn as canonical Server-Sent Events."""
 
+    # 在开始输出 SSE 前校验身份并申请容量；lease 在整个生成器生命周期内持有。
+    # 文字接口关闭 output_audio，朗读由独立语音接口处理，而非隐式占用 TTS。
     _authorize_request_identity(request.user_id, http_request)
     lease = await _acquire_gateway_capacity(request.user_id)
     stream_request = ChatCompletionRequest(
@@ -691,6 +748,7 @@ async def stream_text(request: ChatCompletionRequest, http_request: Request) -> 
 
     async def event_source() -> AsyncIterator[str]:
         async with lease:
+            # 响应开始后不能再改 HTTP 状态码，后续故障通过标准 ERROR 事件通知客户端。
             try:
                 async for event in orchestrator.stream(stream_request):
                     yield sse_encode(event)
@@ -818,6 +876,8 @@ async def stream_speech(
 async def realtime_voice_completion(websocket: WebSocket) -> None:
     """Receive realtime PCM input and continue through the existing response pipeline."""
 
+    # 握手阶段有独立限额和超时，防止只建立连接却不发送 start 的客户端占满资源。
+    # WebSocket 接受连接不代表身份通过；必须核验首条消息中的用户和令牌。
     await websocket.accept()
     lease: Optional[ConcurrencyLease] = None
     handshake_acquired = False
@@ -843,6 +903,8 @@ async def realtime_voice_completion(websocket: WebSocket) -> None:
         handshake_acquired = False
         async with lease:
             lease = None
+            # 普通模式在录音结束后统一回复；continuous_turns 模式在 ASR 每次
+            # transcript.final 时回复一轮，并保留 session_id 供 LLM 延续记忆。
             segments = await _relay_realtime_asr(websocket, request)
             if not _continuous_realtime_turns(request):
                 await _complete_realtime_voice_turn(websocket, request, segments)
@@ -915,6 +977,8 @@ def _realtime_voice_request(start: RealtimeVoiceStart) -> RealtimeVoiceRequest:
 
 
 async def _relay_realtime_asr(websocket: WebSocket, request: RealtimeVoiceRequest) -> list[dict[str, Any]]:
+    # 两个协程分别上传音频和接收识别事件，避免等上传完毕才开始收结果。
+    # stop 表示输入完成，仍需等待 ASR 收尾；断开/cancel 才会取消另一侧任务。
     upstream_url = os.getenv("GATEWAY_ASR_REALTIME_URL", DEFAULT_ASR_REALTIME_URL)
     try:
         async with websocket_connect(
@@ -939,20 +1003,19 @@ async def _relay_realtime_asr(websocket: WebSocket, request: RealtimeVoiceReques
             )
             client_task = asyncio.create_task(_forward_realtime_audio(websocket, upstream))
             asr_task = asyncio.create_task(_collect_realtime_asr(websocket, upstream, request))
-            done, _ = await asyncio.wait({client_task, asr_task}, return_when=asyncio.FIRST_COMPLETED)
-            if asr_task in done:
-                if not client_task.done():
-                    client_task.cancel()
-                    await asyncio.gather(client_task, return_exceptions=True)
+            try:
+                done, _ = await asyncio.wait({client_task, asr_task}, return_when=asyncio.FIRST_COMPLETED)
+                if asr_task in done:
+                    return await asr_task
+                client_status = await client_task
+                if client_status == "disconnected":
+                    raise WebSocketDisconnect()
                 return await asr_task
-
-            client_status = await client_task
-            if client_status == "disconnected":
-                if not asr_task.done():
-                    asr_task.cancel()
-                    await asyncio.gather(asr_task, return_exceptions=True)
-                raise WebSocketDisconnect()
-            return await asr_task
+            finally:
+                for task in (client_task, asr_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(client_task, asr_task, return_exceptions=True)
     except WebSocketDisconnect:
         raise
     except ConnectionClosed as exc:
@@ -999,26 +1062,84 @@ async def _collect_realtime_asr(
     request: RealtimeVoiceRequest,
 ) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
-    async for raw in upstream:
-        if not isinstance(raw, str):
-            continue
-        body = json.loads(raw)
-        if not isinstance(body, dict):
-            raise HTTPException(status_code=502, detail="ASR realtime event must be a JSON object.")
-        event_type = str(body.get("type") or "")
-        await _safe_websocket_json(websocket, {"event": event_type, "data": body})
-        if event_type == "transcript.final" and str(body.get("text") or "").strip():
-            segments.append(body)
-            if _continuous_realtime_turns(request):
-                turn_request = _realtime_turn_request(request, len(segments))
-                await _complete_realtime_voice_turn(websocket, turn_request, [body])
-        if event_type == "session.done":
-            return segments
-    raise HTTPException(status_code=502, detail="ASR realtime connection ended before session.done.")
+    send_lock = asyncio.Lock()
+    response_task: asyncio.Task[None] | None = None
+    response_turn = 0
+    preview = VoicePreview(_realtime_turn_request(request, 1) if _continuous_realtime_turns(request) else request)
+
+    async def cancel_response() -> bool:
+        nonlocal response_task
+        if response_task is None:
+            return False
+        interrupted = not response_task.done()
+        if interrupted:
+            response_task.cancel()
+        await asyncio.gather(response_task, return_exceptions=True)
+        response_task = None
+        return interrupted
+
+    try:
+        async for raw in upstream:
+            if not isinstance(raw, str):
+                continue
+            body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=502, detail="ASR realtime event must be a JSON object.")
+            event_type = str(body.get("type") or "")
+            await _send_websocket_payload(websocket, {"event": event_type, "data": body}, send_lock)
+            if event_type == "transcript.partial" and (response_task is None or response_task.done()):
+                parts = [] if _continuous_realtime_turns(request) else [str(item.get("text") or "") for item in segments]
+                await preview.update(_join_realtime_transcripts([*parts, str(body.get("text") or "")]))
+            if event_type == "speech.started" and _realtime_barge_in_enabled(request):
+                interrupted_turn = response_turn
+                if await cancel_response():
+                    await _send_websocket_stream_event(
+                        websocket,
+                        _gateway_event(
+                            request,
+                            EventType.RESPONSE_INTERRUPTED,
+                            {"turn_number": interrupted_turn, "reason": "barge_in", "audio_cleared": True},
+                        ),
+                        send_lock,
+                    )
+            if event_type == "transcript.final" and str(body.get("text") or "").strip():
+                segments.append(body)
+                if _continuous_realtime_turns(request):
+                    if response_task is not None:
+                        if _realtime_barge_in_enabled(request):
+                            await cancel_response()
+                        else:
+                            await response_task
+                            response_task = None
+                    response_turn = len(segments)
+                    turn_request = _realtime_turn_request(request, response_turn)
+                    response_task = asyncio.create_task(
+                        _run_continuous_realtime_turn(websocket, turn_request, body, send_lock, preview)
+                    )
+                    preview = VoicePreview(_realtime_turn_request(request, response_turn + 1))
+                else:
+                    await preview.update(_join_realtime_transcripts([str(item.get("text") or "") for item in segments]))
+            if event_type == "session.done":
+                if response_task is not None:
+                    await response_task
+                    response_task = None
+                if not _continuous_realtime_turns(request):
+                    request.voice_preview_token = await preview.finish(
+                        _join_realtime_transcripts([str(item.get("text") or "") for item in segments])
+                    )
+                return segments
+        raise HTTPException(status_code=502, detail="ASR realtime connection ended before session.done.")
+    finally:
+        await cancel_response()
+        await preview.close()
 
 
 def _continuous_realtime_turns(request: RealtimeVoiceRequest) -> bool:
     return bool(request.metadata.get("continuous_turns", False))
+
+
+def _realtime_barge_in_enabled(request: RealtimeVoiceRequest) -> bool:
+    return _continuous_realtime_turns(request) and bool(request.metadata.get("barge_in", False))
 
 
 def _realtime_turn_request(request: RealtimeVoiceRequest, turn_number: int) -> RealtimeVoiceRequest:
@@ -1037,6 +1158,7 @@ async def _complete_realtime_voice_turn(
     websocket: WebSocket,
     request: RealtimeVoiceRequest,
     segments: Sequence[dict[str, Any]],
+    send_lock: asyncio.Lock | None = None,
 ) -> None:
     transcript = _join_realtime_transcripts([str(segment.get("text") or "") for segment in segments])
     if not transcript:
@@ -1050,6 +1172,7 @@ async def _complete_realtime_voice_turn(
         "emotion_hint": last_segment.get("emotion_hint"),
         "raw_text": last_segment.get("raw_text"),
         "clean_text": last_segment.get("clean_text") or transcript,
+        "corrections": last_segment.get("corrections") or [],
     }
     await _send_websocket_stream_event(
         websocket,
@@ -1064,15 +1187,60 @@ async def _complete_realtime_voice_turn(
                 "segments": list(segments),
             },
         ),
+        send_lock,
     )
     await _send_websocket_stream_event(
         websocket,
         _gateway_event(request, EventType.MESSAGE_STARTED, {"message_id": request.request_id}),
+        send_lock,
     )
 
     current_message = Message(role=MessageRole.USER, content=transcript, metadata={"asr": asr_details})
     async for event in _stream_voice_response(request, current_message):
-        await _send_websocket_stream_event(websocket, event)
+        await _send_websocket_stream_event(websocket, event, send_lock)
+
+
+async def _run_continuous_realtime_turn(
+    websocket: WebSocket,
+    request: RealtimeVoiceRequest,
+    segment: dict[str, Any],
+    send_lock: asyncio.Lock,
+    preview: VoicePreview | None = None,
+) -> None:
+    try:
+        if preview is not None:
+            request.voice_preview_token = await preview.finish(str(segment.get("text") or ""))
+        await _complete_realtime_voice_turn(websocket, request, [segment], send_lock)
+    except asyncio.CancelledError:
+        raise
+    except HTTPException as exc:
+        await _send_websocket_stream_event(
+            websocket,
+            _gateway_event(
+                request,
+                EventType.ERROR,
+                {
+                    "code": ErrorCode.INVALID_ARGUMENT if exc.status_code < 500 else ErrorCode.MODEL_UNAVAILABLE,
+                    "message": str(exc.detail),
+                    "retryable": exc.status_code >= 500,
+                },
+            ),
+            send_lock,
+        )
+    except Exception:
+        logger.exception("Continuous realtime voice turn failed request_id=%s", request.request_id)
+        await _send_websocket_stream_event(
+            websocket,
+            _gateway_event(
+                request,
+                EventType.ERROR,
+                {"code": ErrorCode.INTERNAL_ERROR, "message": "Voice response failed.", "retryable": True},
+            ),
+            send_lock,
+        )
+    finally:
+        if preview is not None:
+            await preview.close()
 
 
 def _join_realtime_transcripts(parts: Sequence[str]) -> str:
@@ -1087,8 +1255,24 @@ def _join_realtime_transcripts(parts: Sequence[str]) -> str:
     return result
 
 
-async def _send_websocket_stream_event(websocket: WebSocket, event: StreamEvent) -> None:
-    await websocket.send_json(_model_to_dict(event))
+async def _send_websocket_stream_event(
+    websocket: WebSocket,
+    event: StreamEvent,
+    send_lock: asyncio.Lock | None = None,
+) -> None:
+    await _send_websocket_payload(websocket, _model_to_dict(event), send_lock)
+
+
+async def _send_websocket_payload(
+    websocket: WebSocket,
+    payload: dict[str, Any],
+    send_lock: asyncio.Lock | None = None,
+) -> None:
+    if send_lock is None:
+        await websocket.send_json(payload)
+        return
+    async with send_lock:
+        await websocket.send_json(payload)
 
 
 async def _safe_websocket_json(websocket: WebSocket, payload: dict[str, Any]) -> None:
@@ -1132,6 +1316,8 @@ _VOICE_REFERENCE_METADATA: Metadata = {
 
 @dataclass
 class _TtsReferenceTextFilter:
+    # 仅过滤朗读分支的参考来源行，屏幕文字仍保留引用。
+    # 流式片段可能把“参考来源”拆开，因此保存行首状态，不能对每个片段独立替换。
     pending_prefix: str = ""
     mode: str = "detect"
 
@@ -1194,6 +1380,8 @@ async def _produce_voice_llm_events(
     event_queue: asyncio.Queue[StreamEvent | Exception | _VoiceProducerDone],
     segment_queue: asyncio.Queue[str | None],
 ) -> None:
+    # 一份 LLM 输出分两路：原文进入事件队列，适合朗读的句段进入 TTS 队列。
+    # message.done 只代表文字完成，不能据此关闭连接；音频可能仍在生成。
     tts_buffer = ""
     tts_segment_count = 0
     tts_reference_filter = _TtsReferenceTextFilter()
@@ -1239,8 +1427,10 @@ async def _produce_voice_llm_events(
     except Exception as exc:
         await event_queue.put(exc)
     finally:
-        await segment_queue.put(None)
-        await event_queue.put(_VoiceProducerDone("llm"))
+        task = asyncio.current_task()
+        if task is None or not task.cancelling():
+            await segment_queue.put(None)
+            await event_queue.put(_VoiceProducerDone("llm"))
 
 
 def _voice_audio_started_event(request: RealtimeVoiceRequest) -> StreamEvent:
@@ -1255,21 +1445,49 @@ def _voice_audio_started_event(request: RealtimeVoiceRequest) -> StreamEvent:
     )
 
 
+async def _queued_tts_segments(segment_queue: asyncio.Queue[str | None]) -> AsyncIterator[str]:
+    max_chars = min(_TTS_SEGMENT_MAX_CHARS, _read_int_env("GATEWAY_TTS_BATCH_MAX_CHARS", 80))
+    first = True
+    pending: str | None = None
+    ended = False
+    while not ended:
+        segment = pending if pending is not None else await segment_queue.get()
+        pending = None
+        if segment is None:
+            return
+        segment = _normalize_tts_spoken_text(segment)
+        if not segment:
+            continue
+        # Never delay the first segment or wait for text to fill a batch.
+        if not first:
+            while len(segment) < max_chars:
+                try:
+                    following = segment_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if following is None:
+                    ended = True
+                    break
+                following = _normalize_tts_spoken_text(following)
+                if len(segment) + len(following) > max_chars:
+                    pending = following
+                    break
+                segment += following
+        first = False
+        yield segment
+
+
 async def _produce_voice_tts_events(
     request: RealtimeVoiceRequest,
     segment_queue: asyncio.Queue[str | None],
     event_queue: asyncio.Queue[StreamEvent | Exception | _VoiceProducerDone],
 ) -> None:
+    # 按句段顺序合成，None 是上游结束标记，不是待朗读内容。
+    # 所有有效句段处理完才发 AUDIO_DONE，句段内的音频块由客户端逐块播放。
     audio_started = False
     segment_index = 0
     try:
-        while True:
-            segment = await segment_queue.get()
-            if segment is None:
-                break
-            segment = _normalize_tts_spoken_text(segment)
-            if not segment:
-                continue
+        async for segment in _queued_tts_segments(segment_queue):
             if not audio_started:
                 audio_started = True
                 await event_queue.put(_voice_audio_started_event(request))
@@ -1287,23 +1505,44 @@ async def _produce_voice_tts_events(
     except Exception as exc:
         await event_queue.put(exc)
     finally:
-        await event_queue.put(_VoiceProducerDone("tts"))
+        task = asyncio.current_task()
+        if task is None or not task.cancelling():
+            await event_queue.put(_VoiceProducerDone("tts"))
+
+
+def _voice_llm_request(request: RealtimeVoiceRequest, current_message: Message) -> LLMRequest:
+    return LLMRequest(
+        request_id=request.request_id, trace_id=request.trace_id,
+        session_id=request.session_id, user_id=request.user_id,
+        messages=[current_message], stream=True,
+        metadata={**request.metadata, **_VOICE_REFERENCE_METADATA},
+        voice_preview_token=request.voice_preview_token,
+    )
 
 
 async def _stream_voice_response(
     request: RealtimeVoiceRequest,
     current_message: Message,
-) -> AsyncIterator[StreamEvent]:
-    llm_metadata = {**request.metadata, **_VOICE_REFERENCE_METADATA}
-    llm_request = LLMRequest(
-        request_id=request.request_id,
-        trace_id=request.trace_id,
-        session_id=request.session_id,
-        user_id=request.user_id,
-        messages=[current_message],
-        stream=True,
-        metadata=llm_metadata,
+) -> AsyncGenerator[StreamEvent, None]:
+    keyword_filter_settings = KeywordFilterSettings.load()
+    keyword_filter_decision = await _evaluate_asr_keyword_filter(
+        request,
+        current_message.content,
+        keyword_filter_settings,
     )
+    if keyword_filter_decision.blocked:
+        async for event in _stream_keyword_filter_fallback(
+            request,
+            keyword_filter_settings.fallback_text,
+            keyword_filter_decision,
+        ):
+            yield event
+        return
+
+    # 只传当前消息与身份信息，历史和系统提示词由 LLM 服务补齐。
+    llm_request = _voice_llm_request(request, current_message)
+    # 有界队列形成背压：客户端或 TTS 变慢时让生产协程等待，避免无限积压。
+    # 两个生产者都结束才退出；异常或客户端取消时，finally 回收剩余任务。
     event_queue: asyncio.Queue[StreamEvent | Exception | _VoiceProducerDone] = asyncio.Queue(
         maxsize=_read_int_env("GATEWAY_VOICE_EVENT_QUEUE_SIZE", 64)
     )
@@ -1331,6 +1570,80 @@ async def _stream_voice_response(
         await asyncio.gather(*producers, return_exceptions=True)
 
 
+async def _evaluate_asr_keyword_filter(
+    request: RealtimeVoiceRequest,
+    transcript: str,
+    settings: KeywordFilterSettings,
+) -> KeywordFilterDecision:
+    if not settings.enabled:
+        return KeywordFilterDecision(blocked=False)
+    try:
+        async with _gateway_http_client(settings.timeout_seconds) as client:
+            decision = await check_keyword_filter(client, transcript, settings)
+    except KeywordFilterError as exc:
+        logger.warning(
+            "Keyword filter failed request_id=%s session_id=%s failure_mode=%s error=%s",
+            request.request_id,
+            request.session_id,
+            settings.failure_mode,
+            exc,
+        )
+        if settings.failure_mode == "open":
+            return KeywordFilterDecision(blocked=False, reason="filter_unavailable", failed=True)
+        return KeywordFilterDecision(blocked=True, reason="filter_unavailable", failed=True)
+
+    if decision.blocked:
+        logger.info(
+            "ASR transcript blocked request_id=%s session_id=%s matched_keyword_count=%d",
+            request.request_id,
+            request.session_id,
+            len(decision.matched_keywords),
+        )
+    return decision
+
+
+async def _stream_keyword_filter_fallback(
+    request: RealtimeVoiceRequest,
+    fallback_text: str,
+    decision: KeywordFilterDecision,
+) -> AsyncGenerator[StreamEvent, None]:
+    moderation = {
+        "blocked": True,
+        "provider_failed": decision.failed,
+        "reason": "filter_unavailable" if decision.failed else "keyword_match",
+        "matched_keyword_count": len(decision.matched_keywords),
+    }
+    yield _gateway_event(
+        request,
+        EventType.MESSAGE_DELTA,
+        {"text": fallback_text, "moderation": moderation},
+    )
+    yield _gateway_event(
+        request,
+        EventType.MESSAGE_DONE,
+        {
+            "message_id": request.request_id,
+            "finish_reason": "content_filter",
+            "usage": {},
+            "moderation": moderation,
+        },
+    )
+    if not request.output_audio:
+        return
+
+    yield _voice_audio_started_event(request)
+    segment_count = 0
+    for segment in _split_long_tts_text(fallback_text):
+        async for event in _stream_tts_segment(request, segment, segment_count):
+            yield event
+        segment_count += 1
+    yield _gateway_event(
+        request,
+        EventType.AUDIO_DONE,
+        {"segments": segment_count, "format": request.output_audio_config.format},
+    )
+
+
 async def _stream_tts_segment(
     request: RealtimeVoiceRequest,
     text: str,
@@ -1339,7 +1652,11 @@ async def _stream_tts_segment(
     if orchestrator.tts_provider is None:
         raise HTTPException(status_code=503, detail="TTS provider is not configured.")
     tts_metadata = dict(request.metadata)
-    tts_metadata.setdefault("chunk_size", _read_int_env("GATEWAY_TTS_STREAM_CHUNK_SIZE", 8))
+    chunk_size = _read_int_env("GATEWAY_TTS_STREAM_CHUNK_SIZE", 8)
+    if segment_index > 0:
+        # Later segments amortize codec decoding while the first segment plays.
+        chunk_size = _read_int_env("GATEWAY_TTS_CONTINUATION_CHUNK_SIZE", max(12, chunk_size))
+    tts_metadata.setdefault("chunk_size", chunk_size)
     tts_request = TTSRequest(
         request_id=request.request_id,
         trace_id=request.trace_id,
@@ -1351,6 +1668,8 @@ async def _stream_tts_segment(
         metadata=tts_metadata,
     )
     async for event in orchestrator.tts_provider.stream_synthesize(tts_request):
+        if event.event == EventType.ERROR:
+            raise HTTPException(status_code=502, detail="TTS stream failed.")
         if event.event != EventType.AUDIO_DELTA:
             continue
         data = dict(event.data)
@@ -1359,7 +1678,8 @@ async def _stream_tts_segment(
         yield _gateway_event(request, EventType.AUDIO_DELTA, data)
 
 
-_TTS_SENTENCE_BOUNDARY = re.compile(r"[。.！？!?；;\n]+")
+_TTS_SENTENCE_BOUNDARY = re.compile(r"[。！？!?；;\n]+|\.+")
+_TTS_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
 _TTS_SOFT_BOUNDARY = re.compile(r"[，,、：:]\s*")
 _TTS_SOFT_SEGMENT_MIN_CHARS = max(4, _read_int_env("GATEWAY_TTS_SOFT_SEGMENT_MIN_CHARS", 8))
 _TTS_FIRST_SEGMENT_CHARS = max(4, _read_int_env("GATEWAY_TTS_FIRST_SEGMENT_CHARS", 6))
@@ -1376,9 +1696,19 @@ def _extract_tts_segments(
     flush: bool = False,
     first: bool = False,
 ) -> tuple[list[str], str]:
+    # 返回“本次可送去合成的句段”和“需继续等待的尾部”，不是直接丢弃不完整句子。
+    # 首段使用更短阈值降低首音延迟，后续优先按标点分段；flush 在流结束时排空尾部。
     segments: list[str] = []
     start = 0
     for match in _TTS_SENTENCE_BOUNDARY.finditer(buffer):
+        if match.group() == ".":
+            if match.end() < len(buffer) and buffer[match.end()].isdigit():
+                continue
+            # The next model chunk may complete a decimal such as "3." + "14".
+            if not flush and match.end() == len(buffer):
+                previous = buffer[match.start() - 1] if match.start() else ""
+                if not (previous.isascii() and previous.isalpha()):
+                    continue
         segments.extend(_split_long_tts_text(buffer[start:match.end()]))
         start = match.end()
     remainder = buffer[start:]
@@ -1402,7 +1732,9 @@ def _extract_tts_segments(
             continue
         eager_segment_chars = _TTS_FIRST_SEGMENT_CHARS if first else _TTS_EAGER_SEGMENT_CHARS
         if len(remainder) >= eager_segment_chars:
-            segment, remainder = _take_tts_prefix(remainder, eager_segment_chars)
+            segment, remainder = _take_tts_prefix(remainder, eager_segment_chars, preserve_numbers=True)
+            if not segment:
+                break
             segments.append(segment)
             first = False
             continue
@@ -1417,17 +1749,33 @@ def _split_long_tts_text(text: str) -> list[str]:
     remaining = text.strip()
     parts: list[str] = []
     while len(remaining) > _TTS_SEGMENT_MAX_CHARS:
-        part, remaining = _take_tts_prefix(remaining)
+        part, remaining = _take_tts_prefix(remaining, preserve_numbers=True)
         parts.append(part)
     if remaining:
         parts.append(remaining)
     return parts
 
 
-def _take_tts_prefix(text: str, limit: int = _TTS_SEGMENT_MAX_CHARS) -> tuple[str, str]:
+def _take_tts_prefix(
+    text: str, limit: int = _TTS_SEGMENT_MAX_CHARS, *, preserve_numbers: bool = False,
+) -> tuple[str, str]:
     cut = text.rfind(" ", 0, limit + 1)
     if cut <= 0:
         cut = limit
+    if preserve_numbers:
+        if text.endswith(".") and len(text) <= limit and cut >= len(text) - 1 and not text[-2:-1].isdigit():
+            return "", text
+        if cut == len(text) and text.endswith(("+", "-")):
+            cut -= 1
+        for number in _TTS_NUMBER.finditer(text):
+            if number.start() < cut <= number.end():
+                if number.start() > 0:
+                    cut = number.start()
+                elif number.end() < len(text) and number.end() <= _TTS_SEGMENT_MAX_CHARS:
+                    cut = number.end()
+                elif len(text) < _TTS_SEGMENT_MAX_CHARS:
+                    return "", text
+                break
     return text[:cut].strip(), text[cut:].lstrip()
 
 
@@ -1495,6 +1843,7 @@ def _asr_document_to_response(request: ASRRequest, body: dict[str, Any]) -> ASRR
             emotion_hint=first.get("emotion_hint"),
             raw_text=first.get("raw_text"),
             clean_text=first.get("clean_text") or text,
+            corrections=first.get("corrections") or [],
         ),
         metadata={"provider": "http-asr", **(first.get("metadata") or {})},
     )

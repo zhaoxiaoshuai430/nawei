@@ -3,11 +3,86 @@
 Nawei is a five-service voice AI system:
 
 ```text
-Client -> Gateway -> ASR -> LLM -> TTS -> Gateway -> Client
+Robot -> Gateway -> ASR -> LLM -> TTS -> Gateway -> Robot
 ```
 
 The LLM service owns the internal Agent runtime, tools, and persistent memory.
 The current bundled TTS voice is `liliya`.
+
+The project exposes robot and backend APIs only. Browser chat, device pages,
+audio test pages and public tunnel launchers have been removed. See
+[robot integration](services/gateway/xiaozhi/README.md) for activation and binding
+without a webpage. Cloud IP deployment still requires the server address and TLS
+configuration; this cleanup does not deploy a server or flash the robot.
+
+See [cloud deployment and robot onboarding](deploy/CLOUD_DEPLOYMENT.md) for
+production configuration, offline models, HTTPS/WSS, migration and rollback.
+
+## Native Streaming Voice
+
+Windows startup now selects local Paraformer online for realtime ASR. Download
+its additional weights once, using the existing ASR virtual environment:
+
+```powershell
+.\services\asr\.venv\Scripts\python.exe scripts/prepare_streaming_asr.py --download
+```
+
+The model resides in `models/asr/paraformer-online` and keeps per-session decoder
+state. `/api/v1/asr/realtime` emits cumulative `transcript.partial` snapshots
+while audio is arriving and `transcript.final` after endpointing or stop.
+Clients replace a segment's partial text rather than appending each snapshot.
+The 600 ms decoding chunk is not a guarantee of first-text latency.
+
+Windows startup now defaults to `ASR_STREAMING_WORKERS=2`. Each worker loads its
+own Paraformer model and processes one audio chunk at a time; each connection
+stays with the same worker and retains its own decoder cache. `/health` exposes
+`streaming_concurrency` separately from SenseVoice's `concurrency` counters.
+Set `ASR_STREAMING_WORKERS=1` before startup to reduce model memory usage.
+The production template exposes the same setting when Paraformer is enabled.
+
+TTS still runs one generation per process to protect shared CUDA graph state.
+Its default waiting queue is now 16; this increases burst tolerance, not GPU
+throughput. Multiple TTS instances need sufficient GPU memory and routing.
+This configuration does not claim capacity for 20 simultaneous voice users.
+
+Gateway sends the first spoken segment immediately. Later segments already in
+the queue are combined up to `GATEWAY_TTS_BATCH_MAX_CHARS` (default `80`, capped
+at `450`) to reduce repeated synthesis setup for short sentences. Batching does
+not wait for more model output. Set the limit to `1` to disable combining;
+sentence-start events describe the combined spoken segment.
+
+With local services running and two streaming workers enabled, run the live
+two-robot check (uses real LLM requests and creates then removes test bindings):
+
+```powershell
+.\.venv\Scripts\python.exe scripts/check_robot_concurrency.py
+```
+
+The report in `.runtime/robot-concurrency/checks.json` records observed ASR/TTS
+activity and per-robot results. First-audio timings start after microphone input
+ends. This is a concurrency smoke check, not a sustained capacity benchmark.
+
+Robot Opus upload, native ASR, LLM text streaming and sentence-based streaming
+TTS form the realtime voice path. Responses still start from a finalized user
+turn; full-duplex listening, speculative answers and acoustic interruption are
+not added. Robot firmware already displays `stt` snapshots, so no protocol
+version change is required. Physical audio quality still requires hardware tests.
+
+SenseVoice HTTP uploads and `/api/v1/asr/realtime/sensevoice` remain available,
+including the original multilingual recognition. The new online model targets
+Chinese. Robot firmware displays partial transcripts through the `stt` protocol.
+
+Set `$env:ASR_REALTIME_BACKEND="sensevoice"` before starting/restarting ASR to
+restore the original realtime backend. Production Compose retains that default
+for existing installations; opt in with `ASR_REALTIME_BACKEND=paraformer` and
+rebuild the ASR image after downloading the model. Model files are never fetched
+automatically while serving requests.
+
+Acceptance (local transport, real models, simulated microphone/device):
+
+```powershell
+.\.venv\Scripts\python.exe scripts/check_native_streaming.py
+```
 
 ## Project Layout
 
@@ -28,7 +103,7 @@ tests/                  Cross-service protocol and deployment regression tests
 
 - Windows PowerShell
 - Python 3.11
-- Git LFS for bundled model files
+- Bundled local model files matching `models/manifest.json`
 - Docker for local PostgreSQL/Redis/Qdrant/Neo4j infrastructure and production Compose
 - Service-specific ASR and TTS Python environments
 
@@ -47,7 +122,7 @@ Create the local environment file:
 Copy-Item .env.example .env
 ```
 
-The local file is ignored by Git. The DeepSeek configuration uses:
+The local file contains private configuration and must not be shared. The DeepSeek configuration uses:
 
 ```dotenv
 LLM_PROVIDER=deepseek
@@ -60,16 +135,15 @@ Production configuration starts from `deploy/.env.production.example`.
 
 ## Model Files
 
-Download Git LFS objects and restore split model files before starting services:
+Validate local model files and restore available split weights before starting services:
 
 ```powershell
-git lfs pull
 .\.venv\Scripts\python.exe scripts\restore_models.py
 ```
 
-The repository tracks the Liliya model split parts through Git LFS. The restored
-`models/tts/liliya/checkpoint-epoch-1/model.safetensors` file is intentionally
-ignored because it can be reconstructed from the validated parts in
+This local distribution does not require Git history or an LFS object cache.
+Keep the complete `models/` directory, including the Liliya split weights used
+by the TTS container build. Sizes and SHA-256 checksums are recorded in
 `models/manifest.json`.
 
 ## Start Project
@@ -77,8 +151,73 @@ ignored because it can be reconstructed from the validated parts in
 The unified startup script restores models, starts PostgreSQL, Redis, Qdrant,
 and Neo4j, then starts ASR, Knowledge, LLM, TTS, and Gateway:
 
+Before reporting readiness, startup synthesizes a short local voice sample and
+transcribes it through HTTP ASR and every online ASR worker. This moves initial
+inference setup into startup without calling the LLM or creating conversation
+history. Results are saved to `.runtime/voice-warmup.json`; `-SkipWarmup` skips
+this step when needed.
+
+For local robot discovery, `.env.robot` can set `NAWEI_PUBLIC_ROBOT_URL=auto`
+and `XIAOZHI_PUBLIC_WEBSOCKET_URL=auto`. OTA then uses the address the client
+connected to, so local and LAN clients receive their respective WebSocket URL.
+The robot still needs a reachable initial OTA address. Production requires an
+explicit WSS endpoint and JWT authentication.
+
 Start Docker Desktop before running the script. If the Docker CLI is installed
 but its engine is unavailable, startup now stops with a direct diagnostic.
+
+Startup and service restart allow 900 seconds for cold model loading by default.
+Pass `-TimeoutSeconds` to change that deadline. Windows readiness checks inspect
+the JSON readiness fields, so an HTTP 200 with `degraded` or `loaded=false` does
+not count as ready. Gateway dependency probes allow 10 seconds by default,
+covering the LLM's nested memory and Knowledge checks; Windows callers wait 15
+seconds, and the production Gateway container health check allows 20 seconds.
+If overriding these budgets, keep each caller's deadline longer than its probe.
+LLM health checks probe memory and Knowledge concurrently. PostgreSQL readiness
+requires a successful `SELECT 1`, and `KNOWLEDGE_REQUIRED=true` makes a failed
+Knowledge probe mark the LLM as degraded. The Knowledge client requires both
+`status=ok` and `ready=true` and enforces a five-second total probe deadline.
+Memory initialization publishes connections only after schema setup or Redis
+ping succeeds. PostgreSQL connection and schema setup share a deadline of
+`MEMORY_CONNECT_TIMEOUT_SECONDS + 0.5` seconds; Redis setup uses
+`MEMORY_CONNECT_TIMEOUT_SECONDS`. Failed or cancelled setup releases its
+candidate connections. Redis failures close the failed client and wait for
+`MEMORY_RETRY_INTERVAL_SECONDS` (default 10 seconds) before reconnecting;
+concurrent callers share the same initialization attempt. When memory is
+required, LLM startup allows `LLM_MEMORY_STARTUP_TIMEOUT_SECONDS` (default 30
+seconds) for PostgreSQL and Redis to recover before failing startup.
+
+Gateway and LLM expose `/ready`, returning HTTP 503 when dependencies are not
+ready. Monitoring uses these endpoints and also checks Knowledge; Gateway
+`/health` remains a separate process liveness probe. WebSocket device registry
+access runs in worker threads, and read-only SQLite queries do not take write locks.
+
+History reads merge local messages still awaiting Redis persistence with shared
+history by message ID. Already persisted local entries do not override newer
+history from other workers. Background memory work is capped at
+`MEMORY_POST_TURN_MAX_PENDING` (64 per worker); admission waits when full, with
+`MEMORY_POST_TURN_TIMEOUT_SECONDS` (120 seconds) limiting admission and each task.
+Memory extraction stays within the tracked task. Runtime diagnostics include
+pending work, oldest age and failure count.
+
+On Windows, the multi-worker LLM uses a selector loop with a nonblocking
+cross-process accept mutex. Each callback rechecks listener readiness under
+the mutex and accepts at most one connection, preventing competing workers
+from blocking in `accept()` after another worker consumes the queued connection.
+
+Windows stop/restart scripts verify process ownership and drain all LLM workers
+before terminating them. A drain blocks new business requests and waits up to
+150 seconds for active requests and background work. Worker files live under
+the current runtime log directory. Missing worker reports, pending work or
+recorded persistence failures prevent an automatic stop; a failed drain resumes
+request admission. `-ForceStop` explicitly skips draining and can lose unfinished
+writes; it is also needed for the one-time transition from an older running
+process without drain support. Normal stops of updated processes need no flag.
+Process records are replaced atomically, retain a `.bak` copy, and are saved
+immediately after each launch so a readiness failure does not lose the new PID.
+Container shutdown allows 45 seconds for requests, 130 seconds for background
+memory work and a 210-second container grace period. These limits do not provide
+crash-proof delivery or a transaction spanning PostgreSQL and Redis.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_project.ps1
@@ -91,23 +230,57 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\status_project
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop_project.ps1
 ```
 
-## Browser Test Page
+## Robot Acceptance
 
-After Gateway starts in development mode, open the local end-to-end test console:
+### Voice Preview
 
-```text
-http://127.0.0.1:8000/test
+Voice preview is opt-in (`GATEWAY_VOICE_PREVIEW_ENABLED=true`). When enabled,
+robot and browser realtime voice requests prepare an answer after an ASR
+partial has remained unchanged for 250 ms (minimum six characters). Generation
+runs while audio is still being received; no answer text or audio is sent before
+the final transcript. Changed partials cancel the local preview. Only an exact
+final-text match can reuse a preview, with keyword and LLM safety checks applied
+again before delivery. Provisional answers do not write conversation history,
+long-term memory, or pending weather-query state.
+
+The default `GATEWAY_VOICE_PREVIEW_ENABLED=false` keeps streaming recognition
+and generates the answer after the final transcript, avoiding unused requests.
+The other
+`GATEWAY_VOICE_PREVIEW_*` settings in `.env.example` control the debounce, minimum
+length, per-turn attempt budget (four), and final wait budget (eight seconds).
+Gateway and LLM each allow at most two concurrent previews per process. Preview
+answers are buffered as text; TTS starts only after final validation. This can
+increase model usage, and latency savings depend on how stable ASR output is
+and how quickly the complete answer is generated. Timeout, missing cache,
+capacity exhaustion, or changed text falls back to normal generation.
+
+The LLM keeps up to 64 single-use preview results for 60 seconds. A different
+LLM worker or a restart can cause a cache miss and normal regeneration. Restart
+LLM and Gateway together when deploying this protocol change. Measure latency
+on real recordings; `Robot turn timing` includes `voice_preview_ready` and
+`voice_preview_attempts`, and reused LLM results report `voice_preview_used`.
+
+TTS uses `GATEWAY_TTS_STREAM_CHUNK_SIZE=8` for the first segment and
+`GATEWAY_TTS_CONTINUATION_CHUNK_SIZE=12` for subsequent segments. Explicit
+request metadata `chunk_size` overrides both. Compare actual synthesis latency
+and throughput before tuning these settings on a different GPU:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/benchmark_tts_stream.py --sizes 8 12 16
 ```
 
-The page supports uploaded WAV/MP3 audio and realtime microphone conversation.
-Both modes play TTS chunks as soon as the first streaming audio block arrives.
-It displays Gateway dependency latency plus file-read, ASR, LLM, TTS, first-token,
-first-audio, recording, and total elapsed times. Microphone access works on
-`localhost` or HTTPS origins.
+The benchmark writes timing results and playable WAV files to `.runtime/tts-speed`.
+It calls the real TTS service; run it without concurrent voice traffic.
 
-`GATEWAY_ENABLE_DIAGNOSTICS=true` enables `/test`, `/docs`, `/redoc`, and
-`/openapi.json` during development. These routes are always disabled when
-`NAWEI_ENV=production`.
+Run protocol checks against the local services:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/simulate_robot.py --rounds 20
+.\.venv\Scripts\python.exe scripts/check_full_flow.py
+```
+
+`GATEWAY_ENABLE_DIAGNOSTICS=true` enables the JSON `/openapi.json` schema during
+development. It is disabled in production. Gateway serves no HTML pages.
 
 Use `-SkipInfrastructure` only when externally managed PostgreSQL, Redis,
 Qdrant, and Neo4j instances are already configured.

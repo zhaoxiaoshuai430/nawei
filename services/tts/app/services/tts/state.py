@@ -15,6 +15,6 @@ loading: bool = False
 parakeet = None
 generation_capacity = GenerationCapacity(
     limit=1,
-    queue_limit=int(os.environ.get("TTS_MAX_QUEUE_SIZE", "8")),
+    queue_limit=int(os.environ.get("TTS_MAX_QUEUE_SIZE", "16")),
     wait_timeout_seconds=float(os.environ.get("TTS_QUEUE_TIMEOUT_SECONDS", "120")),
 )

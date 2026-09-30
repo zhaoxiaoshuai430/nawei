@@ -10,6 +10,8 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
+from services.llm.safety_replies import reply_for
+
 
 LOGGER = logging.getLogger("nawei.llm.safety")
 
@@ -119,16 +121,6 @@ _CRISIS_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("abuse.immediate_danger", re.compile(r"(?:(?:有人|家里人|爸爸|妈妈|老师).{0,8}(?:正在|要|威胁).{0,6}(?:打我|伤害我|杀我)|我现在.{0,6}(?:不安全|被打|被威胁))")),
 )
 
-_CATEGORY_RESPONSES = {
-    "self_harm": "我不能提供伤害自己的方法。现在最重要的是你的现实安全：请马上告诉身边可信任的成年人，例如家长、老师或监护人，先不要独处，并远离可能伤害自己的物品或地点。如果你已经受伤或准备马上行动，请立即联系当地急救或报警服务。你不需要独自处理这件事。",
-    "abuse": "如果你现在正被伤害、威胁或感到不安全，请先去有其他可信任成年人在场的安全地点，马上告诉家长、老师、监护人或其他能够到场帮助你的成年人。存在立即危险或已经受伤时，请联系当地报警或急救服务。",
-    "cyber": "我不能提供入侵、盗取账号或绕过安全验证的操作步骤。我可以改为讲解合法的防护、授权测试和漏洞修复方法。",
-    "danger": "我不能提供制造危险物品或武器的具体步骤。我可以讲解相关原理、风险和安全防护知识。",
-    "illegal": "我不能提供违法物品的制作或获取方法。我可以说明其危害、法律风险和预防知识。",
-    "sexual": "这个请求涉及未成年人性内容，我不能协助。可以改为讨论未成年人保护、健康教育或如何寻求帮助。",
-    "default": "这个请求包含我不能协助的高风险操作。我可以改为提供安全、合法的知识说明或预防建议。",
-}
-
 _BLOCKED_TOOL_VALUE = "[该字段已被本地安全规则移除]"
 _INJECTION_REPLACEMENT = "[外部指令已移除]"
 
@@ -140,6 +132,7 @@ class SafetyDecision:
     categories: tuple[str, ...] = ()
     rule_ids: tuple[str, ...] = ()
     content_hash: str = ""
+    external_review: dict[str, Any] | None = None
 
     @property
     def blocked(self) -> bool:
@@ -155,6 +148,7 @@ class SafetyDecision:
             "categories": list(self.categories),
             "rule_ids": list(self.rule_ids),
             "content_hash": self.content_hash,
+            **({"external_review": self.external_review} if self.external_review is not None else {}),
         }
 
 
@@ -183,11 +177,11 @@ class LocalSafetyGuard:
             return False
         return not stage or _read_bool_env(f"SAFETY_{stage.upper()}_ENABLED", True)
 
-    def audit_input(self, text: str) -> SafetyDecision:
-        return self._audit_text(text, stage="input", sanitize_injection=True)
+    def audit_input(self, text: str, *, age: int | None = None) -> SafetyDecision:
+        return self._audit_text(text, stage="input", sanitize_injection=True, age=age)
 
-    def audit_output(self, text: str) -> SafetyDecision:
-        return self._audit_text(text, stage="output")
+    def audit_output(self, text: str, *, age: int | None = None) -> SafetyDecision:
+        return self._audit_text(text, stage="output", age=age)
 
     def audit_tool_result(
         self,
@@ -227,9 +221,9 @@ class LocalSafetyGuard:
             rule_ids=tuple(sorted(rule_ids)),
         )
 
-    def refusal_for(self, categories: tuple[str, ...]) -> str:
+    def refusal_for(self, categories: tuple[str, ...], *, age: int | None = None) -> str:
         prefix = (categories[0] if categories else "default").split(".", 1)[0]
-        return _CATEGORY_RESPONSES.get(prefix, _CATEGORY_RESPONSES["default"])
+        return reply_for(prefix, age)
 
     def log(
         self,
@@ -252,7 +246,14 @@ class LocalSafetyGuard:
             ",".join(decision.rule_ids),
         )
 
-    def _audit_text(self, text: str, *, stage: str, sanitize_injection: bool = False) -> SafetyDecision:
+    def _audit_text(
+        self,
+        text: str,
+        *,
+        stage: str,
+        sanitize_injection: bool = False,
+        age: int | None = None,
+    ) -> SafetyDecision:
         original = str(text or "")
         if not self.enabled(stage):
             return SafetyDecision(ACTION_ALLOW, original, content_hash=_content_hash(original))
@@ -276,7 +277,7 @@ class LocalSafetyGuard:
             risk_categories = {rule_id.rsplit(".", 1)[0] for rule_id in risk_rules}
             return SafetyDecision(
                 ACTION_BLOCK,
-                self.refusal_for(tuple(sorted(risk_categories))),
+                self.refusal_for(tuple(sorted(risk_categories)), age=age),
                 categories=tuple(sorted(risk_categories)),
                 rule_ids=tuple(sorted(rule_ids | risk_rules)),
                 content_hash=_content_hash(original),
@@ -388,8 +389,10 @@ class SafetyStreamBuffer:
         guard: LocalSafetyGuard,
         max_chars: int | None = None,
         overlap_chars: int | None = None,
+        age: int | None = None,
     ) -> None:
         self.guard = guard
+        self.age = age
         self.max_chars = max(16, max_chars or _read_int_env("SAFETY_STREAM_BUFFER_CHARS", 24))
         requested_overlap = self.max_chars - 1 if overlap_chars is None else overlap_chars
         self.overlap_chars = min(max(8, requested_overlap), self.max_chars - 1)
@@ -404,7 +407,7 @@ class SafetyStreamBuffer:
         emitted: list[str] = []
         while self.pending:
             if len(self.pending) >= self.max_chars:
-                decision = self.guard.audit_output(self.pending)
+                decision = self.guard.audit_output(self.pending, age=self.age)
                 self._record(decision)
                 if decision.blocked or decision.changed:
                     self.blocked = decision.blocked
@@ -419,7 +422,7 @@ class SafetyStreamBuffer:
                     break
                 segment = self.pending[:boundary]
                 self.pending = self.pending[boundary:]
-            decision = self.guard.audit_output(segment)
+            decision = self.guard.audit_output(segment, age=self.age)
             self._record(decision)
             if decision.blocked:
                 self.blocked = True
@@ -433,7 +436,7 @@ class SafetyStreamBuffer:
     def finish(self) -> list[str]:
         if self.blocked or not self.pending:
             return []
-        decision = self.guard.audit_output(self.pending)
+        decision = self.guard.audit_output(self.pending, age=self.age)
         self.pending = ""
         self._record(decision)
         if decision.blocked:

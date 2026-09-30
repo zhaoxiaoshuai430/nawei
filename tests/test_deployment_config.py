@@ -5,11 +5,21 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from deploy.scripts.validate_production_env import validate_environment
 
 
 VALID_ENV = {
+    "NAWEI_DOMAIN": "voice.nawei.cn",
+    "TLS_EMAIL": "ops@nawei.cn",
+    "NAWEI_PUBLIC_ROBOT_URL": "https://voice.nawei.cn",
+    "XIAOZHI_PUBLIC_WEBSOCKET_URL": "wss://voice.nawei.cn/xiaozhi/v1/",
+    "XIAOZHI_ENABLED": "true",
+    "LLM_HOST": "0.0.0.0",
+    "EMBEDDING_API_BASE_URL": "https://embedding.nawei.cn/v1",
+    "EMBEDDING_MODEL": "bge-small-zh",
+    "EMBEDDING_DIMENSION": "512",
     "NAWEI_ENV": "production",
     "GATEWAY_AUTH_MODE": "jwt",
     "GATEWAY_ENABLE_DIAGNOSTICS": "false",
@@ -99,15 +109,20 @@ def test_production_compose_scopes_full_environment_to_config_check() -> None:
     assert 'GATEWAY_ENABLE_DIAGNOSTICS: "false"' in gateway
 
 
-def test_production_asr_requests_nvidia_gpu() -> None:
+def test_production_gpu_is_reserved_for_tts_with_streaming_cpu_asr() -> None:
     compose = (Path(__file__).resolve().parents[1] / "deploy" / "docker-compose.production.yml").read_text(
         encoding="utf-8"
     )
-    asr = compose.split("  asr:\n", 1)[1].split("  tts:\n", 1)[0]
-
-    assert "ASR_DEVICE: ${ASR_DEVICE:-cuda:0}" in asr
-    assert "driver: nvidia" in asr
-    assert "capabilities: [gpu]" in asr
+    services = yaml.safe_load(compose)["services"]
+    asr = services["asr"]
+    assert asr["environment"]["ASR_DEVICE"] == "${ASR_DEVICE:-cpu}"
+    assert asr["environment"]["ASR_REALTIME_BACKEND"] == "${ASR_REALTIME_BACKEND:-paraformer}"
+    assert "reservations" not in asr["deploy"]["resources"]
+    assert services["tts"]["deploy"]["resources"]["reservations"]["devices"][0]["capabilities"] == ["gpu"]
+    assert services["llm"]["environment"]["LLM_HOST"] == "0.0.0.0"
+    assert services["knowledge"]["build"]["target"] == "knowledge"
+    for name in ("gateway", "asr", "llm", "knowledge", "tts", "postgres", "redis", "qdrant", "neo4j"):
+        assert "ports" not in services[name]
 
 
 def test_deepseek_v4_pro_is_the_documented_default() -> None:
