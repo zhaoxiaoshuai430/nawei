@@ -29,6 +29,7 @@ deploy/backups/
 
 # Keep the source repository text-only; runtime assets are restored separately.
 *.wav
+*.ogg
 *.mp3
 *.mp4
 *.png
