@@ -3,99 +3,17 @@ from __future__ import annotations
 
 import base64
 import io
-import os
-import subprocess
-import tempfile
 
 import numpy as np
 import soundfile as sf
 
-DEFAULT_TARGET_SR = 16000
-_DEFAULT_WAV_SUFFIXES = frozenset({".wav"})
-
 
 class AudioFormatError(Exception):
-    """Raised when uploaded audio cannot be converted to mono WAV."""
+    """Raised when generated audio cannot satisfy the output format contract."""
 
     def __init__(self, detail: str) -> None:
         self.detail = detail
         super().__init__(detail)
-
-
-def prepare_wav_path(
-    content: bytes,
-    suffix: str,
-    *,
-    target_sr: int = DEFAULT_TARGET_SR,
-    wav_suffixes: frozenset[str] | set[str] | None = None,
-) -> tuple[str, list[str]]:
-    """Write bytes to a mono WAV file; returns path and temp files to delete."""
-    suffix = (suffix or ".wav").lower()
-    allowed = wav_suffixes if wav_suffixes is not None else _DEFAULT_WAV_SUFFIXES
-    cleanup: list[str] = []
-
-    if suffix in allowed:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(content)
-            cleanup.append(tmp.name)
-        return tmp.name, cleanup
-
-    with tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False) as src:
-        src.write(content)
-        src_path = src.name
-    cleanup.append(src_path)
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as dst:
-        dst_path = dst.name
-    cleanup.append(dst_path)
-
-    try:
-        import imageio_ffmpeg
-
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    except (ImportError, OSError, RuntimeError) as exc:
-        _cleanup_paths(cleanup)
-        raise AudioFormatError(
-            f"不支持的音频格式 {suffix}，请上传 WAV/MP3，或在 asr_env 安装 imageio-ffmpeg",
-        ) from exc
-
-    cmd = [ffmpeg, "-y", "-i", src_path, "-ar", str(target_sr), "-ac", "1", dst_path]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True)
-    except subprocess.CalledProcessError as exc:
-        _cleanup_paths(cleanup)
-        err = (exc.stderr or b"").decode("utf-8", errors="replace")[-400:]
-        raise AudioFormatError(f"音频解码失败（{suffix}）: {err or exc}") from exc
-    except OSError as exc:
-        _cleanup_paths(cleanup)
-        raise AudioFormatError(f"无法启动音频解码器（{suffix}）: {exc}") from exc
-
-    return dst_path, cleanup
-
-
-def bytes_to_wav_bytes(
-    content: bytes,
-    suffix: str,
-    *,
-    target_sr: int = 24000,
-) -> bytes:
-    """Convert uploaded audio bytes to mono PCM WAV (for TTS reference storage)."""
-    from pathlib import Path
-
-    path, cleanup = prepare_wav_path(content, suffix, target_sr=target_sr)
-    try:
-        return Path(path).read_bytes()
-    finally:
-        _cleanup_paths(cleanup)
-
-
-def _cleanup_paths(paths: list[str]) -> None:
-    for path in paths:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
 
 
 def encode_audio_b64(

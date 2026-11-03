@@ -38,8 +38,9 @@ class _ClosingStreamingResponse(StreamingResponse):
 
 @dataclass
 class RefAudioContext:
+    """Reference paths belong to the shared cache, not to one generation."""
+
     path: str | None
-    is_cached: bool
     ref_text: str
 
 
@@ -84,40 +85,32 @@ async def resolve_ref_audio(
     required: bool = False,
 ) -> RefAudioContext:
     tmp_path: str | None = None
-    tmp_is_cached = False
 
     if ref_preset and ref_preset in emotion_refs.emotion_refs:
         preset = emotion_refs.emotion_refs[ref_preset]
         tmp_path = preset["path"]
-        tmp_is_cached = True
         if not ref_text:
             ref_text = preset["ref_text"]
     elif ref_preset and ref_preset in preset_refs:
         preset = preset_refs[ref_preset]
         tmp_path = preset["path"]
-        tmp_is_cached = True
         if not ref_text:
             ref_text = preset["ref_text"]
     elif ref_audio and ref_audio.filename:
-        content = await ref_audio.read()
+        content = await ref_audio.read(MAX_AUDIO_BYTES + 1)
+        if not content:
+            raise HTTPException(status_code=400, detail="Reference audio is empty.")
         if len(content) > MAX_AUDIO_BYTES:
             raise HTTPException(
                 status_code=400,
                 detail=AUDIO_TOO_LARGE_MSG.format(size_mb=len(content) / 1024 / 1024),
             )
-        tmp_path = get_cached_ref_path(content)
-        tmp_is_cached = True
+        tmp_path = await run_blocking_until_complete(get_cached_ref_path, content)
 
     if required and not tmp_path:
         raise HTTPException(status_code=400, detail="Reference audio required.")
 
-    return RefAudioContext(path=tmp_path, is_cached=tmp_is_cached, ref_text=ref_text)
-
-
-def cleanup_ref_path(path: str | None, is_cached: bool) -> None:
-    if path and os.path.exists(path) and not is_cached:
-        os.unlink(path)
-
+    return RefAudioContext(path=tmp_path, ref_text=ref_text)
 
 
 async def generate_stream(
@@ -149,18 +142,18 @@ async def generate_stream(
         ref_text=ref_text,
         required=mode == "voice_clone",
     )
-    tmp_path, tmp_is_cached, ref_text = ctx.path, ctx.is_cached, ctx.ref_text
+    tmp_path, ref_text = ctx.path, ctx.ref_text
 
     loop = asyncio.get_event_loop()
-    queue: asyncio.Queue[str | None] = asyncio.Queue(
+    queue: asyncio.Queue[str] = asyncio.Queue(
         maxsize=int(os.environ.get("TTS_STREAM_QUEUE_SIZE", "8"))
     )
     stop_requested = threading.Event()
-    consumer_closed = threading.Event()
+    generation_finished = asyncio.Event()
     queue_put_timeout = float(os.environ.get("TTS_STREAM_QUEUE_PUT_TIMEOUT_SECONDS", "5"))
 
-    def put_stream_message(message: str | None, *, required: bool = True) -> None:
-        if stop_requested.is_set() and not required:
+    def put_stream_message(message: str, *, required: bool = True) -> None:
+        if stop_requested.is_set():
             return
         future = asyncio.run_coroutine_threadsafe(queue.put(message), loop)
         try:
@@ -172,7 +165,10 @@ async def generate_stream(
                 raise RuntimeError("TTS stream consumer is too slow.") from exc
 
     def run_generation():
+        gen = None
         try:
+            if stop_requested.is_set():
+                return
             model = state.model_cache.get(state.active_model_name)
             if model is None:
                 raise RuntimeError("No model loaded. Please load a model first.")
@@ -223,7 +219,7 @@ async def generate_stream(
             total_gen_ms = 0.0
             t0 = time.perf_counter()
 
-            first_audio = next(gen, None)
+            first_audio = next(gen, None) if not stop_requested.is_set() else None
             if first_audio is not None and not stop_requested.is_set():
                 audio_chunk, sr, timing = first_audio
                 voice_clone_ms, ttfa_ms, _ = stream_chunk_metrics(mode, timing)
@@ -254,9 +250,13 @@ async def generate_stream(
                 }
                 put_stream_message(json.dumps(payload))
 
-            for audio_chunk, sr, timing in gen:
+            while not stop_requested.is_set():
+                next_audio = next(gen, None)
+                if next_audio is None:
+                    break
                 if stop_requested.is_set():
                     break
+                audio_chunk, sr, timing = next_audio
                 total_gen_ms += timing.get("prefill_ms", 0) + timing.get("decode_ms", 0)
                 audio_chunk = concat_audio(audio_chunk)
                 dur = len(audio_chunk) / sr
@@ -302,14 +302,22 @@ async def generate_stream(
             except RuntimeError:
                 pass
         finally:
-            if not consumer_closed.is_set():
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop)
-            cleanup_ref_path(tmp_path, tmp_is_cached)
+            try:
+                close = getattr(gen, "close", None)
+                if close is not None:
+                    close()
+            except Exception:
+                logger.exception("Could not close TTS model generator")
+            finally:
+                # Completion must not wait for space in the audio queue.
+                loop.call_soon_threadsafe(generation_finished.set)
 
     async def sse():
         lease = None
         acquire_task = asyncio.create_task(state.generation_capacity.acquire())
         worker: threading.Thread | None = None
+        finished_task: asyncio.Task | None = None
+        read_task: asyncio.Task | None = None
         try:
             await asyncio.sleep(0)
             if not acquire_task.done():
@@ -321,19 +329,31 @@ async def generate_stream(
                 yield f"data: {json.dumps({'type': 'error', 'message': exc.reason, 'retry_after_seconds': exc.retry_after_seconds})}\n\n"
                 return
 
+            finished_task = asyncio.create_task(generation_finished.wait())
             worker = threading.Thread(target=run_generation, daemon=True)
             worker.start()
 
             while True:
-                msg = await queue.get()
-                if msg is None:
+                if generation_finished.is_set() and queue.empty():
                     break
-                yield f"data: {msg}\n\n"
+                read_task = asyncio.create_task(queue.get())
+                await asyncio.wait((read_task, finished_task), return_when=asyncio.FIRST_COMPLETED)
+                if read_task.done():
+                    yield f"data: {read_task.result()}\n\n"
+                    read_task = None
+                else:
+                    read_task.cancel()
+                    await asyncio.gather(read_task, return_exceptions=True)
+                    read_task = None
         finally:
-            consumer_closed.set()
             stop_requested.set()
             # StreamingResponse keeps cancelling awaits after a disconnect.
             with anyio.CancelScope(shield=True):
+                stream_tasks = [task for task in (read_task, finished_task) if task is not None]
+                for task in stream_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*stream_tasks, return_exceptions=True)
                 if not acquire_task.done():
                     acquire_task.cancel()
                 await asyncio.gather(acquire_task, return_exceptions=True)
@@ -384,7 +404,7 @@ async def generate_non_streaming(
         ref_text=ref_text,
         required=mode == "voice_clone",
     )
-    tmp_path, tmp_is_cached, ref_text = ctx.path, ctx.is_cached, ctx.ref_text
+    tmp_path, ref_text = ctx.path, ctx.ref_text
 
     def run():
         model = state.model_cache.get(state.active_model_name)
@@ -432,28 +452,25 @@ async def generate_non_streaming(
         return audio, sr, elapsed, dur
 
     lease = await _acquire_generation_capacity()
-    try:
-        async with lease:
-            audio, sr, elapsed, dur = await run_blocking_until_complete(run)
-        rtf = real_time_factor(generation_ms=elapsed * 1000, audio_seconds=dur)
-        audio_b64 = await run_blocking_until_complete(
-            encode_audio_b64,
-            audio,
-            sr,
-            output_format=audio_format,
-            target_sr=sample_rate,
-            channels=channels,
-        )
-        return JSONResponse({
-            "audio_b64": audio_b64,
-            "format": audio_format,
-            "sample_rate": sample_rate,
-            "channels": channels,
-            "metrics": {
-                "total_ms": round(elapsed * 1000),
-                "audio_duration_s": round(dur, 3),
-                "rtf": round(rtf, 3),
-            },
-        })
-    finally:
-        cleanup_ref_path(tmp_path, tmp_is_cached)
+    async with lease:
+        audio, sr, elapsed, dur = await run_blocking_until_complete(run)
+    rtf = real_time_factor(generation_ms=elapsed * 1000, audio_seconds=dur)
+    audio_b64 = await run_blocking_until_complete(
+        encode_audio_b64,
+        audio,
+        sr,
+        output_format=audio_format,
+        target_sr=sample_rate,
+        channels=channels,
+    )
+    return JSONResponse({
+        "audio_b64": audio_b64,
+        "format": audio_format,
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "metrics": {
+            "total_ms": round(elapsed * 1000),
+            "audio_duration_s": round(dur, 3),
+            "rtf": round(rtf, 3),
+        },
+    })

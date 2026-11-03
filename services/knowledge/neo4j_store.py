@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.knowledge.concurrency import gather_cancel_on_error
 from services.knowledge.schemas import GraphCandidate, KnowledgeGraphRelation, ResolvedKnowledgeEntity
 
 try:
@@ -124,67 +125,76 @@ class Neo4jKnowledgeStore:
         knowledge_base_id: str,
         candidates: list[GraphCandidate],
     ) -> list[ResolvedKnowledgeEntity]:
-        for candidate in candidates:
+        if not candidates:
+            return []
+
+        ordered_candidates = sorted(candidates, key=lambda item: item.priority)
+        candidate_payloads = []
+        for position, candidate in enumerate(ordered_candidates):
             canonical_names = {
                 _canonical_name(candidate.name),
                 *(_canonical_name(alias) for alias in candidate.aliases),
             }
             raw_names = {candidate.name.strip().lower(), *(alias.strip().lower() for alias in candidate.aliases)}
-            records, _, _ = await self.driver.execute_query(
-                """
-                MATCH (entity:Entity)
-                WHERE entity.knowledge_base_id = $knowledge_base_id
-                  AND (
-                    size($entity_types) = 0
-                    OR entity.entity_type IN $entity_types
-                  )
-                  AND (
-                    entity.canonical_name IN $canonical_names
-                    OR toLower(entity.name) IN $raw_names
-                    OR any(alias IN coalesce(entity.aliases, []) WHERE toLower(alias) IN $raw_names)
-                  )
-                RETURN entity.id AS entity_id,
-                       entity.name AS name,
-                       entity.canonical_name AS canonical_name,
-                       entity.entity_type AS entity_type,
-                       coalesce(entity.aliases, []) AS aliases
-                ORDER BY
-                    CASE WHEN entity.canonical_name = $candidate_canonical THEN 0 ELSE 1 END,
-                    entity.name
-                LIMIT 5
-                """,
-                knowledge_base_id=knowledge_base_id,
-                entity_types=candidate.entity_types,
-                canonical_names=sorted(canonical_names),
-                raw_names=sorted(raw_names),
-                candidate_canonical=_canonical_name(candidate.name),
-                database_=self.database,
+            candidate_payloads.append(
+                {
+                    "position": position,
+                    "name": candidate.name,
+                    "canonical_name": _canonical_name(candidate.name),
+                    "entity_types": candidate.entity_types,
+                    "canonical_names": sorted(canonical_names),
+                    "raw_names": sorted(raw_names),
+                }
             )
-            if not records:
-                continue
-            resolved: list[ResolvedKnowledgeEntity] = []
-            for record in records:
-                canonical_name = str(record["canonical_name"] or "")
-                match_level = (
-                    "exact_concept"
-                    if canonical_name == _canonical_name(candidate.name)
-                    else "exact_alias"
-                )
-                resolved.append(
-                    ResolvedKnowledgeEntity(
-                        entity_id=str(record["entity_id"]),
-                        name=str(record["name"]),
-                        canonical_name=canonical_name,
-                        entity_type=str(record["entity_type"]),
-                        aliases=[str(item) for item in record["aliases"] or []],
-                        match_level=match_level,
-                        candidate_name=candidate.name,
-                        confidence=1.0 if match_level == "exact_concept" else 0.95,
-                    )
-                )
-            exact_matches = [item for item in resolved if item.match_level == "exact_concept"]
-            return exact_matches[:1] or resolved[:1]
-        return []
+
+        records, _, _ = await self.driver.execute_query(
+            """
+            UNWIND $candidates AS candidate
+            MATCH (entity:Entity)
+            WHERE entity.knowledge_base_id = $knowledge_base_id
+              AND (
+                size(candidate.entity_types) = 0
+                OR entity.entity_type IN candidate.entity_types
+              )
+              AND (
+                entity.canonical_name IN candidate.canonical_names
+                OR toLower(entity.name) IN candidate.raw_names
+                OR any(alias IN coalesce(entity.aliases, []) WHERE toLower(alias) IN candidate.raw_names)
+              )
+            RETURN entity.id AS entity_id,
+                   entity.name AS name,
+                   entity.canonical_name AS canonical_name,
+                   entity.entity_type AS entity_type,
+                   coalesce(entity.aliases, []) AS aliases,
+                   candidate.name AS candidate_name,
+                   candidate.canonical_name AS candidate_canonical_name
+            ORDER BY candidate.position,
+                     CASE WHEN entity.canonical_name = candidate.canonical_name THEN 0 ELSE 1 END,
+                     entity.name
+            LIMIT 1
+            """,
+            knowledge_base_id=knowledge_base_id,
+            candidates=candidate_payloads,
+            database_=self.database,
+        )
+        if not records:
+            return []
+
+        record = records[0]
+        canonical_name = str(record["canonical_name"] or "")
+        match_level = "exact_concept" if canonical_name == str(record["candidate_canonical_name"]) else "exact_alias"
+        return [
+            ResolvedKnowledgeEntity(
+                entity_id=str(record["entity_id"]),
+                name=str(record["name"]),
+                canonical_name=canonical_name,
+                entity_type=str(record["entity_type"]),
+                aliases=[str(item) for item in record["aliases"] or []],
+                match_level=match_level,
+                candidate_name=str(record["candidate_name"]),
+                confidence=1.0 if match_level == "exact_concept" else 0.95,
+            )
+        ]
 
     async def expand_entities(
         self,
@@ -196,10 +206,11 @@ class Neo4jKnowledgeStore:
         if not entity_ids or depth <= 0:
             return {}
         max_depth = 1 if depth == 1 else 2
-        result: dict[str, list[KnowledgeGraphRelation]] = {}
-        for group_name, (relation_types, limit) in relation_groups.items():
-            if not relation_types or limit <= 0:
-                continue
+        async def expand_group(
+            group_name: str,
+            relation_types: list[str],
+            limit: int,
+        ) -> tuple[str, list[KnowledgeGraphRelation]]:
             records, _, _ = await self.driver.execute_query(
                 f"""
                 MATCH (seed:Entity)
@@ -222,7 +233,7 @@ class Neo4jKnowledgeStore:
                 limit=limit,
                 database_=self.database,
             )
-            result[group_name] = [
+            return group_name, [
                 KnowledgeGraphRelation(
                     source_id=str(record["source_id"]),
                     source_name=str(record["source_name"]),
@@ -238,7 +249,16 @@ class Neo4jKnowledgeStore:
                 )
                 for record in records
             ]
-        return result
+
+        jobs = [
+            expand_group(group_name, relation_types, limit)
+            for group_name, (relation_types, limit) in relation_groups.items()
+            if relation_types and limit > 0
+        ]
+        if not jobs:
+            return {}
+        expanded = await gather_cancel_on_error(*jobs)
+        return dict(expanded)
 
     async def expand(self, *, chunk_ids: list[str], depth: int = 2) -> list[KnowledgeGraphRelation]:
         if not chunk_ids or depth <= 0:

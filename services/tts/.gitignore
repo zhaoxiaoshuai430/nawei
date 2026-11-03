@@ -9,6 +9,8 @@ data/cache/
 data/logs/
 data/sessions/
 voice_lab/output/
+faster_qwen3_tts_ref_*.wav
+torchinductor_*/
 *.log
 *.tmp
 *.bak

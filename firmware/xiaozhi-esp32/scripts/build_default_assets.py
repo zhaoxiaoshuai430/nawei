@@ -31,7 +31,7 @@ def struct_pack_string(string, max_len=None):
     if max_len is None, max_len = len(string) + 1
     else len(string) < max_len, the left will be padded by struct.pack('x')
     """
-    if max_len == None :
+    if max_len is None:
         max_len = len(string)
     else:
         assert len(string) <= max_len
@@ -39,7 +39,7 @@ def struct_pack_string(string, max_len=None):
     left_num = max_len - len(string)
     out_bytes = None
     for char in string:
-        if out_bytes == None:
+        if out_bytes is None:
             out_bytes = struct.pack('b', ord(char))
         else:
             out_bytes += struct.pack('b', ord(char))
@@ -105,7 +105,7 @@ def pack_models(model_path, out_file="srmodels.bin"):
         
         for file_name in models[key]:
             model_bin += struct_pack_string(file_name, 32) # + file name
-            if data_bin == None:
+            if data_bin is None:
                 model_bin += struct.pack('I', header_len) 
                 data_bin = models[key][file_name]
                 model_bin += struct.pack('I', len(models[key][file_name]))
@@ -116,7 +116,7 @@ def pack_models(model_path, out_file="srmodels.bin"):
         
         out_bin += model_bin
     assert len(out_bin) == header_len
-    if data_bin != None:
+    if data_bin is not None:
         out_bin += data_bin
 
     out_file = os.path.join(model_path, out_file)

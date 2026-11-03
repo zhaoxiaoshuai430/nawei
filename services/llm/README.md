@@ -27,7 +27,8 @@ LLM API
   -> standalone Knowledge service (Qdrant + Neo4j)
   -> RuntimeToolAgent
   -> DeepSeek or Stub inference
-  -> Redis/PostgreSQL post-turn persistence
+  -> completed-turn history persistence, then optional background memory extraction
+  -> optional PostgreSQL-backed summary jobs and answer-time summary context
 ```
 
 ## Start
@@ -48,6 +49,7 @@ Start only LLM after configuring external storage:
 
 ```text
 GET    /health
+GET    /ready
 GET    /api/v1/llm/runtime
 POST   /api/v1/llm
 POST   /api/v1/llm/stream
@@ -115,9 +117,11 @@ their presence does not claim that every category is enabled or was tested live.
 
 Edit `safety_replies.json` to change Chinese fallback wording. Every category has
 `3_5`, `6_8`, `9_11`, `12_14`, `15_17`, `adult`, and `unknown` variants. Safety age
-is read from request metadata (`age`, `user_age`, or a birth-date field), then from
-the persistent profile; an existing grade is mapped to an age band when exact age is
-unavailable. Age changes wording only, never whether content is allowed or blocked.
+comes from the persistent profile first, including a grade-derived band when
+exact age is unavailable. Trusted internal metadata is a fallback only when
+the profile supplies no age; a profile lookup failure uses unknown age. Gateway
+strips client-supplied age, birth-date and grade metadata. Age changes wording
+only, never whether content is allowed or blocked.
 Category priority is self-harm support, violence, illegal activity, sexual content,
 sensitive content, privacy, profanity, and advertising. Operational failures have
 a separate age-aware reply. Local high-risk rules share the same reply table.
@@ -216,11 +220,32 @@ holding the invitation while emitting the body. Existing reference blocks are
 excluded from normalization. Final deltas, `message.done.text`, and persisted
 assistant text agree; Gateway's screen-only citation/TTS filtering is unchanged.
 
-`MEMORY_POST_TURN_ASYNC=true` caches history immediately and persists it in the
-background, maintaining user/assistant order and draining pending work on close.
+Recent user/assistant messages are written before a turn reports completion,
+with a five-second `MEMORY_HISTORY_WRITE_TIMEOUT_SECONDS` default deadline.
+`MEMORY_POST_TURN_ASYNC=true` runs subsequent memory extraction in the background,
+using a separate lock and draining pending extraction work on close.
 Fast turns default to `LLM_FAST_POST_TURN_MODE=history_only`; use `full` for memory
 extraction as well, or `off` to skip those writes. Async responses report
-`persistence.scheduled`, not a guarantee that the database write has finished.
-Persistence failures are logged. `MEMORY_POST_TURN_ASYNC=false` waits for writes.
+`persistence.saved_turn` for the history write and `persistence.scheduled` for
+background extraction. Development without shared storage remains local only.
+Persistence failures are logged. `MEMORY_POST_TURN_ASYNC=false` also waits for extraction.
 
 Focused verification: `.\.venv\Scripts\python.exe -m pytest tests/test_agent02_08_fusion.py`.
+# 阶段总结 Agent
+
+实现及迁移说明见 [summary/README.md](summary/README.md)。部署开关默认关闭；启用前通过迁移脚本依次执行 001、002、003 SQL，启动不会自动迁移。启用后新用户正常聊天即可自动使用总结，既有用户的关闭设置保留。总结维护带证据的行为画像，不修改正式人格字段或知识点掌握分数。
+
+### User profile and personality memory
+
+Formal personality data is stored only when the student explicitly describes
+or confirms a trait, for example `我的性格比较慢热`. The extractor does not
+turn a single answer, mood, silence, writing style, or assistant interpretation
+into a personality label. Confirmed traits are normalized and deduplicated under
+`profile.personality.confirmed` and included in the answer-time profile. Explicit
+corrections retire older conflicting personality facts.
+
+Long-term `behavior_observation` memories remain separate from formal
+personality data. They retain confidence and source evidence, including the
+original utterance and session, and can guide relevant replies without changing
+the personality profile. The summary agent follows the same rule and cannot
+promote an inferred personality into the formal profile.

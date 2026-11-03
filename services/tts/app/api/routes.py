@@ -149,7 +149,7 @@ def _authorize_model_load(request: Request, admin_key: Optional[str]) -> None:
         return
 
     configured_key = os.environ.get("TTS_ADMIN_API_KEY", "").strip()
-    if configured_key and admin_key and secrets.compare_digest(admin_key, configured_key):
+    if configured_key and admin_key and secrets.compare_digest(admin_key.encode("utf-8"), configured_key.encode("utf-8")):
         return
     raise HTTPException(
         status_code=403,

@@ -52,7 +52,7 @@ def build_assets(wakenet_model, text_font, emoji_collection, build_dir, final_di
     
     try:
         # Run build.py
-        result = subprocess.run(cmd, check=True, cwd=os.path.dirname(__file__))
+        subprocess.run(cmd, check=True, cwd=os.path.dirname(__file__))
         
         # Generate output filename
         output_name = f"{wakenet_model}-{text_font}-{emoji_collection}.bin"
@@ -66,7 +66,7 @@ def build_assets(wakenet_model, text_font, emoji_collection, build_dir, final_di
             print(f"✓ 成功生成: {output_name}")
             return True
         else:
-            print(f"✗ 错误: 未找到生成的 assets.bin 文件")
+            print("✗ 错误: 未找到生成的 assets.bin 文件")
             return False
             
     except subprocess.CalledProcessError as e:
@@ -126,7 +126,7 @@ def main():
                 if build_assets(wakenet_model, text_font, emoji_collection, build_dir, final_dir):
                     successful_builds += 1
     
-    print(f"\n构建完成!")
+    print("\n构建完成!")
     print(f"成功构建: {successful_builds}/{total_combinations}")
     print(f"输出文件位置: {final_dir}")
     

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from services.knowledge.cache import KnowledgeCache
 from services.knowledge.config import load_settings
 from services.knowledge.embeddings import HashEmbeddingProvider
 from services.knowledge.extractor import RuleGraphExtractor
+from services.knowledge.neo4j_store import Neo4jKnowledgeStore
 from services.knowledge.qdrant_store import _lexical_score, _lexical_terms
 from services.knowledge.schemas import (
     GraphCandidate,
@@ -346,6 +348,32 @@ async def test_knowledge_cache_falls_back_when_redis_fails() -> None:
 
 
 @pytest.mark.asyncio
+async def test_knowledge_cache_invalidates_keys_in_batches() -> None:
+    class Redis:
+        def __init__(self) -> None:
+            self.deleted: list[list[str]] = []
+
+        async def scan_iter(self, *, match: str):
+            for index in range(205):
+                yield f"{match}:{index}"
+
+        async def delete(self, *keys: str) -> None:
+            self.deleted.append(list(keys))
+
+        async def aclose(self) -> None:
+            return None
+
+    cache = KnowledgeCache("redis://example.invalid/0", 60)
+    redis = Redis()
+    cache.redis = redis
+
+    await cache.invalidate_base("default")
+
+    assert [len(batch) for batch in redis.deleted] == [100, 100, 5, 100, 100, 5]
+    assert sum(len(batch) for batch in redis.deleted) == 410
+
+
+@pytest.mark.asyncio
 async def test_retrieval_anchor_filters_unrelated_chunks_before_graph_expansion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -450,6 +478,180 @@ async def test_graph_candidate_resolves_before_filtered_qdrant_search(
     assert context.relation_groups["taxonomy"][0].source_name == "三角学"
     assert context.metadata["graph_match_level"] == "exact_concept"
     assert context.metadata["grounding_status"] == "grounded"
+
+
+@pytest.mark.asyncio
+async def test_retrieval_overlaps_independent_preparation_and_graph_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "hash")
+    monkeypatch.setenv("EMBEDDING_DIMENSION", "64")
+    service = KnowledgeService(load_settings())
+    qdrant = FakeQdrantStore()
+    neo4j = FakeNeo4jStore()
+    neo4j.resolved_entities = [
+        ResolvedKnowledgeEntity(
+            entity_id="trigonometry-entity",
+            name="三角函数",
+            canonical_name="三角函数",
+            entity_type="Concept",
+            match_level="exact_concept",
+            candidate_name="三角函数",
+        )
+    ]
+    qdrant.search_hits = [
+        KnowledgeChunkHit(
+            chunk_id="trigonometry",
+            document_id="math",
+            title="三角函数基础知识包",
+            text="三角函数描述角与边长比例之间的关系。",
+            score=0.98,
+        )
+    ]
+    service.qdrant = qdrant  # type: ignore[assignment]
+    service.neo4j = neo4j  # type: ignore[assignment]
+
+    class CacheMiss:
+        async def get(self, **kwargs: Any) -> None:
+            return None
+
+        async def set(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    service.cache = CacheMiss()  # type: ignore[assignment]
+
+    started = {"preparation": set(), "graph": set()}
+    barriers = {name: asyncio.Event() for name in started}
+
+    async def meet(stage: str, operation: str) -> None:
+        started[stage].add(operation)
+        if len(started[stage]) == 2:
+            barriers[stage].set()
+        await asyncio.wait_for(barriers[stage].wait(), timeout=1)
+
+    async def resolve_entities(**kwargs: Any) -> list[ResolvedKnowledgeEntity]:
+        await meet("preparation", "entity_resolution")
+        return neo4j.resolved_entities
+
+    async def expand_entities(**kwargs: Any) -> dict[str, list[KnowledgeGraphRelation]]:
+        await meet("graph", "entity_expansion")
+        return {}
+
+    async def expand(**kwargs: Any) -> list[KnowledgeGraphRelation]:
+        await meet("graph", "chunk_expansion")
+        return []
+
+    class ConcurrentEmbeddingProvider:
+        dimension = 64
+        model_id = "parallel-test"
+
+        async def embed(self, texts: list[str]) -> list[list[float]]:
+            await meet("preparation", "embedding")
+            return [[0.0] * self.dimension for _ in texts]
+
+    monkeypatch.setattr(neo4j, "resolve_entities", resolve_entities)
+    monkeypatch.setattr(neo4j, "expand_entities", expand_entities)
+    monkeypatch.setattr(neo4j, "expand", expand)
+    service.embeddings = ConcurrentEmbeddingProvider()  # type: ignore[assignment]
+
+    context = await service.retrieve(
+        KnowledgeRetrieveRequest(
+            query="三角函数是什么？",
+            graph_candidates=[GraphCandidate(name="三角函数", entity_types=["Concept"])],
+        )
+    )
+
+    assert started["preparation"] == {"entity_resolution", "embedding"}
+    assert started["graph"] == {"entity_expansion", "chunk_expansion"}
+    assert context.metadata["timings_ms"]["pre_search_preparation"] >= 0
+    assert context.metadata["timings_ms"]["graph_expansion"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_graph_candidate_resolution_uses_one_ordered_query() -> None:
+    class Driver:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def execute_query(self, query: str, **kwargs: Any) -> tuple[list[dict[str, Any]], None, None]:
+            self.calls.append((query, kwargs))
+            return (
+                [
+                    {
+                        "entity_id": "preferred-entity",
+                        "name": "三角学",
+                        "canonical_name": "三角学",
+                        "entity_type": "Concept",
+                        "aliases": ["三角函数"],
+                        "candidate_name": "优先候选",
+                        "candidate_canonical_name": "优先候选",
+                    }
+                ],
+                None,
+                None,
+            )
+
+    driver = Driver()
+    store = object.__new__(Neo4jKnowledgeStore)
+    store.driver = driver
+    store.database = "neo4j"
+
+    resolved = await store.resolve_entities(
+        knowledge_base_id="default",
+        candidates=[
+            GraphCandidate(name="低优先候选", priority=2),
+            GraphCandidate(name="优先候选", aliases=["三角函数"], priority=1),
+        ],
+    )
+
+    assert len(driver.calls) == 1
+    query, parameters = driver.calls[0]
+    assert "UNWIND $candidates AS candidate" in query
+    assert "ORDER BY candidate.position" in query
+    assert "LIMIT 1" in query
+    assert [item["name"] for item in parameters["candidates"]] == ["优先候选", "低优先候选"]
+    assert resolved[0].candidate_name == "优先候选"
+    assert resolved[0].match_level == "exact_alias"
+    assert resolved[0].confidence == 0.95
+
+
+@pytest.mark.asyncio
+async def test_graph_expansion_runs_relation_groups_concurrently() -> None:
+    class Driver:
+        def __init__(self) -> None:
+            self.started: set[str] = set()
+            self.ready = asyncio.Event()
+
+        async def execute_query(self, query: str, **kwargs: Any) -> tuple[list[dict[str, Any]], None, None]:
+            group = str(kwargs["relation_types"][0])
+            self.started.add(group)
+            if len(self.started) == 2:
+                self.ready.set()
+            await asyncio.wait_for(self.ready.wait(), timeout=1)
+            return ([{
+                "source_id": "source",
+                "source_name": group,
+                "relation_type": group,
+                "target_id": "target",
+                "target_name": "target",
+                "confidence": 1.0,
+                "evidence_chunk_id": None,
+            }], None, None)
+
+    driver = Driver()
+    store = object.__new__(Neo4jKnowledgeStore)
+    store.driver = driver
+    store.database = "neo4j"
+
+    result = await store.expand_entities(
+        entity_ids=["entity"],
+        relation_groups={"taxonomy": (["TAXONOMY"], 2), "history": (["HISTORY"], 2)},
+        depth=2,
+    )
+
+    assert driver.started == {"TAXONOMY", "HISTORY"}
+    assert set(result) == {"taxonomy", "history"}
+    assert result["taxonomy"][0].relation_type == "TAXONOMY"
 
 
 @pytest.mark.asyncio

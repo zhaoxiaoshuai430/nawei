@@ -11,7 +11,6 @@ from typing import Any, Callable
 
 
 CALC_MARKERS = ("计算", "算一下", "等于多少", "是多少", "平方根", "开方")
-CHINESE_OPERATOR_PATTERN = re.compile(r"乘以|加上|减去|除以|[乘加减除]")
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z_])(?:\d+(?:\.\d*)?|\.\d+)")
 
 ALLOWED_BINARY: dict[type[ast.operator], Callable[[float, float], float]] = {

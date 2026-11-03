@@ -74,14 +74,16 @@ export NAWEI_SMOKE_TOKEN="$(docker compose --env-file deploy/.env.production \
   --base-url https://voice.your-domain.cn --user-id robot-owner
 ```
 
-机器人固件 `ROBOT/sdkconfig` 设置：
+当前固件源码在 `firmware/xiaozhi-esp32`，没有 `ROBOT/` 目录。先通过其板型配置或 menuconfig 设置：
 
 ```ini
-CONFIG_NAWEI_BACKEND=y
+CONFIG_NAWEI_SERVER_MODE=y
 CONFIG_OTA_URL="https://voice.your-domain.cn/xiaozhi/ota/"
 ```
 
-在已有 ESP-IDF 环境的 Windows 开发机运行 `ROBOT/scripts/build_nawei.ps1`，按设备现有烧录流程更新。不要将用户 JWT 或内部服务密钥写入固件。
+固件要求 ESP-IDF >= 6.0.1，推荐 6.1；在固件目录使用 `python scripts/build.py --list-boards` 确认真实板型，再按固件 README 的板型/variant 流程构建和烧录。不要将用户 JWT 或内部服务密钥写入固件。
+
+**当前实体接入缺口：** 这份固件的 `main/ota.cc` 尚未发送后端默认要求的 `X-Device-Key`，仅修改 OTA 地址仍会返回 401。必须先实现设备独立初始化密钥的持久化和 OTA 请求头，再进行下面的绑定流程。协议模拟器已实现该请求头，不能用模拟器通过代替这份固件的激活验收。详见 [机器人协议说明](../services/gateway/xiaozhi/README.md)。
 
 设备联网后取得激活码。使用上面的用户 JWT 调用 `POST /api/v1/devices/bind`，JSON 为 `{"code":"设备给出的激活码","name":"我的机器人"}`。例如在受控终端中执行：
 

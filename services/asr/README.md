@@ -1,6 +1,8 @@
 # ASR Service
 
-Standalone SenseVoice ASR service. In the integrated project, Gateway calls this service through the standard `ASRRequest` / `ASRResponse` JSON protocol.
+ASR service with SenseVoice for complete-audio recognition and Paraformer Online
+for native Chinese streaming. Gateway uses `ASRRequest` / `ASRResponse` for HTTP
+uploads and PCM16 WebSocket events for realtime recognition.
 
 ## Runtime
 
@@ -12,7 +14,8 @@ Standalone SenseVoice ASR service. In the integrated project, Gateway calls this
 | Model | `iic/SenseVoiceSmall` |
 | Code default device | `cuda:0` |
 | Unified startup device | `cpu` |
-| Local model/cache path | `hf_download` |
+| Local model path | Repository `models/asr/` (SenseVoiceSmall, fsmn-vad, paraformer-online) |
+| Download cache | `services/asr/hf_download` |
 
 ## Start
 
@@ -177,14 +180,17 @@ not advertised.
 The service sets ModelScope and HuggingFace cache variables to project-local paths under `hf_download` so it does not write to the Windows user cache directory. Complete local snapshots are preferred automatically, and routine FunASR/ModelScope update checks are disabled during service startup.
 # Native online ASR
 
-The Windows launcher selects `ASR_REALTIME_BACKEND=paraformer`; direct standalone
-launch and production Compose retain `sensevoice` unless explicitly configured.
+The Windows launcher and production Compose default to `ASR_REALTIME_BACKEND=paraformer`.
+The direct standalone Python entry defaults to `sensevoice` unless explicitly configured.
 Prepare the additional model with `scripts/prepare_streaming_asr.py --download`
 using the ASR interpreter from the project root.
 
 - `ASR_STREAMING_MODEL_PATH`: local `models/asr/paraformer-online` directory.
 - `ASR_STREAMING_DEVICE`: `cpu` by default, separate from the SenseVoice device.
 - `ASR_STREAMING_THREADS`: `2` by default.
+- `ASR_STREAMING_WORKERS`: direct code default `1`; Windows launcher and production
+  template default `2`. These are independent model instances inside one ASR
+  process, with per-connection pinning and serialized decoding per instance.
 - Realtime input: 16 kHz, mono, little-endian PCM16; packets up to 32000 bytes.
 - Native decoding: `[0, 10, 5]` chunks, 600 ms stride, connection-local caches.
 - `transcript.partial.text` is the current segment's complete snapshot, not a delta.

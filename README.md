@@ -3,11 +3,18 @@
 Nawei is a five-service voice AI system:
 
 ```text
-Robot -> Gateway -> ASR -> LLM -> TTS -> Gateway -> Robot
+Client -> Gateway -> ASR -> LLM -> TTS -> Gateway -> Client
+                            |
+                            +-> Knowledge (Qdrant + Neo4j)
 ```
 
 The LLM service owns the internal Agent runtime, tools, and persistent memory.
 The current bundled TTS voice is `liliya`.
+
+The optional summary worker also runs inside LLM. Enable it only after the
+explicit 001/002/003 migrations; deployment templates keep it disabled. See
+[summary configuration](services/llm/summary/README.md) for evidence, budgets,
+online use and deletion semantics.
 
 The project exposes robot and backend APIs only. Browser chat, device pages,
 audio test pages and public tunnel launchers have been removed. See
@@ -63,19 +70,22 @@ activity and per-robot results. First-audio timings start after microphone input
 ends. This is a concurrency smoke check, not a sustained capacity benchmark.
 
 Robot Opus upload, native ASR, LLM text streaming and sentence-based streaming
-TTS form the realtime voice path. Responses still start from a finalized user
-turn; full-duplex listening, speculative answers and acoustic interruption are
-not added. Robot firmware already displays `stt` snapshots, so no protocol
-version change is required. Physical audio quality still requires hardware tests.
+TTS form the realtime voice path. By default, answers are generated after a
+finalized user turn. Optional voice preview can prepare an answer from stable
+partials, but never delivers it before final validation. The generic realtime
+API supports opt-in continuous turns and barge-in; robot transport can cancel
+playback on a new listen command. These transport features do not establish
+working acoustic echo cancellation or physical full-duplex performance. The
+bundled firmware still needs OTA device-key adaptation; see the robot guide.
 
 SenseVoice HTTP uploads and `/api/v1/asr/realtime/sensevoice` remain available,
 including the original multilingual recognition. The new online model targets
 Chinese. Robot firmware displays partial transcripts through the `stt` protocol.
 
 Set `$env:ASR_REALTIME_BACKEND="sensevoice"` before starting/restarting ASR to
-restore the original realtime backend. Production Compose retains that default
-for existing installations; opt in with `ASR_REALTIME_BACKEND=paraformer` and
-rebuild the ASR image after downloading the model. Model files are never fetched
+restore the original realtime backend. Production Compose defaults to Paraformer;
+set `ASR_REALTIME_BACKEND=sensevoice` to use the original backend. Rebuild the ASR
+image after downloading the online model. Model files are never fetched
 automatically while serving requests.
 
 Acceptance (local transport, real models, simulated microphone/device):
@@ -89,12 +99,13 @@ Acceptance (local transport, real models, simulated microphone/device):
 ```text
 app_protocols/          Shared request, response, and streaming event models
 services/gateway/       Public HTTP/WebSocket gateway, port 8000
-services/asr/           SenseVoice speech recognition, port 8001
+services/asr/           Paraformer online + SenseVoice recognition, port 8001
 services/llm/           DeepSeek, Agent, tools, and memory, port 8002
 services/knowledge/     Qdrant + Neo4j GraphRAG service, port 8003
 services/tts/           Qwen3-TTS with the Liliya voice, port 19000
 deploy/                 Production containers, Compose, and dependencies
-models/                 Git LFS model manifests and split model files
+models/                 Local model assets, manifest, and split weight files
+firmware/xiaozhi-esp32/ ESP-IDF firmware sources and board build tools
 scripts/                Start, stop, status, model restore, and project checks
 tests/                  Cross-service protocol and deployment regression tests
 ```
@@ -149,7 +160,8 @@ by the TTS container build. Sizes and SHA-256 checksums are recorded in
 ## Start Project
 
 The unified startup script restores models, starts PostgreSQL, Redis, Qdrant,
-and Neo4j, then starts ASR, Knowledge, LLM, TTS, and Gateway:
+and Neo4j, then launches ASR, TTS, Knowledge, LLM, and Gateway processes in that
+order. Model loading continues concurrently; the script waits for all services:
 
 Before reporting readiness, startup synthesizes a short local voice sample and
 transcribes it through HTTP ASR and every online ASR worker. This moves initial
@@ -219,6 +231,23 @@ Container shutdown allows 45 seconds for requests, 130 seconds for background
 memory work and a 210-second container grace period. These limits do not provide
 crash-proof delivery or a transaction spanning PostgreSQL and Redis.
 
+Completed turns now wait for recent conversation messages to be written before
+returning completion. `MEMORY_HISTORY_WRITE_TIMEOUT_SECONDS` defaults to five
+seconds; write failures are reported instead of acknowledging completion.
+Long-term memory extraction still runs in the bounded background queue and uses
+a separate lock, so slow extraction does not delay recent history writes.
+Development mode without shared storage still only provides process-local history.
+
+Gateway removes client-supplied age, birth-date and grade fields from metadata
+before forwarding requests. Configure audience identity through the trusted LLM
+profile interface. Stored profile age takes priority over internal evaluation hints.
+
+Knowledge imports and deletes exclude concurrent operations on the same document.
+Contention returns HTTP 503 and can be retried after the current operation finishes.
+With PostgreSQL enabled, the exclusion also spans Knowledge processes. Cancelled
+imports retain the guard while cleanup runs, with a 15-second cleanup deadline.
+Forced termination can still leave partial indexes; these require retry or deletion.
+
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_project.ps1
 ```
@@ -235,7 +264,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop_project.p
 ### Voice Preview
 
 Voice preview is opt-in (`GATEWAY_VOICE_PREVIEW_ENABLED=true`). When enabled,
-robot and browser realtime voice requests prepare an answer after an ASR
+robot and generic realtime voice requests prepare an answer after an ASR
 partial has remained unchanged for 250 ms (minimum six characters). Generation
 runs while audio is still being received; no answer text or audio is sent before
 the final transcript. Changed partials cancel the local preview. Only an exact
@@ -334,7 +363,7 @@ cd D:\daima\nawei
 | 8002 | LLM | DeepSeek, Agent, tools, and memory |
 | 8003 | Knowledge | Qdrant vector retrieval and Neo4j graph expansion |
 | 19000 | TTS | Liliya speech synthesis |
-| 5432 | PostgreSQL | Persistent LLM memory |
+| 5432 | PostgreSQL | LLM memory, summary jobs/evidence, and Knowledge catalog |
 | 6379 | Redis | Session and profile cache |
 | 6333 | Qdrant | Knowledge chunk vectors and payloads |
 | 7474/7687 | Neo4j | Browser and Bolt knowledge graph access |
@@ -375,7 +404,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check_project.
 
 The script runs Python compilation, Ruff, Mypy, main tests, tracked-secret
 scanning, ASR tests, TTS tests, PowerShell parsing, and Docker Compose
-validation. When all four services are running, include health checks with:
+validation. When all five services are running, include health checks with:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check_project.ps1 -Live

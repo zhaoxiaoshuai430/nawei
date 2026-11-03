@@ -33,7 +33,6 @@ MODELSCOPE_CACHE = (
 )
 
 ASSET_DIR = Path(os.environ.get("ASSET_DIR", str(REPO_ROOT / "assets")))
-SENSEVOICE_DIR = REPO_ROOT / "SenseVoice"
 
 # voice_lab: fine-tuned CustomVoice
 VOICE_LAB_DIR = REPO_ROOT / "voice_lab"
@@ -44,12 +43,8 @@ TTS_DEFAULT_MODEL = (
     or f"voice_lab/{VOICE_LAB_SPEAKER}"
 )
 
-# Gateway
-ASR_BASE_URL = os.environ.get("ASR_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
 MAX_TEXT_CHARS = 1000 / 2
 MAX_TEXT_NEW_TOKENS = 640
-# Chat clone: cap sampling so one reply stays one consistent voice.
-CLONE_CHAT_TEMPERATURE = float(os.environ.get("CLONE_CHAT_TEMPERATURE", "0.65"))
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
 AUDIO_TOO_LARGE_MSG = (
     "Audio file too large ({size_mb:.1f} MB). "

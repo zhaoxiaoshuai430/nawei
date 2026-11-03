@@ -31,8 +31,8 @@ knowledge_service = KnowledgeService(settings)
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # 在接请求前连接存储并预热本地向量模型；停机时统一释放连接和模型提供者资源。
-    await knowledge_service.initialize()
     try:
+        await knowledge_service.initialize()
         yield
     finally:
         await knowledge_service.close()
@@ -136,7 +136,10 @@ async def document_status(document_id: str) -> dict[str, Any]:
     dependencies=[Depends(authorize_knowledge_admin_request)],
 )
 async def delete_document(document_id: str) -> dict[str, bool]:
-    return {"deleted": await knowledge_service.delete_document(document_id)}
+    try:
+        return {"deleted": await knowledge_service.delete_document(document_id)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 def _decode_text(raw: bytes) -> str:

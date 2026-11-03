@@ -1,6 +1,10 @@
 """AgentSkill package owned by the LLM service."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from services.llm.skills.base import AgentSkillContext
+    from services.llm.skills.manager import AgentSkillManager
 
 __all__ = ["AgentSkillContext", "AgentSkillManager"]
 

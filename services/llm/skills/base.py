@@ -7,6 +7,7 @@ from typing import Any, Protocol
 
 from services.llm.memory import LearningConcept, MemoryContext
 from services.knowledge.schemas import KnowledgeContext
+from services.llm.summary.context import SummaryContext
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class AgentSkillContext:
     knowledge: KnowledgeContext = field(default_factory=KnowledgeContext)
     tutor_strategy: dict[str, Any] = field(default_factory=dict)
     skill_metadata: dict[str, Any] = field(default_factory=dict)
+    summary_context: SummaryContext | None = None
 
     @property
     def user_id(self) -> str:

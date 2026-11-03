@@ -155,13 +155,13 @@ async def test_persistence_backpressure_bounds_created_tasks(monkeypatch):
     monkeypatch.setenv("MEMORY_POST_TURN_ASYNC", "true")
     monkeypatch.setenv("MEMORY_POST_TURN_MAX_PENDING", "2")
     runtime, turn = persistence_fixture()
+    turn.direct_answer = None
     release = asyncio.Event()
-    runtime.memory_store.persist_message = AsyncMock(side_effect=lambda **kwargs: None)
 
     async def persist(**kwargs):
         await release.wait()
 
-    runtime.memory_store.persist_message.side_effect = persist
+    runtime.skill_manager.after_turn = AsyncMock(side_effect=persist)
     await runtime.after_turn(turn, "one")
     await runtime.after_turn(turn, "two")
     waiting = asyncio.create_task(runtime.after_turn(turn, "three"))
@@ -181,13 +181,14 @@ async def test_persistence_admission_and_sync_timeouts_prevent_safe_drain(monkey
     monkeypatch.setenv("MEMORY_POST_TURN_MAX_PENDING", "1")
     monkeypatch.setenv("MEMORY_POST_TURN_TIMEOUT_SECONDS", "10")
     runtime, turn = persistence_fixture()
+    turn.direct_answer = None
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def persist(**kwargs):
         entered.set()
         await release.wait()
 
-    runtime.memory_store.persist_message = persist
+    runtime.skill_manager.after_turn = persist
     if background:
         await runtime.after_turn(turn, "one")
         await asyncio.wait_for(entered.wait(), timeout=1)
@@ -208,11 +209,12 @@ async def test_persistence_timeout_is_reported_and_shutdown_is_bounded(monkeypat
     monkeypatch.setenv("MEMORY_POST_TURN_ASYNC", "true")
     monkeypatch.setenv("MEMORY_SHUTDOWN_TIMEOUT_SECONDS", "0.01")
     runtime, turn = persistence_fixture()
+    turn.direct_answer = None
 
     async def stalled(**kwargs):
         await asyncio.Event().wait()
 
-    runtime.memory_store.persist_message = stalled
+    runtime.skill_manager.after_turn = stalled
     await runtime.after_turn(turn, "answer")
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(runtime.close(), timeout=1)

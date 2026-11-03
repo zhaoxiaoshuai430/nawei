@@ -55,6 +55,7 @@ async def exercise(flow: FullFlow, kind: str) -> dict:
                      "output_audio_config": {"format": "wav", "sample_rate": 24000, "channels": 1}}
         events = []
         transcript = ""
+        transcript_segments = []
         answer = ""
         first_partial = None
         first_audio = None
@@ -108,6 +109,7 @@ async def exercise(flow: FullFlow, kind: str) -> dict:
                         data = body.get("data", body)
                         assert event != "error", data
                         events.append({"type": event, "state": data.get("state"), "text": data.get("text"),
+                                       "segment_index": data.get("segment_index"),
                                        "final": data.get("final"), "elapsed_ms": elapsed})
                         if event == "ping":
                             await socket.send(json.dumps({"type": "ping"}))
@@ -115,7 +117,15 @@ async def exercise(flow: FullFlow, kind: str) -> dict:
                             if first_partial is None:
                                 first_partial = elapsed
                         if event == "transcript.final" or event == "asr.completed" or (event == "stt" and data.get("final") is not False):
-                            transcript = data.get("text", "")
+                            text = data.get("text", "")
+                            # Direct ASR emits one final per VAD segment, not per session.
+                            if direct:
+                                transcript_segments.append(text)
+                                transcript = " ".join(transcript_segments).strip()
+                            else:
+                                # Gateway transcript.final/asr.completed can describe the same turn.
+                                transcript_segments = [text]
+                                transcript = text
                         if event == "message.delta":
                             answer += data.get("text", "")
                         if event == "tts" and data.get("state") == "sentence_start":
@@ -134,6 +144,8 @@ async def exercise(flow: FullFlow, kind: str) -> dict:
                 sender.cancel()
                 await asyncio.gather(sender, return_exceptions=True)
         assert transcript, "Missing final transcription"
+        if direct:
+            assert any(event["type"] == "session.done" for event in events), "ASR closed before session completion"
         if not legacy:
             assert first_partial is not None and input_finished is not None and first_partial < input_finished, "No real partial before input ended"
         if not direct:
@@ -141,7 +153,8 @@ async def exercise(flow: FullFlow, kind: str) -> dict:
             if not robot:
                 assert {"message.done", "audio.done"}.issubset({event["type"] for event in events})
         report = dict(first_partial_ms=first_partial, input_finished_ms=input_finished, first_audio_ms=first_audio,
-                      transcript=transcript, answer=answer, audio_samples=audio_samples, audio_peak=audio_peak,
+                      transcript=transcript, transcript_segments=transcript_segments,
+                      answer=answer, audio_samples=audio_samples, audio_peak=audio_peak,
                       events=events, local_transport=True, physical_robot=False)
         (flow.output / f"{kind}-events.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         return {key: value for key, value in report.items() if key != "events"}

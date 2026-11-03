@@ -15,6 +15,8 @@ services/tts/data/cache
 services/tts/data/logs
 services/tts/data/sessions
 services/tts/voice_lab/output
+services/tts/faster_qwen3_tts_ref_*.wav
+services/tts/torchinductor_*
 .runtime-logs
 .runtime
 models/embeddings

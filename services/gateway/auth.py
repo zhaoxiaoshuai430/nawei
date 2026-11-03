@@ -95,7 +95,7 @@ def _authenticate_jwt(authorization: str | None) -> str:
 
     _validate_registered_claims(payload)
     subject = payload.get("sub")
-    if not isinstance(subject, str) or not subject.strip() or subject == "anonymous":
+    if not isinstance(subject, str) or not subject.strip() or subject.strip() == "anonymous":
         raise HTTPException(status_code=401, detail="JWT subject must be a persistent user id.")
     return subject.strip()
 
@@ -104,7 +104,7 @@ def _validate_registered_claims(payload: dict[str, Any]) -> None:
     now = time.time()
     try:
         expires_at = float(payload["exp"])
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise HTTPException(status_code=401, detail="JWT exp claim is required.") from exc
     if not math.isfinite(expires_at) or expires_at <= now:
         raise HTTPException(status_code=401, detail="Bearer token has expired.")
@@ -117,7 +117,7 @@ def _validate_registered_claims(payload: dict[str, Any]) -> None:
                 raise HTTPException(status_code=401, detail="Invalid JWT nbf claim.")
             if not_before_value > now:
                 raise HTTPException(status_code=401, detail="Bearer token is not active yet.")
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise HTTPException(status_code=401, detail="Invalid JWT nbf claim.") from exc
 
     configured_issuer = os.getenv("GATEWAY_JWT_ISSUER", "").strip()
@@ -130,10 +130,12 @@ def _validate_registered_claims(payload: dict[str, Any]) -> None:
 
 
 def _audience_contains(claim: Any, expected: str) -> bool:
+    # Audience identifiers are public Unicode strings, not secret MAC values.
+    # compare_digest(str, str) rejects non-ASCII claims with TypeError.
     if isinstance(claim, str):
-        return hmac.compare_digest(claim, expected)
+        return claim == expected
     if isinstance(claim, list):
-        return any(isinstance(item, str) and hmac.compare_digest(item, expected) for item in claim)
+        return any(isinstance(item, str) and item == expected for item in claim)
     return False
 
 
@@ -147,3 +149,15 @@ def _decode_json_segment(value: str) -> dict[str, Any]:
 def _decode_segment(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode(value + padding)
+
+
+_PUBLIC_AGE_KEYS = frozenset({"age", "user_age", "birth_date", "birthday", "date_of_birth", "grade", "age_years", "age_stage"})
+
+
+def public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Keep client metadata from overriding server-owned audience identity."""
+    return {
+        key: public_metadata(value) if isinstance(value, dict) else value
+        for key, value in metadata.items()
+        if key not in _PUBLIC_AGE_KEYS
+    }

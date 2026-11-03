@@ -1,13 +1,11 @@
 # SPDX-FileCopyrightText: 2024-2025 Espressif Systems (Shanghai) CO LTD
 # SPDX-License-Identifier: Apache-2.0
-import io
 import os
 import argparse
 import json
 import shutil
 import math
 import sys
-import time
 import numpy as np
 import importlib
 import subprocess
@@ -157,8 +155,6 @@ def split_image(im, block_size, input_dir, ext, convert_to_qoi):
         crop.save(output_path, quality=100)
 
         qoi_module = importlib.import_module('qoi-conv.qoi')
-        Qoi = qoi_module.Qoi
-        replace_extension = qoi_module.replace_extension
 
         if convert_to_qoi:
             with Image.open(output_path) as img:
@@ -167,7 +163,7 @@ def split_image(im, block_size, input_dir, ext, convert_to_qoi):
 
                 img_data = np.asarray(img)
                 out_path = qoi_module.replace_extension(output_path, 'qoi')
-                new_image = qoi_module.Qoi().save(out_path, img_data)
+                qoi_module.Qoi().save(out_path, img_data)
                 os.remove(output_path)
 
 
@@ -242,7 +238,7 @@ def handle_lvgl_version_v9(input_file: str, input_dir: str,
     ]
 
     try:
-        result = subprocess.run(
+        subprocess.run(
             cmd,
             check=True,
             stdout=subprocess.PIPE,
@@ -301,7 +297,7 @@ def process_image(input_file, height_str, output_extension, convert_to_qoi=False
         SPLIT_HEIGHT = int(height_str)
         if SPLIT_HEIGHT < 0:
             raise ValueError('Height must be a positive integer')
-    except ValueError as e:
+    except ValueError:
         print('Error: Height must be a positive integer')
         sys.exit(1)
 
@@ -415,8 +411,7 @@ def pack_assets(config: PackModelsConfig):
         try:
             img = Image.open(file_path)
             width, height = img.size
-        except Exception as e:
-            # print("Error:", e)
+        except Exception:
             _, file_extension = os.path.splitext(file_path)
             if file_extension.lower() in ['.sjpg', '.spng', '.sqoi']:
                 offset = 14

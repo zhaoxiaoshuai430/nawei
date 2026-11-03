@@ -14,9 +14,7 @@ import argparse
 import os
 import re
 import sys
-import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -278,7 +276,7 @@ def main():
             print()
             downloaded_count += 1
         
-        print(f"Summary:")
+        print("Summary:")
         print(f"  Downloaded: {downloaded_count} artifact(s)")
         print(f"  Skipped: {skipped_count} artifact(s)")
         print(f"  Total: {len(artifacts)} artifact(s)")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 from scripts.restore_models import restore_models
@@ -22,13 +23,16 @@ def test_manifest_bundles_only_latest_liliya_checkpoint() -> None:
 
 def test_docker_bundle_restores_model_without_shipping_parts() -> None:
     dockerignore = (PROJECT_ROOT / ".dockerignore").read_text(encoding="utf-8")
-    gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
     dockerfile = (PROJECT_ROOT / "deploy" / "Dockerfile.tts").read_text(encoding="utf-8")
 
     assert "/models/tts/liliya/checkpoint-epoch-0" in dockerignore
     assert "/models/tts/liliya/checkpoint-epoch-1/model.safetensors" in dockerignore
-    assert "/models/tts/liliya/checkpoint-epoch-1/model.safetensors" in gitignore
-    assert "/models/tts/nana/checkpoint-epoch-7/model.safetensors" not in gitignore
+    ignored = subprocess.run(
+        ["git", "-c", f"safe.directory={PROJECT_ROOT.as_posix()}", "check-ignore", "--no-index",
+         "models/tts/liliya/checkpoint-epoch-1/model.safetensors"],
+        cwd=PROJECT_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert ignored.returncode == 0, ignored.stderr
     assert "FROM ${TTS_BASE_IMAGE} AS tts-models" in dockerfile
     assert "--remove-parts" in dockerfile
     assert "COPY --from=tts-models" in dockerfile

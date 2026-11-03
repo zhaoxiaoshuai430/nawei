@@ -81,7 +81,14 @@ class ParaformerStreamingPool:
 
     @contextmanager
     def session(self) -> Iterator[ParaformerStreamingModel]:
-        index = min(range(len(self.models)), key=lambda item: self.sessions[item])
+        # Prefer the least assigned worker, then avoid a worker that is already
+        # decoding or has queued work. This keeps new connections away from a
+        # temporarily busy model without changing per-session pinning.
+        def load_score(item: int) -> tuple[int, int]:
+            snapshot = self.models[item].capacity.snapshot()
+            return self.sessions[item], snapshot.active + snapshot.waiting
+
+        index = min(range(len(self.models)), key=load_score)
         self.sessions[index] += 1
         try:
             yield self.models[index]

@@ -23,6 +23,7 @@ COPY --chown=nawei:nawei services/gateway /app/services/gateway
 COPY --chown=nawei:nawei services/llm /app/services/llm
 COPY --chown=nawei:nawei services/knowledge /app/services/knowledge
 COPY --chown=nawei:nawei deploy/scripts /app/deploy/scripts
+COPY --chown=nawei:nawei deploy/migrations /app/deploy/migrations
 
 RUN mkdir -p /models/huggingface /models/sentence-transformers /var/lib/nawei \
     && chown -R nawei:nawei /models /var/lib/nawei

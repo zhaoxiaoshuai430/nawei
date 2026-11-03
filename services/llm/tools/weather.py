@@ -555,6 +555,7 @@ class OpenMeteoWeatherTool:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _lookup_open_meteo(self, *, city: str, day: str) -> WeatherToolResult:
         location = CITY_COORDINATES.get(city)

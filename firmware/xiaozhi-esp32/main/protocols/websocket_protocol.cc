@@ -109,27 +109,44 @@ bool WebsocketProtocol::OpenAudioChannel() {
         if (binary) {
             if (on_incoming_audio_ != nullptr) {
                 if (version_ == 2) {
-                    BinaryProtocol2* bp2 = (BinaryProtocol2*)data;
-                    bp2->version = ntohs(bp2->version);
-                    bp2->type = ntohs(bp2->type);
-                    bp2->timestamp = ntohl(bp2->timestamp);
-                    bp2->payload_size = ntohl(bp2->payload_size);
-                    auto payload = (uint8_t*)bp2->payload;
+                    if (len < sizeof(BinaryProtocol2)) {
+                        ESP_LOGW(TAG, "Truncated v2 audio header");
+                        return;
+                    }
+                    BinaryProtocol2 header;
+                    std::memcpy(&header, data, sizeof(header));
+                    const size_t payload_size = ntohl(header.payload_size);
+                    if (ntohs(header.version) != 2 || ntohs(header.type) != 0 ||
+                        payload_size == 0 || payload_size > 1275 ||
+                        payload_size != len - sizeof(header)) {
+                        ESP_LOGW(TAG, "Invalid v2 audio payload");
+                        return;
+                    }
+                    const auto* payload = reinterpret_cast<const uint8_t*>(data) + sizeof(header);
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
                         .frame_duration = server_frame_duration_,
-                        .timestamp = bp2->timestamp,
-                        .payload = std::vector<uint8_t>(payload, payload + bp2->payload_size)}));
+                        .timestamp = ntohl(header.timestamp),
+                        .payload = std::vector<uint8_t>(payload, payload + payload_size)}));
                 } else if (version_ == 3) {
-                    BinaryProtocol3* bp3 = (BinaryProtocol3*)data;
-                    bp3->type = bp3->type;
-                    bp3->payload_size = ntohs(bp3->payload_size);
-                    auto payload = (uint8_t*)bp3->payload;
+                    if (len < sizeof(BinaryProtocol3)) {
+                        ESP_LOGW(TAG, "Truncated v3 audio header");
+                        return;
+                    }
+                    BinaryProtocol3 header;
+                    std::memcpy(&header, data, sizeof(header));
+                    const size_t payload_size = ntohs(header.payload_size);
+                    if (header.type != 0 || payload_size == 0 || payload_size > 1275 ||
+                        payload_size != len - sizeof(header)) {
+                        ESP_LOGW(TAG, "Invalid v3 audio payload");
+                        return;
+                    }
+                    const auto* payload = reinterpret_cast<const uint8_t*>(data) + sizeof(header);
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
                         .frame_duration = server_frame_duration_,
                         .timestamp = 0,
-                        .payload = std::vector<uint8_t>(payload, payload + bp3->payload_size)}));
+                        .payload = std::vector<uint8_t>(payload, payload + payload_size)}));
                 } else {
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,

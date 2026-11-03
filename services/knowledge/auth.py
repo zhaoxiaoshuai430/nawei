@@ -29,5 +29,5 @@ def _authorize(name: str, provided: str | None) -> None:
         return
     if production and len(configured.encode("utf-8")) < 32:
         raise HTTPException(status_code=503, detail=f"{name} must contain at least 32 bytes.")
-    if not provided or not secrets.compare_digest(provided, configured):
+    if not provided or not secrets.compare_digest(provided.encode("utf-8"), configured.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Invalid knowledge API key.")

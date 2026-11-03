@@ -111,8 +111,14 @@ class KnowledgeCache:
         )
         try:
             for pattern in patterns:
+                pending: list[str] = []
                 async for key in self.redis.scan_iter(match=pattern):
-                    await self.redis.delete(key)
+                    pending.append(key)
+                    if len(pending) >= 100:
+                        await self.redis.delete(*pending)
+                        pending.clear()
+                if pending:
+                    await self.redis.delete(*pending)
         except Exception as exc:
             await self._disable_redis("invalidate", exc)
 

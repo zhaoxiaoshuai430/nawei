@@ -35,11 +35,23 @@ atomically after size and format validation. The limits can be adjusted with
 `TTS_PRESET_DOWNLOAD_TIMEOUT_SECONDS`, `TTS_PRESET_MAX_AUDIO_BYTES`, and
 `TTS_PRESET_MAX_TRANSCRIPT_BYTES`.
 
-Health check:
+Uploaded reference audio is read with a 10 MiB limit plus a one-byte overflow
+probe; empty or oversized input is rejected before caching. This bounds the
+handler read, not the HTTP server's multipart buffering. Cache validation and
+writing run off the request event loop. Existing files are checked against the
+provided bytes, and missing or damaged entries are written to a unique temporary
+file before atomic replacement. Valid files are reused without rewriting.
+Paths are derived from content without an unbounded in-memory path index.
+Cache files remain shared across generations; this does not add disk eviction
+or guarantee cleanup of temporary files after a forced process termination.
+
+Model readiness check (returns 503 if the model is not loaded):
 
 ```text
-GET http://127.0.0.1:19000/api/v1/health
+GET http://127.0.0.1:19000/api/v1/status
 ```
+
+`GET /api/v1/health` is only a process liveness check; it does not verify model loading.
 
 ## Standard API
 
@@ -152,11 +164,19 @@ requests work without credentials. Remote model management requires
 `TTS_ADMIN_API_KEY` and the matching `X-TTS-Admin-Key` header.
 
 Concurrent clients are admitted through a bounded single-GPU generation queue.
-Configure `TTS_MAX_QUEUE_SIZE` (default `8`), `TTS_QUEUE_TIMEOUT_SECONDS`
+Configure `TTS_MAX_QUEUE_SIZE` (default `16`), `TTS_QUEUE_TIMEOUT_SECONDS`
 (default `120`), `TTS_STREAM_QUEUE_SIZE` (default `8`), and
 `TTS_STREAM_QUEUE_PUT_TIMEOUT_SECONDS` (default `5`). Scale TTS with one model
 process per GPU after measuring the model's memory usage; do not add Uvicorn
 workers on the same GPU because each worker loads another model copy.
+
+When a streaming client disconnects, synthesis checks for cancellation before
+requesting another model chunk and explicitly closes the model iterator on exit,
+including encoding failures and queue timeouts. Completion notification does not
+use the audio queue, so a full queue cannot leave a pending completion write.
+Normal completion drains queued audio events before closing the response. The
+generation slot is released only after the worker exits; an already running model
+call must finish before cleanup can complete.
 
 The selected model is preloaded once and remains resident in the process-level
 GPU cache across conversations. `TTS_OUTPUT_SAMPLE_RATE` can explicitly override

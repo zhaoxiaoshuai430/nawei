@@ -40,6 +40,8 @@ from services.llm.response_constraints import (
 from services.llm.safety_replies import resolve_safety_age
 from services.llm.voice_preview import VoicePreviewCache
 from services.llm.drain import LocalDrainMiddleware, LocalDrainState
+from services.llm.summary.router import summary_router
+from services.llm.summary.repository import RequestConflict
 
 
 logger = logging.getLogger(__name__)
@@ -108,29 +110,31 @@ content_safety = AliyunContentSafety()
 @asynccontextmanager
 async def _llm_lifespan(application: FastAPI) -> AsyncIterator[None]:
     # 先初始化记忆和知识依赖；停机时先等待 Agent 的后台写入，再关闭网络连接池。
-    await agent_runtime.initialize()
-    drain_task = asyncio.create_task(local_drain.monitor(agent_runtime))
-    warmup_task = (
-        asyncio.create_task(_warm_deepseek_transport())
-        if _read_bool_env("LLM_UPSTREAM_WARMUP_ENABLED", True)
-        else None
-    )
-    await asyncio.sleep(0)
+    drain_task = None
+    warmup_task = None
     try:
+        await agent_runtime.initialize()
+        drain_task = asyncio.create_task(local_drain.monitor(agent_runtime))
+        if _read_bool_env("LLM_UPSTREAM_WARMUP_ENABLED", True):
+            warmup_task = asyncio.create_task(_warm_deepseek_transport())
+        await asyncio.sleep(0)
         yield
     finally:
-        drain_task.cancel()
-        await asyncio.gather(drain_task, return_exceptions=True)
+        if drain_task is not None:
+            drain_task.cancel()
+            await asyncio.gather(drain_task, return_exceptions=True)
         if warmup_task is not None:
             if not warmup_task.done():
                 warmup_task.cancel()
             await asyncio.gather(warmup_task, return_exceptions=True)
-        await agent_runtime.close()
-        for client in list(_deepseek_clients.values()):
-            close = getattr(client, "aclose", None)
-            if close is not None:
-                await close()
-        _deepseek_clients.clear()
+        try:
+            await agent_runtime.close()
+        finally:
+            for client in list(_deepseek_clients.values()):
+                close = getattr(client, "aclose", None)
+                if close is not None:
+                    await close()
+            _deepseek_clients.clear()
 
 
 async def _warm_deepseek_transport() -> None:
@@ -153,6 +157,7 @@ async def _warm_deepseek_transport() -> None:
 
 
 app = FastAPI(title="Xiaowei Agentic LLM Service", version="0.3.0", lifespan=_llm_lifespan)
+app.include_router(summary_router(agent_runtime.summary_repository))
 app.add_middleware(LocalDrainMiddleware, state=local_drain)
 
 
@@ -379,6 +384,8 @@ async def _complete_llm(request: LLMRequest) -> LLMResponse:
                 turn, response, input_decision=input_decision, safety_age=safety_age,
             )
         raise HTTPException(status_code=502, detail=f"LLM upstream request failed: {exc}") from exc
+    except RequestConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         if settings.fallback_enabled:
             active_request = turn.request if turn is not None else request
@@ -420,6 +427,7 @@ async def stream_llm(request: LLMRequest) -> StreamingResponse:
                     cached_turn, cached_response, input_decision=input_decision, safety_age=safety_age,
                 )
                 for text in _text_chunks(reviewed.text, size=_stream_chunk_chars()):
+                    await agent_runtime.assert_turn_epoch(cached_turn)
                     yield sse_encode(_stream_text_event(request, text, template=None))
                 yield sse_encode(StreamEvent(
                     event=EventType.MESSAGE_DONE, request_id=request.request_id,
@@ -448,6 +456,7 @@ async def stream_llm(request: LLMRequest) -> StreamingResponse:
             stream_chunk_chars = _stream_chunk_chars()
             source = _stream_direct_answer(turn) if turn.direct_answer is not None else _stream_backend_with_fallback(turn.request, settings)
             async for event in source:
+                await agent_runtime.assert_turn_epoch(turn)
                 tool_agent_metadata = event.data.get("tool_agent")
                 if isinstance(tool_agent_metadata, dict):
                     turn.metadata["tools"] = {
@@ -495,14 +504,20 @@ async def stream_llm(request: LLMRequest) -> StreamingResponse:
                     size=stream_chunk_chars,
                 )
                 for text in chunks:
+                    await agent_runtime.assert_turn_epoch(turn)
                     yield sse_encode(_stream_text_event(request, text, template=delta_template))
             output_decision = stream_safety.decision or safety_guard.audit_output("".join(raw_parts), age=safety_age)
             if output_decision.changed:
                 safety_guard.log(stage="output", decision=output_decision, request_id=request.request_id)
             turn.metadata["age_constraints"] = age_stream.metadata()
-            # after_turn 在异步模式下只保证安排写入；persistence.scheduled 不表示落库完成。
+            # after_turn 先提交近期历史；scheduled 仅表示长期记忆抽取已安排。
             # 延后发送 message.done，确保缓冲尾部先发完，并附上本轮运行与持久化状态。
-            persistence = await agent_runtime.after_turn(turn, "".join(safe_parts))
+            await agent_runtime.assert_turn_epoch(turn)
+            summary_ineligible = output_decision.blocked or done_event is None or (done_event is not None and (
+                done_event.data.get("finish_reason", "stop") != "stop" or done_event.data.get("fallback")))
+            persistence = ({"saved_turn": False, "reason": "incomplete_or_safety"}
+                           if agent_runtime.summary_settings.enabled and summary_ineligible
+                           else await agent_runtime.after_turn(turn, "".join(safe_parts)))
             final_event = done_event or StreamEvent(
                 event=EventType.MESSAGE_DONE,
                 request_id=request.request_id,
@@ -518,6 +533,10 @@ async def stream_llm(request: LLMRequest) -> StreamingResponse:
             final_data["persistence"] = persistence
             final_data["safety"] = _safety_metadata(input_decision, output_decision)
             yield sse_encode(_copy_stream_event(final_event, data=final_data))
+        except RequestConflict:
+            yield sse_encode(_error_event(request, "request_id was already used for different input."))
+        except TimeoutError:
+            yield sse_encode(_error_event(request, "Conversation history commit timed out."))
         except RuntimeError as exc:
             yield sse_encode(_error_event(request, f"LLM Agent runtime unavailable: {exc}"))
 
@@ -545,6 +564,7 @@ async def _stream_reviewed_turn(
     source = _stream_direct_answer(turn) if turn.direct_answer is not None else _stream_backend_with_fallback(request, settings)
     try:
         async for event in source:
+            await agent_runtime.assert_turn_epoch(turn)
             if event.event == EventType.MESSAGE_DELTA:
                 text = str(event.data.get("text", ""))
                 total += len(text)
@@ -563,7 +583,7 @@ async def _stream_reviewed_turn(
                 break
     finally:
         await source.aclose()
-    if failed:
+    if failed or (agent_runtime.summary_settings.enabled and not done_data):
         yield sse_encode(_error_event(request, "LLM response could not be completed."))
         return
     response = LLMResponse(
@@ -584,6 +604,7 @@ async def _stream_reviewed_turn(
             turn, response, input_decision=input_decision, safety_age=safety_age,
         )
     for text in _text_chunks(reviewed.text, size=_stream_chunk_chars()):
+        await agent_runtime.assert_turn_epoch(turn)
         yield sse_encode(StreamEvent(
             event=EventType.MESSAGE_DELTA, request_id=request.request_id,
             trace_id=request.trace_id, session_id=request.session_id,
@@ -1362,9 +1383,6 @@ def _model_to_dict(model: Any) -> dict[str, Any]:
 
 
 async def _resolve_request_safety_age(request: LLMRequest) -> int | None:
-    age = resolve_safety_age(request.metadata)
-    if age is not None:
-        return age
     try:
         timeout = _read_float_env("SAFETY_PROFILE_TIMEOUT_SECONDS", 0.5)
         async with asyncio.timeout(max(0.05, min(timeout, 2.0))):
@@ -1376,7 +1394,8 @@ async def _resolve_request_safety_age(request: LLMRequest) -> int | None:
             type(exc).__name__,
         )
         return None
-    return resolve_safety_age(request.metadata, profile)
+    age = resolve_safety_age({}, profile)
+    return age if age is not None else resolve_safety_age(request.metadata)
 
 
 def _audit_request_input(request: LLMRequest, *, age: int | None = None) -> tuple[LLMRequest, SafetyDecision]:
@@ -1601,6 +1620,7 @@ async def _finalize_agent_response(
     )
     if turn is None:
         return safe_response
+    await agent_runtime.assert_turn_epoch(turn)
     if turn.original_request.defer_persistence:
         metadata = dict(safe_response.metadata)
         if not output_decision.blocked and safe_response.finish_reason == "stop":
@@ -1613,9 +1633,12 @@ async def _finalize_agent_response(
         )
     persistence = (
         {"saved_turn": False, "reason": "content_safety"}
-        if output_decision.external_review and output_decision.blocked
+        if (output_decision.external_review and output_decision.blocked) or (
+            agent_runtime.summary_settings.enabled and (output_decision.blocked or response.finish_reason != "stop"
+                                                       or response.metadata.get("fallback")))
         else await agent_runtime.after_turn(turn, safe_text)
     )
+    await agent_runtime.assert_turn_epoch(turn)
     return _response_with_runtime_metadata(safe_response, turn, persistence)
 
 

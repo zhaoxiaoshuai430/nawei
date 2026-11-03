@@ -19,7 +19,6 @@ import shutil
 import argparse
 import subprocess
 import json
-from pathlib import Path
 
 
 def ensure_dir(directory):
@@ -214,7 +213,7 @@ def process_board_icon_collection(icon_collection_dir, assets_dir):
 def process_board_layout(layout_json_file, assets_dir):
     """Process layout_json parameter"""
     if not layout_json_file:
-        print(f"Warning: Layout json file not provided")
+        print("Warning: Layout json file not provided")
         return []
     
     print(f"Processing layout_json: {layout_json_file}")

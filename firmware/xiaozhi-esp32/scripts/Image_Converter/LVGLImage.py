@@ -283,8 +283,8 @@ def unpack_colors(data: bytes, cf: ColorFormat, w) -> List:
             H = data[1::3]
             A = data[2::3]
 
-            for h, l, a in zip(H, L, A):
-                p = (h << 8) | (l)
+            for h, low_byte, a in zip(H, L, A):
+                p = (h << 8) | low_byte
                 ret.append(bit_extend((p >> 11) & 0x1f, 5))  # R
                 ret.append(bit_extend((p >> 5) & 0x3f, 6))  # G
                 ret.append(bit_extend((p >> 0) & 0x1f, 5))  # B
@@ -882,7 +882,7 @@ class LVGLImage:
 
         # to preserve original palette data only convert the image if needed. For this
         # check if image has a palette and the requested palette size equals the existing one 
-        if not 'palette' in metadata or not auto_cf and len(metadata['palette']) !=  2 ** cf.bpp:
+        if 'palette' not in metadata or not auto_cf and len(metadata['palette']) !=  2 ** cf.bpp:
             # reread and convert file
             reader = png.Reader(
                 bytes=PngQuant(256 if auto_cf else cf.ncolors).convert(filename))

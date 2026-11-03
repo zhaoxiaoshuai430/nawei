@@ -323,7 +323,7 @@ def _memory_prepare_timeout_seconds(answer_mode: str, *, user_text: str = "", me
         fast_default = 1.0 if _fast_query_needs_memory(user_text) or _requested_memory_mode(metadata) in {"lightweight", "full"} else 0.45
         minimum = 2.0 if is_contextual_followup(user_text) else 0.1
         return max(_read_float_env("LLM_FAST_MEMORY_TIMEOUT_SECONDS", fast_default), minimum)
-    default = 1.2 if answer_mode == "fast" else 2.5 if answer_mode == "standard" else 5.0
+    default = 2.5 if answer_mode == "standard" else 5.0
     return max(_read_float_env("LLM_MEMORY_PREPARE_TIMEOUT_SECONDS", default), 0.1)
 
 
@@ -363,15 +363,6 @@ def _should_use_lightweight_memory(*, user_text: str, answer_mode: str, metadata
     if mode == "auto":
         return _fast_query_needs_memory(user_text)
     return mode == "lightweight"
-
-
-def _memory_prepare_skip_reason(*, user_text: str, answer_mode: str, metadata: dict[str, Any]) -> str:
-    requested = _requested_memory_mode(metadata)
-    if requested == "off":
-        return "requested_memory_off"
-    if answer_mode == "fast" and _fast_memory_mode() == "auto" and not _fast_query_needs_memory(user_text):
-        return "fast_memory_auto_skip"
-    return "fast_memory_off"
 
 
 def _fast_query_needs_memory(text: str) -> bool:

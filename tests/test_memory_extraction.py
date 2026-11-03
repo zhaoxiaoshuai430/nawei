@@ -3,7 +3,13 @@
 import httpx
 import pytest
 
-from services.llm.memory import MemoryStore, _extract_memory_records, _extract_profile_changes
+from services.llm.memory import (
+    MemoryStore,
+    _extract_memory_records,
+    _extract_profile_changes,
+    _normalize_education_profile,
+    _normalize_llm_memory_record,
+)
 
 
 @pytest.mark.asyncio
@@ -71,6 +77,21 @@ async def test_memory_fallback_bounds_items_per_user(monkeypatch: pytest.MonkeyP
         "Prefers visual explanations",
         "Weak at fractions",
     ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_personality_correction_replaces_profile_and_obsoletes_memory() -> None:
+    store = MemoryStore(enabled=False)
+    await store.extract_and_store(
+        user_id="student", session_id="one", user_text="\u6211\u7684\u6027\u683c\u6bd4\u8f83\u6162\u70ed", use_llm=False
+    )
+    await store.extract_and_store(
+        user_id="student", session_id="two", user_text="\u6211\u7684\u6027\u683c\u6bd4\u8f83\u5185\u5411", use_llm=False
+    )
+    assert store._memory_profiles["student"]["personality"]["confirmed"] == ["\u5185\u5411"]
+    active = [item for item in store._memory_items["student"] if not item.get("is_deleted")]
+    assert len(active) == 1
+    assert "\u5185\u5411" in active[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -177,3 +198,34 @@ def test_per_turn_persona_request_is_not_persisted() -> None:
 
     assert "assistant_persona" not in changes
     assert "assistant_dialect" not in changes
+
+
+def test_explicit_personality_is_saved_as_confirmed_profile() -> None:
+    changes = _extract_profile_changes("\u6211\u7684\u6027\u683c\u6bd4\u8f83\u6162\u70ed")
+    assert changes["personality"]["confirmed"] == ["\u6162\u70ed"]
+    assert any(record["memory_type"] == "profile_fact" for record in _extract_memory_records("\u6211\u7684\u6027\u683c\u6bd4\u8f83\u6162\u70ed"))
+
+
+def test_personality_question_does_not_write_profile() -> None:
+    assert "personality" not in _extract_profile_changes("\u6211\u7684\u6027\u683c\u662f\u4ec0\u4e48")
+
+
+def test_personality_is_normalized_and_deduplicated() -> None:
+    profile = _normalize_education_profile(
+        {"personality": {"confirmed": ["\u6162\u70ed", "\u6162\u70ed", "", "\u5185\u5411"]}}
+    )
+    assert profile["personality"]["confirmed"] == ["\u6162\u70ed", "\u5185\u5411"]
+
+
+def test_behavior_observation_memory_type_is_allowed() -> None:
+    record = _normalize_llm_memory_record(
+        {
+            "content": "\u7528\u6237\u660e\u786e\u8868\u793a\u559c\u6b22\u5148\u770b\u4f8b\u5b50",
+            "memory_type": "behavior_observation",
+            "importance": 6,
+            "confidence": 0.8,
+            "tags": [],
+        }
+    )
+    assert record is not None
+    assert record["memory_type"] == "behavior_observation"

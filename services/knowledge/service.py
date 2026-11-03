@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -18,6 +19,7 @@ from typing import Any
 
 from services.knowledge.cache import KnowledgeCache
 from services.knowledge.catalog import KnowledgeCatalog
+from services.knowledge.concurrency import gather_cancel_on_error
 from services.knowledge.chunker import chunk_text
 from services.knowledge.config import KnowledgeSettings
 from services.knowledge.embeddings import EmbeddingProvider, FastEmbedProvider, build_embedding_provider
@@ -38,6 +40,12 @@ from services.knowledge.schemas import (
 
 
 _RETRIEVAL_CACHE_VERSION = "path-query-v5"
+
+
+async def _measure_awaitable(awaitable: Any) -> tuple[Any, int]:
+    started = time.perf_counter()
+    result = await awaitable
+    return result, round((time.perf_counter() - started) * 1000)
 
 
 class KnowledgeService:
@@ -120,6 +128,19 @@ class KnowledgeService:
             await self.neo4j.close()
 
     async def ingest(self, request: KnowledgeDocumentRequest) -> KnowledgeDocumentResponse:
+        content_hash = hashlib.sha256(request.content.strip().encode("utf-8")).hexdigest()
+        document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"nawei:{request.knowledge_base_id}:{content_hash}"))
+        async with self.catalog.document_operation(document_id):
+            return await self._ingest(request)
+
+    async def ingest_structured(self, request: KnowledgeStructuredDocumentRequest) -> KnowledgeDocumentResponse:
+        serialized = json.dumps(_model_to_dict(request), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        content_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"nawei:{request.knowledge_base_id}:{content_hash}"))
+        async with self.catalog.document_operation(document_id):
+            return await self._ingest_structured(request)
+
+    async def _ingest(self, request: KnowledgeDocumentRequest) -> KnowledgeDocumentResponse:
         # 同一知识库按内容哈希检测已完成的重复导入；文档及片段使用可重复生成的 UUID。
         # 流程为切块 -> 向量化 -> 抽取实体关系 -> 写双库 -> 标记就绪 -> 失效检索缓存。
         qdrant, neo4j = self._require_stores()
@@ -272,11 +293,11 @@ class KnowledgeService:
                 entity_count=len(entities_by_id),
                 relation_count=len(relations),
             )
-        except Exception as exc:
-            await self._rollback_document(document_id, qdrant=qdrant, neo4j=neo4j, error=exc)
+        except (Exception, asyncio.CancelledError) as exc:
+            await self._finish_rollback(document_id, qdrant=qdrant, neo4j=neo4j, error=exc)
             raise
 
-    async def ingest_structured(
+    async def _ingest_structured(
         self,
         request: KnowledgeStructuredDocumentRequest,
     ) -> KnowledgeDocumentResponse:
@@ -472,9 +493,30 @@ class KnowledgeService:
                 entity_count=len(entities_by_id),
                 relation_count=len(deduped_relations),
             )
-        except Exception as exc:
-            await self._rollback_document(document_id, qdrant=qdrant, neo4j=neo4j, error=exc)
+        except (Exception, asyncio.CancelledError) as exc:
+            await self._finish_rollback(document_id, qdrant=qdrant, neo4j=neo4j, error=exc)
             raise
+
+    async def _finish_rollback(self, document_id: str, **kwargs: Any) -> None:
+        # Retain the document lock until bounded cleanup finishes, even if the
+        # caller receives another cancellation while cleanup is in flight.
+        async def cleanup() -> None:
+            try:
+                async with asyncio.timeout(15):
+                    await self._rollback_document(document_id, **kwargs)
+            except TimeoutError:
+                logging.getLogger(__name__).error("Knowledge rollback timed out document_id=%s", document_id)
+
+        task = asyncio.create_task(cleanup())
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _rollback_document(
         self,
@@ -482,19 +524,19 @@ class KnowledgeService:
         *,
         qdrant: QdrantKnowledgeStore,
         neo4j: Neo4jKnowledgeStore,
-        error: Exception,
+        error: BaseException,
     ) -> None:
         # 尽力标记失败并分别清理双库，不让清理异常覆盖原始入库错误。
         # 补偿本身也可能失败，因此失败状态和日志仍需保留供后续排查。
         try:
-            await self.catalog.fail_document(document_id=document_id, error=str(error))
+            await self.catalog.fail_document(document_id=document_id, error=str(error) or type(error).__name__)
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("Could not mark failed document_id=%s", document_id)
         for delete_document in (qdrant.delete_document, neo4j.delete_document):
             try:
                 await delete_document(document_id)
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("Could not clean index document_id=%s", document_id)
 
     async def _embed_in_batches(self, texts: list[str]) -> list[list[float]]:
         batch_size = max(1, int(os.getenv("KNOWLEDGE_EMBEDDING_BATCH_SIZE", "64")))
@@ -533,18 +575,23 @@ class KnowledgeService:
             return cached
 
         timings = {"cache_lookup": round((time.perf_counter() - started) * 1000)}
-        stage_started = time.perf_counter()
+        preparation_started = time.perf_counter()
         resolver = GraphEntityResolver(neo4j)
         planner = KnowledgeExpansionPlanner()
-        resolved_entities = await resolver.resolve(
-            knowledge_base_id=request.knowledge_base_id,
-            candidates=request.graph_candidates,
+        (resolved_entities, entity_resolution_ms), (vectors, embedding_ms) = await gather_cancel_on_error(
+            _measure_awaitable(
+                resolver.resolve(
+                    knowledge_base_id=request.knowledge_base_id,
+                    candidates=request.graph_candidates,
+                )
+            ),
+            _measure_awaitable(self.embeddings.embed([request.query])),
         )
+        timings["entity_resolution"] = entity_resolution_ms
+        timings["embedding"] = embedding_ms
+        timings["pre_search_preparation"] = round((time.perf_counter() - preparation_started) * 1000)
         qdrant_filters = planner.qdrant_filters(resolved_entities)
-        timings["entity_resolution"] = round((time.perf_counter() - stage_started) * 1000)
-        stage_started = time.perf_counter()
-        vector = (await self.embeddings.embed([request.query]))[0]
-        timings["embedding"] = round((time.perf_counter() - stage_started) * 1000)
+        vector = vectors[0]
         stage_started = time.perf_counter()
         chunks = await qdrant.search(
             knowledge_base_id=request.knowledge_base_id,
@@ -564,26 +611,41 @@ class KnowledgeService:
             )
         retrieved_chunk_count = len(chunks)
         timings["vector_and_lexical_search"] = round((time.perf_counter() - stage_started) * 1000)
-        stage_started = time.perf_counter()
+        graph_started = time.perf_counter()
         if anchor_terms:
             # 片段必须实际提到锚点概念；仅命中宽泛学科节点，不等于有具体公式的文本证据。
             chunks = [chunk for chunk in chunks if _chunk_matches_anchor(chunk, anchor_terms)]
-        relation_groups = (
-            await neo4j.expand_entities(
-                entity_ids=[item.entity_id for item in resolved_entities],
-                relation_groups=planner.relation_groups(request.expansion),
-                depth=request.graph_depth,
+        if resolved_entities:
+            (relation_groups, entity_expansion_ms), (chunk_relations, chunk_expansion_ms) = await gather_cancel_on_error(
+                _measure_awaitable(
+                    neo4j.expand_entities(
+                        entity_ids=[item.entity_id for item in resolved_entities],
+                        relation_groups=planner.relation_groups(request.expansion),
+                        depth=request.graph_depth,
+                    )
+                ),
+                _measure_awaitable(
+                    neo4j.expand(
+                        chunk_ids=[chunk.chunk_id for chunk in chunks],
+                        depth=request.graph_depth,
+                    )
+                ),
             )
-            if resolved_entities
-            else {}
-        )
-        chunk_relations = await neo4j.expand(
-            chunk_ids=[chunk.chunk_id for chunk in chunks],
-            depth=request.graph_depth,
-        )
+            timings["entity_graph_expansion"] = entity_expansion_ms
+            timings["chunk_graph_expansion"] = chunk_expansion_ms
+        else:
+            relation_groups = {}
+            chunk_relations, chunk_expansion_ms = await _measure_awaitable(
+                neo4j.expand(
+                    chunk_ids=[chunk.chunk_id for chunk in chunks],
+                    depth=request.graph_depth,
+                )
+            )
+            timings["entity_graph_expansion"] = 0
+            timings["chunk_graph_expansion"] = chunk_expansion_ms
         if chunk_relations:
             relation_groups["chunk_relations"] = chunk_relations
-        timings["graph_expansion"] = round((time.perf_counter() - stage_started) * 1000)
+        timings["graph_expansion"] = round((time.perf_counter() - graph_started) * 1000)
         context = GroundingAssembler().assemble(
             knowledge_base_id=request.knowledge_base_id,
             query=request.query,
@@ -610,6 +672,10 @@ class KnowledgeService:
         return context
 
     async def delete_document(self, document_id: str) -> bool:
+        async with self.catalog.document_operation(document_id):
+            return await self._delete_document(document_id)
+
+    async def _delete_document(self, document_id: str) -> bool:
         # 删除需同时处理向量、图谱、目录及缓存；只删一处会留下可被检索到的旧证据。
         qdrant, neo4j = self._require_stores()
         document = await self.catalog.get_document(document_id)

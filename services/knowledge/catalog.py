@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
 try:
     import asyncpg
@@ -19,6 +20,36 @@ class KnowledgeCatalog:
         self.pool: Any = None
         self.memory: dict[str, dict[str, Any]] = {}
         self.last_error: str | None = None
+        self._active_documents: set[str] = set()
+
+    @asynccontextmanager
+    async def document_operation(self, document_id: str) -> AsyncIterator[None]:
+        """Exclude competing imports/deletes, including across service processes.
+
+        A dedicated session keeps the advisory lock out of the small query pool.
+        PostgreSQL releases the lock when this session closes, including crashes.
+        Reject contention rather than queue unbounded document uploads.
+        """
+        if document_id in self._active_documents:
+            raise RuntimeError("Document operation already in progress; retry later.")
+        self._active_documents.add(document_id)
+        connection = None
+        try:
+            if self.pool is not None:
+                connection = await asyncpg.connect(self.database_url, timeout=4.0)
+                acquired = await connection.fetchval(
+                    "SELECT pg_try_advisory_lock(hashtextextended($1, 0))",
+                    f"knowledge-document:{document_id}",
+                    timeout=4.0,
+                )
+                if not acquired:
+                    raise RuntimeError("Document operation already in progress; retry later.")
+            yield
+        finally:
+            if connection is not None:
+                # No await: cancellation must not release the local guard first.
+                connection.terminate()
+            self._active_documents.discard(document_id)
 
     async def initialize(self) -> None:
         if self.pool is not None:
@@ -26,17 +57,22 @@ class KnowledgeCatalog:
         if asyncpg is None:
             self.last_error = "asyncpg is not installed; using in-memory knowledge catalog."
             return
+        pool = None
         try:
-            self.pool = await asyncio.wait_for(
+            pool = await asyncio.wait_for(
                 asyncpg.create_pool(self.database_url, min_size=1, max_size=3, timeout=3.0),
                 timeout=4.0,
             )
-            async with self.pool.acquire() as connection:
+            async with pool.acquire() as connection:
                 await connection.execute(_SCHEMA_SQL)
+            self.pool = pool
             self.last_error = None
         except Exception as exc:
-            self.pool = None
             self.last_error = f"PostgreSQL knowledge catalog unavailable: {exc}"
+        finally:
+            if pool is not None and pool is not self.pool:
+                # A failed/cancelled schema setup must not leak an unpublished pool.
+                pool.terminate()
 
     async def close(self) -> None:
         if self.pool is not None:

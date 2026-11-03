@@ -48,7 +48,7 @@ from app_protocols import (
 )
 from app_protocols.base import Metadata, ProtocolModel, metadata_field
 from app_protocols.orchestrator import ConversationOrchestrator
-from services.gateway.auth import authenticate_user, authorize_request_user
+from services.gateway.auth import authenticate_user, authorize_request_user, public_metadata
 from services.gateway.concurrency import ConcurrencyLease, ConcurrencyRejected, KeyedConcurrencyLimiter
 from services.gateway.keyword_filter import (
     KeywordFilterDecision,
@@ -120,8 +120,8 @@ async def _gateway_lifespan(application: FastAPI) -> AsyncIterator[None]:
             if _read_bool_env("GATEWAY_STARTUP_WARMUP_ENABLED", True)
             else None
         )
-        await asyncio.sleep(0)
         try:
+            await asyncio.sleep(0)
             yield
         finally:
             if warmup_task is not None:
@@ -347,6 +347,7 @@ class HTTPLLMProvider:
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         payload = _model_to_dict(request)
+        payload["metadata"] = public_metadata(request.metadata)
         headers: dict[str, str] = {}
         internal_api_key = os.getenv("LLM_INTERNAL_API_KEY", "").strip()
         if internal_api_key:
@@ -370,6 +371,7 @@ class HTTPLLMProvider:
 
     async def stream_complete(self, request: LLMRequest) -> AsyncIterator[StreamEvent]:
         payload = _model_to_dict(request)
+        payload["metadata"] = public_metadata(request.metadata)
         headers: dict[str, str] = {}
         internal_api_key = os.getenv("LLM_INTERNAL_API_KEY", "").strip()
         if internal_api_key:

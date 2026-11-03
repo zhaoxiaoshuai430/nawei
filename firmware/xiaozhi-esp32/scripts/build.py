@@ -9,7 +9,6 @@ import re
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
-from pathlib import Path
 
 # Switch to project root directory
 os.chdir(Path(__file__).resolve().parent.parent)

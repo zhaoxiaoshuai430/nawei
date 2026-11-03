@@ -56,7 +56,6 @@ def generate_header(lang_code, output_path):
     main_dir = os.path.dirname(output_path)  # main/assets
     if os.path.basename(main_dir) == 'assets':
         main_dir = os.path.dirname(main_dir)  # main
-    project_dir = os.path.dirname(main_dir)  # 项目根目录
     assets_dir = os.path.join(main_dir, 'assets')
     
     # 构建语言JSON文件路径
@@ -135,12 +134,6 @@ def generate_header(lang_code, output_path):
     # 生成语言特定音效常量
     for file in sorted(all_sound_files):
         base_name = os.path.splitext(file)[0]
-        # 优先使用当前语言的音效，如果不存在则回退到 en-US
-        if file in current_sounds:
-            sound_lang = lang_code.replace('-', '_').lower()
-        else:
-            sound_lang = 'en_us'
-            
         sounds.append(f'''
         extern const char ogg_{base_name}_start[] asm("_binary_{base_name}_ogg_start");
         extern const char ogg_{base_name}_end[] asm("_binary_{base_name}_ogg_end");

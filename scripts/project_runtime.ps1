@@ -97,7 +97,30 @@ function Get-NaweiServiceDefinitions {
 function Test-NaweiPortListening {
     param([int]$Port)
 
-    return $null -ne (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+    try {
+        if ($null -ne (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop)) {
+            return $true
+        }
+        return $false
+    }
+    catch {
+        # Some Windows sessions cannot query the TCP table without elevation.
+        # A loopback connect still provides the needed occupied-port check.
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $connect = $client.ConnectAsync("127.0.0.1", $Port)
+            if (-not $connect.Wait(250)) {
+                return $false
+            }
+            return $client.Connected
+        }
+        catch {
+            return $false
+        }
+        finally {
+            $client.Dispose()
+        }
+    }
 }
 
 function Test-NaweiHealth {
@@ -230,7 +253,7 @@ function Assert-NaweiProcessOwner {
 }
 
 function Wait-NaweiLlmDrain {
-    param($Record, [int]$TimeoutSeconds = 150, [switch]$ForceStop)
+    param($Record, [int]$TimeoutSeconds = 330, [switch]$ForceStop)
     if ($ForceStop) {
         Write-Warning 'Forcing LLM stop; unfinished memory writes may be lost.'
         return

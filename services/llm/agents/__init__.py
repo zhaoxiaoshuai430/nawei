@@ -1,6 +1,10 @@
 """Agent orchestration package owned by the LLM service."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from services.llm.agents.runtime_tool_agent import LangChainRuntimeToolAgent, RuntimeToolAgentResult
+    from services.llm.agents.tutor_graph import TutorGraph
 
 __all__ = ["LangChainRuntimeToolAgent", "RuntimeToolAgentResult", "TutorGraph"]
 

@@ -91,6 +91,14 @@ async def test_pool_runs_independent_models_concurrently_and_pins_sessions(model
     assert pool.snapshot()["sessions"] == pool.snapshot()["active"] == 0
 
 
+def test_pool_assigns_new_session_away_from_busy_equal_session_worker(model_pool):
+    pool, _, _ = model_pool
+    pool.models[0].capacity._active = 1
+    with pool.session() as selected:
+        assert selected is pool.models[1]
+    pool.models[0].capacity._active = 0
+
+
 @pytest.mark.parametrize("cancel_count", [1, 3])
 async def test_cancelled_decode_keeps_worker_exclusive_until_thread_finishes(model_pool, cancel_count):
     pool, starts, releases = model_pool

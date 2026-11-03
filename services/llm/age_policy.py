@@ -7,10 +7,6 @@ from datetime import date, datetime
 from typing import Any, Mapping
 
 
-MIN_SUPPORTED_AGE = 3
-MAX_SUPPORTED_AGE = 17
-
-
 @dataclass(frozen=True)
 class AgeStage:
     code: str

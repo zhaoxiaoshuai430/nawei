@@ -17,11 +17,18 @@ production container uses the `gateway_devices` volume at `/var/lib/nawei`.
 
 ## Provisioning and identity
 
-The firmware generates 32 random bytes on first OTA access, stores their hex
-encoding as `nawei/device_key` in NVS, and supplies `X-Device-Key` to OTA only.
-It also supplies its MAC as `Device-Id` and persistent UUID as `Client-Id`.
+The backend requires a stable per-device provisioning secret in `X-Device-Key`
+on OTA requests, alongside MAC `Device-Id` and persistent UUID `Client-Id`.
+The simulator generates a 32-byte secret and sends its hex encoding. A firmware
+integration must generate and persist its own secret before first registration.
 The server stores the key hash, never the key. MAC/UUID alone cannot retrieve
 a bound device credential. This is first-use registration, not hardware attestation.
+
+The bundled `firmware/xiaozhi-esp32/main/ota.cc` currently sends Device-Id and
+Client-Id but does not generate, store, or send X-Device-Key. Changing only its
+OTA URL is insufficient for the default backend: registration returns 401.
+The protocol simulator passes because it implements this required header;
+its success is not proof that the bundled firmware can activate unchanged.
 
 OTA returns a six-digit activation code for an unbound device. Codes expire after
 600 seconds, are consumed transactionally, and cannot overwrite an existing owner.
@@ -115,15 +122,18 @@ still needs a matching trusted IP certificate and proxy configuration. These
 server-specific settings are pending; local startup does not configure them.
 Run the local startup/restart scripts without extra public-profile switches.
 
-Firmware `CONFIG_OTA_URL` is blank after removing the previous external endpoint.
-Before building, set it in `ROBOT/sdkconfig` and `ROBOT/sdkconfig.nawei` to
-`https://<server-ip>/xiaozhi/ota/`. The OTA response supplies
-`wss://<server-ip>/xiaozhi/v1/`. Verify the firmware trusts the certificate issuer.
-Nawei mode ignores the old
-`wifi/ota_url` NVS override so the initialization key cannot follow an old cloud URL.
-ESP-IDF v5.5.5 is referenced by the project's old VS Code setup, but must be
-installed and activated on the actual build machine. Use a new build directory
-such as `build-nawei`; the existing build cache contains paths from another PC.
+Firmware lives in `firmware/xiaozhi-esp32`; there is no `ROBOT/` directory in
+this repository. Its Kconfig OTA default is an upstream endpoint, not blank.
+Before building, select the actual board and configure `CONFIG_OTA_URL` as
+`https://<your-domain>/xiaozhi/ota/` and `CONFIG_NAWEI_SERVER_MODE=y` through
+the board configuration/menuconfig workflow. This mode ignores `wifi/ota_url`
+stored in NVS. The OTA response supplies the configured WSS address. Verify
+certificate trust and implement the provisioning secret described above before
+attempting physical activation.
+The current firmware requires ESP-IDF >= 6.0.1; 6.1 is recommended and required
+for ESP32-S31. See the firmware README and use `scripts/build.py` inside that
+firmware directory; the old IDF 5.x and `ROBOT/scripts/build_nawei.ps1` instructions
+do not apply to this source tree.
 Production NVS encryption/flash protection needs a separate hardware decision;
 this change does not burn eFuses or claim encrypted NVS.
 
@@ -153,9 +163,10 @@ The restart check interrupts Gateway connections, so run it after other live tes
 `restart_robot_services.ps1 -Names llm` also supports reloading the LLM service;
 startup and restart share the same local infrastructure environment defaults.
 Restart now waits for service readiness (including required LLM memory), with
-`-TimeoutSeconds 180` by default. A process launch alone is not reported as ready.
+`-TimeoutSeconds 900` by default. A process launch alone is not reported as ready.
 Response-policy checks cover result-only answers,
-single-sentence answers and detailed explanations without follow-up questions.
+single-sentence answers without a follow-up and detailed explanations with one
+exploration question joining two directions (the current response-policy assertions).
 For the nickname/color three-turn simulator scenario, use `--memory-report` with
 `check_full_flow.py` after dot-sourcing `scripts/project_runtime.ps1` and calling
 `Initialize-NaweiLocalEnvironment`. It compares Redis/API history with PostgreSQL

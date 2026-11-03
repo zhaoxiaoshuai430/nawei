@@ -67,6 +67,18 @@ metadata for auditing. User-facing citation fields are normalized as follows:
 - reference catalog entries: publisher + publication title + chapter/page + public URL;
 - derived matrices and findings: named project analysis + country/age/domain path, without a fabricated URL.
 
+Prompt character budgets preserve each included chunk's complete attribution.
+Long evidence is excerpted with an explicit truncation marker; chunks whose
+attribution cannot fit are omitted, and source numbers retain their original
+positions. Graph facts are included whole. Citation instructions require actual
+support for the answer: taxonomy entries support classification, not technical
+claims, and missing source fields must not be invented.
+
+Independent retrieval branches still run concurrently. If entity resolution,
+embedding, or graph expansion fails, sibling tasks are cancelled and awaited
+before the error returns. This also applies to individual Neo4j relation groups;
+failed retrievals do not cache partial results.
+
 The importer dry-run reports `citation_audit`. Both
 `internal_source_names` and `internal_source_locators` must be zero before an
 Atlas migration is applied.
@@ -154,7 +166,14 @@ matches the shared catalog and graph. It is a migration-time snapshot, not a
 live replica: new ingestion or deletions after activation require reconciliation
 before rollback. Keep writes paused across migration and activation.
 
-Container deployments do not install these optional dependencies automatically.
-Install `deploy/requirements-embeddings.txt` in the Knowledge image, mount the
-prepared model cache, and pass the model/index/cache settings explicitly; do not
-assume the ignored local `.env.knowledge` file is available inside a container.
+Production Compose builds the `knowledge` target of `deploy/Dockerfile.app`,
+which installs `deploy/requirements-embeddings.txt`. It mounts the prepared
+`models/embeddings` directory read-only at `/models/embeddings` and passes
+model/index/cache settings explicitly. The generic `app` target does not install
+FastEmbed. The ignored local `.env.knowledge` file is not copied into either image.
+
+Graph relations are validated structurally and written during successful document
+ingestion, using either rule or LLM extraction, or explicit structured input.
+There is no implemented human approval queue between extraction and publication;
+source review remains an operational responsibility. Ordinary chat answers are
+not automatically ingested as knowledge documents.

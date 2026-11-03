@@ -13,6 +13,8 @@ fallback so local protocol tests remain fast and deterministic.
 
 from __future__ import annotations
 
+from services.llm.summary.repository import guard_write, invalidate, write_epoch
+
 import asyncio
 import hashlib
 import json
@@ -80,16 +82,18 @@ Output schema:
     "preferences": {"topics_enjoy": string[] optional, "topics_avoid": string[] optional} optional,
     "learning_state": object optional,
     "grade": string optional,
-    "subjects": string[] optional
+    "subjects": string[] optional,
+    "personality": {"confirmed": string[] optional} optional
   },
   "memories": [
     {
       "content": string,
-      "memory_type": "profile_fact" | "learning_state" | "preference" | "learning_event" | "plan" | "weakness",
+      "memory_type": "profile_fact" | "learning_state" | "preference" | "learning_event" | "plan" | "weakness" | "behavior_observation",
       "importance": integer 1-10,
       "confidence": number 0-1,
       "sensitivity": "normal" | "sensitive" | "private",
       "tags": string[],
+      "evidence": {"source_text": string, "extractor": string} optional,
       "summary": string or null,
       "expires_at": string or null
     }
@@ -101,6 +105,9 @@ Must extract these when present:
 - grade, subject, current topic -> profile.grade/current_focus and a learning_state memory.
 - phrases like "I don't understand", "I always get stuck", "weak at" -> weakness memory.
 - likes/dislikes about teaching style or topics -> profile.preferences and preference memory.
+- explicit self-described personality (for example, "我比较慢热") -> profile.personality.confirmed and a profile_fact memory.
+- explicit self-described interaction behavior can be a behavior_observation memory with confidence and source evidence.
+- Never infer personality from one answer, emotion, silence, writing style, or the assistant's own interpretation.
 - homework, exam, deadline, study plan -> plan or learning_event memory.
 
 Do not extract greetings, thanks, filler, or questions asking what you remember.
@@ -165,6 +172,7 @@ class MemoryStore:
         enabled: bool | None = None,
         extractor_client: Any = None,
     ) -> None:
+        self.summary_enabled = False
         raw_enabled = os.getenv("MEMORY_ENABLED", "true").strip().lower()
         self.enabled = enabled if enabled is not None else raw_enabled not in {"0", "false", "no", "off"}
         self.database_url = database_url or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
@@ -505,7 +513,7 @@ class MemoryStore:
             hits = [
                 _memory_hit_from_item(item, score=0.95)
                 for item in self._memory_items.get(user_id, [])
-                if not item.get("is_deleted") and item.get("memory_type") in {"profile_fact", "preference"}
+                if not item.get("is_deleted") and item.get("memory_type") in {"profile_fact", "preference", "behavior_observation"}
             ]
             return [hit for hit in hits if not query or _foundation_memory_relevant(hit, query)][:top_k]
 
@@ -517,7 +525,7 @@ class MemoryStore:
                        0.95::float AS score
                 FROM navi_memories
                 WHERE user_id = $1
-                  AND memory_type IN ('profile_fact', 'preference')
+                  AND memory_type IN ('profile_fact', 'preference', 'behavior_observation')
                   AND NOT is_deleted
                   AND importance >= 4
                   AND (expires_at IS NULL OR expires_at > now())
@@ -590,6 +598,7 @@ class MemoryStore:
             return []
 
         if self._pool is None:
+            await guard_write(None, user_id)
             self._touch_fallback_user(user_id)
             updated: list[LearningConcept] = []
             bucket = self._memory_concepts.setdefault(user_id, [])
@@ -640,6 +649,7 @@ class MemoryStore:
         updated_rows: list[Any] = []
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                await guard_write(conn, user_id)
                 for signal in signals:
                     row = await conn.fetchrow(
                         """
@@ -825,6 +835,17 @@ class MemoryStore:
     async def get_history(self, *, user_id: str, session_id: str, limit: int = 10) -> list[dict[str, str]]:
         """Return recent short-term messages in chronological order."""
 
+        if self.summary_enabled:
+            if self._pool is None:
+                return []
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch("""SELECT role,content FROM (
+                    SELECT role,content,created_at,id FROM navi_messages
+                    WHERE user_id=$1 AND session_id=$2
+                    ORDER BY created_at DESC, CASE WHEN role='assistant' THEN 1 ELSE 0 END DESC,id DESC LIMIT $3
+                    ) recent ORDER BY created_at, CASE WHEN role='assistant' THEN 1 ELSE 0 END,id""",
+                    user_id, session_id, limit)
+            return [_compact_message(dict(row)) for row in rows]
         key = self._history_key(user_id, session_id)
         pending = [dict(item) for item in self._memory_messages.get(key, []) if not item.get("redis_persisted")]
         redis_client = self._redis
@@ -959,6 +980,12 @@ class MemoryStore:
     async def get_profile(self, user_id: str) -> dict[str, Any]:
         """Read a user profile from Redis cache or PostgreSQL."""
 
+        if self.summary_enabled:
+            if self._pool is None:
+                return {}
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT profile_data FROM navi_user_profiles WHERE user_id=$1", user_id)
+            return _normalize_education_profile(_jsonb_to_dict(row["profile_data"]) if row else {})
         self._touch_fallback_user(user_id)
         cached_profile = self._profile_process_cache.get(user_id)
         if cached_profile and time.time() - cached_profile[0] <= PROFILE_CACHE_TTL_SECONDS:
@@ -997,6 +1024,8 @@ class MemoryStore:
     async def update_profile(self, *, user_id: str, changes: dict[str, Any], reason: str, session_id: str) -> None:
         """Merge profile changes into the simplified user profile table."""
 
+        if self._pool is None:
+            await guard_write(None, user_id)
         if not changes:
             return
         normalized_changes = _normalize_education_profile(changes)
@@ -1005,6 +1034,9 @@ class MemoryStore:
         if self._pool is not None:
             async with self._pool.acquire() as conn:
                 async with conn.transaction():
+                    await guard_write(conn, user_id)
+                    if self.summary_enabled and write_epoch.get() is None:
+                        await invalidate(conn, user_id)
                     await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", user_id)
                     row = await conn.fetchrow(
                         "SELECT profile_data FROM navi_user_profiles WHERE user_id = $1",
@@ -1080,7 +1112,7 @@ class MemoryStore:
                       OR ($2 = 'grade' AND (content LIKE '%初%' OR content LIKE '%高%' OR content LIKE '%年级%'))
                       OR ($2 = 'current_focus' AND (content LIKE '%学习%' OR content LIKE '%学%'))
                   )
-                  AND content NOT ILIKE '%' || $3 || '%'
+                  AND ($2 = 'personality' OR content NOT ILIKE '%' || $3 || '%')
                 """,
                 user_id,
                 profile_field,
@@ -1104,7 +1136,7 @@ class MemoryStore:
             mixed_focus = "current_focus" in signatures and any(marker in content for marker in ("学习", "学"))
             if (
                 field in signatures
-                and str(signatures[field]) not in content
+                and (field == "personality" or str(signatures[field]) not in content)
                 or mixed_grade
                 and str(signatures.get("grade")) not in content
                 or mixed_focus
@@ -1262,6 +1294,7 @@ class MemoryStore:
         decay_category = "high" if importance >= 8 else "low" if importance <= 5 else "medium"
 
         if self._pool is None:
+            await guard_write(None, user_id)
             self._touch_fallback_user(user_id)
             incoming_record = {
                 "content": content,
@@ -1273,7 +1306,8 @@ class MemoryStore:
                 (
                     item
                     for item in self._memory_items.get(user_id, [])
-                    if item.get("content_hash") == content_hash or _records_refer_to_same_memory(item, incoming_record)
+                    if not item.get("is_deleted")
+                    and (item.get("content_hash") == content_hash or _records_refer_to_same_memory(item, incoming_record))
                 ),
                 None,
             )
@@ -1285,6 +1319,8 @@ class MemoryStore:
                 existing["confidence"] = max(float(existing.get("confidence", 0.75)), confidence)
                 existing["tags"] = _normalize_tags(list(existing.get("tags", [])) + tags)
                 existing["summary"] = existing.get("summary") or summary
+                existing["evidence"] = {**dict(existing.get("evidence") or {}), **evidence}
+                existing["source_session_id"] = session_id
                 return str(existing["id"])
             if profile_signature:
                 self._obsolete_profile_conflicts_in_memory(
@@ -1302,8 +1338,9 @@ class MemoryStore:
                     "importance": importance,
                     "sensitivity": sensitivity,
                     "confidence": confidence,
-                    "tags": tags,
+                    "source_session_id": session_id,
                     "evidence": evidence,
+                    "tags": tags,
                     "usage_count": 0,
                     "content_hash": content_hash,
                     "is_deleted": False,
@@ -1314,6 +1351,7 @@ class MemoryStore:
 
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                await guard_write(conn, user_id)
                 if profile_signature:
                     await self._obsolete_profile_conflicts(
                         conn=conn,
@@ -1447,6 +1485,19 @@ class MemoryStore:
             profile_changes = _merge_profile(profile_changes, extraction.get("profile", {}))
             memory_records = _merge_memory_records(memory_records, extraction.get("memories", []))
 
+        # Only explicit source declarations can promote personality to a profile.
+        # Apply this even on the LLM-only path, independently of model compliance.
+        confirmed = _explicit_personality(user_text)
+        profile_changes.pop("personality", None)
+        memory_records = [record for record in memory_records if not _is_personality_record(record)]
+        if confirmed:
+            profile_changes["personality"] = {"confirmed": confirmed}
+            memory_records = [
+                {"content": f"我的性格是{trait}", "memory_type": "profile_fact",
+                 "importance": 8, "confidence": 0.9, "tags": ["profile_fact", "personality"]}
+                for trait in confirmed
+            ] + memory_records
+
         if not profile_changes and not memory_records:
             return
 
@@ -1462,7 +1513,11 @@ class MemoryStore:
                 sensitivity=record.get("sensitivity", "normal"),
                 summary=record.get("summary"),
                 tags=record["tags"],
-                evidence={"source_text": user_text[:240], "extractor": record.get("extractor", "rules")},
+                evidence={
+                    **dict(record.get("evidence") or {}),
+                    "source_text": user_text[:240],
+                    "extractor": record.get("extractor", "rules"),
+                },
                 expires_at=record.get("expires_at"),
             )
 
@@ -1595,16 +1650,19 @@ class MemoryStore:
             return False
 
         async with self._pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE navi_memories
-                SET is_deleted = TRUE, deleted_at = now(), deleted_reason = $3, updated_at = now()
-                WHERE id = $1 AND user_id = $2 AND NOT is_deleted
-                """,
-                memory_id,
-                user_id,
-                reason,
-            )
+            async with conn.transaction():
+                if self.summary_enabled:
+                    await invalidate(conn, user_id)
+                result = await conn.execute(
+                    """
+                    UPDATE navi_memories
+                    SET is_deleted = TRUE, deleted_at = now(), deleted_reason = $3, updated_at = now()
+                    WHERE id = $1 AND user_id = $2 AND NOT is_deleted
+                    """,
+                    memory_id,
+                    user_id,
+                    reason,
+                )
         return result.endswith(" 1")
 
     async def memory_stats(self, *, user_id: str) -> dict[str, Any]:
@@ -1634,6 +1692,8 @@ class MemoryStore:
         """Soft-delete user memories and clear cached profile/history."""
 
         await self.initialize()
+        if self.summary_enabled and self._pool is None:
+            raise RuntimeError("Cannot clear durable memory while PostgreSQL is unavailable")
         self._memory_profiles.pop(user_id, None)
         self._profile_process_cache.pop(user_id, None)
         self._memory_items.pop(user_id, None)
@@ -1663,6 +1723,8 @@ class MemoryStore:
             return
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                if self.summary_enabled:
+                    await invalidate(conn, user_id)
                 await conn.execute(
                     "UPDATE navi_memories SET is_deleted = TRUE, deleted_at = now(), updated_at = now() WHERE user_id = $1",
                     user_id,
@@ -1858,6 +1920,13 @@ def _normalize_education_profile(profile: dict[str, Any]) -> dict[str, Any]:
     preferences = dict(normalized.get("preferences") or {})
     subject_states = dict(normalized.get("subject_states") or {})
     interaction_style = dict(normalized.get("interaction_style") or {})
+    personality_value = normalized.get("personality")
+    personality = {"confirmed": personality_value.get("confirmed")} if isinstance(personality_value, dict) else {}
+    confirmed_personality = personality.get("confirmed")
+    if isinstance(confirmed_personality, list):
+        personality["confirmed"] = _unique_profile_strings(confirmed_personality, limit=8)
+    else:
+        personality.pop("confirmed", None)
     risk_flags = dict(normalized.get("risk_flags") or {})
     audience_profile = audience_profile_from_profile(normalized)
 
@@ -1904,11 +1973,33 @@ def _normalize_education_profile(profile: dict[str, Any]) -> dict[str, Any]:
     normalized["subject_states"] = subject_states
     normalized["interaction_style"] = interaction_style
     normalized["risk_flags"] = risk_flags
+    if personality.get("confirmed"):
+        normalized["personality"] = personality
+    else:
+        normalized.pop("personality", None)
     if audience_profile:
         normalized["audience_profile"] = audience_profile
     else:
         normalized.pop("audience_profile", None)
     return {key: value for key, value in normalized.items() if value not in (None, "", [], {})}
+
+
+def _unique_profile_strings(values: list[Any], *, limit: int) -> list[str]:
+    """Normalize short profile labels while preserving first-seen order."""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        text = _clean_space(value)
+        if not text or len(text) > 80 or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
 
 
 def _profile_for_storage(profile: dict[str, Any]) -> dict[str, Any]:
@@ -1925,7 +2016,7 @@ def _profile_for_query(profile: dict[str, Any], query: str) -> dict[str, Any]:
     filtered: dict[str, Any] = {}
     for key in (
         "nickname", "grade", "grade_code", "identity", "interaction_style", "risk_flags",
-        "assistant_persona", "assistant_dialect", "audience_profile",
+        "assistant_persona", "assistant_dialect", "audience_profile", "personality",
     ):
         if key in profile:
             filtered[key] = profile[key]
@@ -1989,7 +2080,7 @@ def _preferences_for_query(preferences: Any, query: str) -> dict[str, Any]:
 def _foundation_memory_relevant(memory: MemoryHit, query: str) -> bool:
     if _looks_like_memory_question(query):
         return True
-    if memory.memory_type not in {"profile_fact", "preference"}:
+    if memory.memory_type not in {"profile_fact", "preference", "behavior_observation"}:
         return True
     text = " ".join([memory.content, memory.summary or "", " ".join(memory.tags)])
     return _profile_value_relevant(text, query) or _looks_like_style_preference(text)
@@ -2054,6 +2145,12 @@ def _profile_signatures_from_changes(changes: dict[str, Any]) -> dict[str, Any]:
     current_focus = changes.get("current_focus") or learning_profile.get("current_focus")
     if current_focus:
         signatures["current_focus"] = current_focus
+    personality_value = changes.get("personality")
+    personality = personality_value if isinstance(personality_value, dict) else {}
+    confirmed = personality.get("confirmed")
+    if isinstance(confirmed, list):
+        if confirmed:
+            signatures["personality"] = "、".join(_unique_profile_strings(confirmed, limit=8))
     return signatures
 
 
@@ -2061,6 +2158,10 @@ def _merge_profile(current: dict[str, Any], changes: dict[str, Any]) -> dict[str
     merged = dict(current)
     for key, value in changes.items():
         if value in (None, "", [], {}):
+            continue
+        if key == "personality" and isinstance(value, dict):
+            # A fresh explicit description replaces the previous snapshot.
+            merged[key] = dict(value)
             continue
         merged[key] = _merge_profile_value(merged.get(key), value)
     return merged
@@ -2122,7 +2223,7 @@ def _normalize_llm_memory_record(item: dict[str, Any]) -> dict[str, Any] | None:
     if not _should_remember(content, importance):
         return None
     memory_type = str(item.get("memory_type") or "episodic").strip().lower()
-    if memory_type not in {"profile_fact", "learning_state", "preference", "learning_event", "plan", "weakness", "episodic"}:
+    if memory_type not in {"profile_fact", "learning_state", "preference", "learning_event", "plan", "weakness", "behavior_observation", "episodic"}:
         memory_type = "episodic"
     confidence = _clamp_float(item.get("confidence", 0.7), 0.0, 1.0)
     sensitivity = _normalize_sensitivity(str(item.get("sensitivity") or "normal"), content)
@@ -2139,17 +2240,27 @@ def _normalize_llm_memory_record(item: dict[str, Any]) -> dict[str, Any] | None:
         "summary": summary[:160] if summary else None,
         "expires_at": str(expires_at) if expires_at else None,
         "extractor": "llm",
+        "evidence": dict(item.get("evidence") or {}) if isinstance(item.get("evidence"), dict) else {},
     }
 
 
 def _sanitize_profile_changes(profile: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"nickname", "current_focus", "preferences", "learning_state", "grade", "subjects"}
+    allowed = {"nickname", "current_focus", "preferences", "learning_state", "grade", "subjects", "personality"}
     cleaned: dict[str, Any] = {}
     for key, value in profile.items():
         if key not in allowed or value in (None, "", [], {}):
             continue
         if key == "nickname" and _looks_like_unknown_answer(str(value)):
             continue
+        if key == "personality":
+            if not isinstance(value, dict):
+                continue
+            confirmed = value.get("confirmed")
+            if not isinstance(confirmed, list):
+                continue
+            value = {"confirmed": _unique_profile_strings(confirmed, limit=8)}
+            if not value["confirmed"]:
+                continue
         cleaned[key] = value
     return cleaned
 
@@ -2190,6 +2301,8 @@ def _merge_into_memory_record(current: dict[str, Any], normalized: dict[str, Any
     current["confidence"] = max(float(current.get("confidence", 0.7)), float(normalized.get("confidence", 0.7)))
     current["tags"] = _normalize_tags(list(current.get("tags", [])) + list(normalized.get("tags", [])))
     current["summary"] = current.get("summary") or normalized.get("summary")
+    if normalized.get("evidence"):
+        current["evidence"] = {**dict(current.get("evidence") or {}), **dict(normalized["evidence"])}
     if current.get("sensitivity") == "normal":
         current["sensitivity"] = normalized.get("sensitivity", "normal")
 
@@ -2201,6 +2314,8 @@ def _records_refer_to_same_memory(left: dict[str, Any], right: dict[str, Any]) -
     right_fact_key = _profile_fact_signature_from_record(right) or _profile_fact_key(right)
     if left_fact_key and left_fact_key == right_fact_key:
         return True
+    if left_fact_key and right_fact_key and "personality" in (left_fact_key[0], right_fact_key[0]):
+        return False
     return _memory_text_similarity(str(left.get("content", "")), str(right.get("content", ""))) >= 0.55
 
 
@@ -2266,6 +2381,15 @@ def _profile_fact_signature(content: str) -> tuple[str, str] | None:
     )
     if focus and not _looks_like_unknown_answer(focus):
         return ("current_focus", focus)
+    personality = _first_match(
+        content,
+        [
+            r"(?:我的性格(?:是|比较|有点|属于)?|我(?:比较|有点))(内向|外向|慢热|谨慎|开朗|安静|好奇|耐心|急性子|容易紧张|容易焦虑)",
+            r"我的性格(?:是|比较|有点|属于)\s*([^，。！？；;,.!?\n]{1,24})",
+        ],
+    )
+    if personality and not _looks_like_unknown_answer(personality):
+        return ("personality", personality)
     return None
 
 
@@ -2347,6 +2471,21 @@ def _extract_profile_changes(text: str) -> dict[str, Any]:
         interaction_style["tone"] = "direct"
     if interaction_style:
         changes["interaction_style"] = interaction_style
+    # Personality is persisted only when the student explicitly describes
+    # themselves. Questions, preferences, and one-off emotional language do
+    # not create a personality profile entry.
+    personality = _first_match(
+        text,
+        [
+            r"我的性格(?:是|比较|有点|属于)?\s*(内向|外向|慢热|谨慎|开朗|安静|好奇|耐心|急性子|容易紧张|容易焦虑)",
+            r"我(?:比较|有点)\s*(内向|外向|慢热|谨慎|开朗|安静|好奇|耐心|急性子|容易紧张|容易焦虑)",
+            r"我的性格(?:是|比较|有点|属于)\s*([^，。！？；;,.!?\n]{1,24})",
+        ],
+    )
+    if personality:
+        personality = _clean_space(personality)
+        if not any(marker in personality for marker in ("喜欢", "想学", "不喜欢", "不要", "回答", "什么")):
+            changes["personality"] = {"confirmed": [personality]}
     persistent_persona = re.search(
         r"(?:以后|今后|从现在开始|一直|默认|切换(?:到|成)?|改成|设为).{0,10}(温柔|柔和|幽默|有趣)",
         text,
@@ -2372,6 +2511,27 @@ def _extract_profile_changes(text: str) -> dict[str, Any]:
     return changes
 
 
+def _explicit_personality(text: str) -> list[str]:
+    changes = _extract_profile_changes(text)
+    personality = changes.get("personality")
+    if not isinstance(personality, dict):
+        return []
+    confirmed = personality.get("confirmed")
+    return _unique_profile_strings(confirmed, limit=8) if isinstance(confirmed, list) else []
+
+
+def _is_personality_record(record: dict[str, Any]) -> bool:
+    if str(record.get("memory_type")) != "profile_fact":
+        return False
+    content = str(record.get("content") or "")
+    signature = _profile_fact_signature(content)
+    if signature and signature[0] == "personality":
+        return True
+    # LLM profile facts that speculate about temperament must not become
+    # formal personality memories when the user did not self-describe it.
+    return any(marker in content for marker in ("性格", "看起来", "似乎", "可能是", "倾向于"))
+
+
 def _extract_memory_records(text: str) -> list[dict[str, Any]]:
     text = _memory_rule_text(_clean_space(text))
     if not text or len(text) < 3:
@@ -2387,6 +2547,20 @@ def _extract_memory_records(text: str) -> list[dict[str, Any]]:
         ("(?:初[一二三123]|高[一二三123]|[一二三四五六1-6]年级|小学[一二三四五六123456]年级?)", 7, "profile_fact"),
     ]
     records: list[dict[str, Any]] = []
+    explicit_personality = _extract_profile_changes(text).get("personality")
+    if isinstance(explicit_personality, dict):
+        confirmed = explicit_personality.get("confirmed")
+        if isinstance(confirmed, list):
+            for trait in _unique_profile_strings(confirmed, limit=2):
+                records.append(
+                    {
+                        "content": f"我的性格是{trait}",
+                        "importance": 8,
+                        "memory_type": "profile_fact",
+                        "confidence": 0.9,
+                        "tags": _infer_memory_tags(f"我的性格是{trait}", "profile_fact"),
+                    }
+                )
     for pattern, importance, memory_type in patterns:
         for match in re.findall(pattern, text):
             content = _clean_space(match)

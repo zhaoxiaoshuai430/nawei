@@ -12,7 +12,6 @@ model_cache: OrderedDict[str, FasterQwen3TTS] = OrderedDict()
 model_cache_max: int = int(os.environ.get("MODEL_CACHE_SIZE", "2"))
 active_model_name: str | None = None
 loading: bool = False
-parakeet = None
 generation_capacity = GenerationCapacity(
     limit=1,
     queue_limit=int(os.environ.get("TTS_MAX_QUEUE_SIZE", "16")),

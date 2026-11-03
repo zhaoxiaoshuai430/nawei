@@ -34,8 +34,11 @@ recordings with unchanged transcripts and separate cold/warm latency runs.
 Validated complete mono PCM16 16 kHz WAV uploads now bypass FFmpeg conversion.
 Other formats and malformed/truncated WAVs retain the conversion path. This
 removes preprocessing overhead; it does not change the ASR model or guarantee
-fewer recognition errors. No automatic text correction or language-default
-change is applied without representative accuracy evidence.
+fewer recognition errors. Final transcripts currently pass through the optional
+phrase correction layer (`ASR_TEXT_CORRECTIONS_ENABLED=true` and built-in rules
+enabled by default). Final events retain raw/clean text and applied corrections.
+Measure this layer separately from model accuracy; configured replacements do
+not establish accuracy gains on representative recordings.
 
 ## Robot first-audio latency
 

@@ -30,10 +30,16 @@ class LocalDrainState:
 
     def snapshot(self, runtime: Any) -> dict[str, Any]:
         persistence = runtime.persistence_status()
+        worker = getattr(runtime, "summary_worker", None)
+        if worker is not None and self.requested():
+            worker.stopping = True
+        summary = worker.status() if worker else {"summary_inflight": 0, "summary_scheduler_stopped": True}
         return {
             "pid": os.getpid(), "updated_at": time.time(), "active": self.active,
             "persistence": persistence,
-            "drained": self.requested() and self.active == 0 and persistence["pending"] == 0 and persistence["failed"] == 0,
+            "summary": summary,
+            "drained": self.requested() and self.active == 0 and persistence["pending"] == 0 and persistence["failed"] == 0
+                       and summary["summary_inflight"] == 0 and summary["summary_scheduler_stopped"],
         }
 
     def _write(self, body: dict[str, Any]) -> None:

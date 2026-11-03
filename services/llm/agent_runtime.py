@@ -12,7 +12,7 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from app_protocols import LLMRequest, Message, MessageRole, ToolCall, ToolFunctionCall
@@ -22,6 +22,10 @@ from services.llm.agents import LangChainRuntimeToolAgent, RuntimeToolAgentResul
 from services.llm.agents.runtime_tool_agent import RuntimeToolOutput
 from services.llm.agents.tutor_graph import is_contextual_followup
 from services.llm.memory import MemoryStore
+from services.llm.summary.policy import SummarySettings
+from services.llm.summary.repository import SummaryRepository, EpochChanged, RequestConflict, digest, write_epoch
+from services.llm.summary.worker import SummaryWorker
+from services.llm.summary.context import read_context, render_context
 from services.llm.conversation import (
     MEMORY_TOOL_NAMES,
     _normalize_answer_mode,
@@ -69,6 +73,7 @@ class AgentTurn:
     metadata: dict[str, Any] = field(default_factory=dict)
     started_at: float = field(default_factory=time.perf_counter)
     direct_answer: str | None = None
+    memory_epoch: int | None = None
 
 
 class LLMAgentRuntime:
@@ -81,6 +86,10 @@ class LLMAgentRuntime:
         safety_guard: LocalSafetyGuard | None = None,
     ) -> None:
         self.memory_store = memory_store or MemoryStore()
+        self.summary_settings = SummarySettings.from_env()
+        self.summary_repository = SummaryRepository(self.memory_store, self.summary_settings)
+        self.summary_worker = SummaryWorker(self.summary_repository)
+        self.memory_store.summary_enabled = self.summary_settings.enabled
         self.knowledge_client = knowledge_client or KnowledgeClient()
         self.safety_guard = safety_guard or LocalSafetyGuard()
         self.skill_manager = AgentSkillManager(self.memory_store, self.knowledge_client)
@@ -88,6 +97,7 @@ class LLMAgentRuntime:
         self._pending_weather_locations: dict[tuple[str, str], tuple[float, str]] = {}
         self._persistence_tasks: set[asyncio.Task[Any]] = set()
         self._persistence_locks: list[asyncio.Lock] = []
+        self._history_locks: list[asyncio.Lock] = []
         self._persistence_loop: asyncio.AbstractEventLoop | None = None
         self._persistence_started: dict[asyncio.Task[Any], float] = {}
         self._persistence_failures = 0
@@ -123,10 +133,17 @@ class LLMAgentRuntime:
                 knowledge = await self.knowledge_client.health()
             else:
                 raise RuntimeError("Required knowledge service is unavailable.")
+        if self.summary_settings.enabled:
+            # Check after dependency recovery, before starting any background
+            # work. Summaries require PostgreSQL even when legacy memory may
+            # fall back to process-local storage. Migrations remain explicit.
+            await self.summary_repository.check_schema()
+            self.summary_worker.start()
 
     async def close(self) -> None:
         # 先等待已登记的轮后写入，再关闭存储；此处的优雅退出不等于强制终止时也能保全数据。
         self._closing = True
+        await self.summary_worker.close()
         try:
             if self._persistence_tasks:
                 async with asyncio.timeout(_read_float_env("MEMORY_SHUTDOWN_TIMEOUT_SECONDS", 130.0)):
@@ -170,6 +187,13 @@ class LLMAgentRuntime:
             "memory": memory,
             "knowledge": knowledge,
             "persistence": self.persistence_status(),
+            "summary": {"enabled": self.summary_settings.enabled,
+                        "apply_to_prompt": self.summary_settings.apply_to_prompt,
+                        "read_timeout_seconds": self.summary_settings.read_timeout_seconds,
+                        "timeout_seconds": self.summary_settings.timeout_seconds,
+                        "online_policy_version": "summary-online-v3",
+                        "profile_promotion_enabled": self.summary_settings.profile_promotion_enabled,
+                        **self.summary_worker.status()},
         }
 
     async def prepare(self, request: LLMRequest) -> AgentTurn:
@@ -186,6 +210,33 @@ class LLMAgentRuntime:
         if not user_text or not _agent_enabled_for_request(request):
             turn.metadata = {"agent": {"enabled": False}}
             return turn
+
+        if self.summary_settings.enabled:
+            try:
+                # Creating/locking authoritative memory state is a persistence
+                # operation. The optional summary read's 100ms budget must not
+                # silently discard completed turns on a cold database connection.
+                async with asyncio.timeout(_read_float_env("MEMORY_HISTORY_WRITE_TIMEOUT_SECONDS", 5.0)):
+                    state = await self.summary_repository.state(user_id)
+                    turn.memory_epoch = state["memory_epoch"]
+            except Exception:
+                # Unverified personalized state must not enter a prompt.
+                context = await self.skill_manager.prepare_stateless_context(user_id=user_id,
+                    session_id=request.session_id, query=user_text)
+                turn.context = context
+                turn.request = _copy_request(request, messages=[
+                    Message(role=MessageRole.SYSTEM, content=self.skill_manager.render_system_prompt(context)),
+                    *[message for message in request.messages if message.role != MessageRole.SYSTEM]], tools=[])
+                turn.metadata = {"summary": {"status": "storage_unavailable"}}
+                return turn
+            previous = await self.summary_repository.previous_turn(user_id, request.request_id,
+                digest({"session_id": request.session_id,
+                        "messages": [message.model_dump(mode="json") for message in request.messages]}))
+            if previous is not None:
+                turn.context = await self.skill_manager.prepare_stateless_context(user_id=user_id,
+                    session_id=request.session_id, query=user_text)
+                turn.direct_answer = previous
+                return turn
 
         context_started = time.perf_counter()
         # 通用选项以 generation_config 覆盖 metadata；记忆读取模式和回答深度分别决定。
@@ -282,8 +333,20 @@ class LLMAgentRuntime:
                     {item.name: item.error for item in tool_result.outputs if item.error},
                 )
         tool_ms = round((time.perf_counter() - tool_started) * 1000)
+        summary_status: dict[str, Any] = {"status": "disabled"}
+        if self.summary_settings.enabled:
+            summary = await read_context(self.summary_repository, user_id, user_text, memory_mode,
+                history=context.memory.history, expected_epoch=turn.memory_epoch,
+                direct_tool=turn.direct_answer is not None or weather_query is not None
+                    or self.tool_agent.time_tool.should_run(user_text)
+                    or self.tool_agent.calculator_tool.extract_expression(user_text) is not None
+                    or self.tool_agent._has_unit_conversion(user_text)
+                    or context.tutor_strategy.get("intent", {}).get("category") == "realtime",
+                followup=is_contextual_followup(user_text), diagnostics=summary_status)
+            context = replace(context, summary_context=summary)
         tool_prompts = [item.prompt for item in tool_result.outputs if item.prompt]
         system_prompt = self.skill_manager.render_system_prompt(context)
+        system_prompt += render_context(context.summary_context)
         system_prompt = _apply_answer_mode_prompt(system_prompt, answer_mode)
         system_prompt += _reference_delivery_prompt(request)
         device_role = request.metadata.get("device_role")
@@ -332,6 +395,7 @@ class LLMAgentRuntime:
                 "memory_count": len(context.memory.memories),
                 "concept_count": len(context.concepts),
             },
+            "summary": summary_status,
             "knowledge": {
                 "knowledge_base_id": context.knowledge.knowledge_base_id,
                 "chunk_count": len(context.knowledge.chunks),
@@ -353,7 +417,8 @@ class LLMAgentRuntime:
                 ),
                 "skip_reason": context.knowledge.metadata.get("skip_reason"),
             },
-            "timings": {"context_ms": context_ms, "tools_ms": tool_ms},
+            "timings": {"context_ms": context_ms, "tools_ms": tool_ms,
+                        "summary_read_ms": summary_status.get("read_ms", 0)},
         }
         return turn
 
@@ -563,7 +628,7 @@ class LLMAgentRuntime:
     async def after_turn(self, turn: AgentTurn, assistant_text: str) -> dict[str, Any]:
         if turn.original_request.defer_persistence:
             return {"saved_turn": False, "reason": "voice_preview"}
-        # 先写进程内近期历史，使同进程的快速追问能看到刚完成的对话。
+        # 先缓存，再在返回完成前提交近期历史；长期抽取使用独立后台任务。
         # history_only 只保存消息；full 继续更新记忆/学习状态；fast 模式可配置跳过写入。
         if not assistant_text.strip() or turn.context is None or not _agent_enabled_for_request(turn.original_request):
             return {}
@@ -576,6 +641,8 @@ class LLMAgentRuntime:
         if self._closing:
             raise RuntimeError("Memory persistence is shutting down")
         post_started = time.perf_counter()
+        if self.summary_settings.enabled:
+            return await self._after_durable_turn(turn, assistant_text, mode)
         user_message_id, assistant_message_id = uuid.uuid4().hex, uuid.uuid4().hex
         user_content = self.memory_store.cache_message(
             user_id=turn.user_id,
@@ -595,21 +662,36 @@ class LLMAgentRuntime:
         if self._persistence_loop is not loop:
             self._persistence_loop = loop
             self._persistence_locks = [asyncio.Lock() for _ in range(32)]
+            self._history_locks = [asyncio.Lock() for _ in range(32)]
         # 固定数量的分片锁使同一用户会话的后台写入按序执行，避免用户/助手消息交错。
         # 这是进程内协调，不是跨多个 LLM worker 的分布式锁。
         lock = self._persistence_locks[hash((turn.user_id, turn.original_request.session_id)) % 32]
 
+        # Commit recent history before reporting completion. Slow extraction uses
+        # a separate lock so it cannot hold up another worker's conversation view.
+        history_lock = self._history_locks[hash((turn.user_id, turn.original_request.session_id)) % 32]
+        try:
+            async with asyncio.timeout(_read_float_env("MEMORY_HISTORY_WRITE_TIMEOUT_SECONDS", 5.0)):
+                async with history_lock:
+                    for role, content, message_id in (("user", user_content, user_message_id),
+                                                     ("assistant", assistant_content, assistant_message_id)):
+                        if content:
+                            await self.memory_store.persist_message(
+                                user_id=turn.user_id, session_id=turn.original_request.session_id,
+                                role=role, content=content, message_id=message_id,
+                            )
+        except (Exception, asyncio.CancelledError):
+            self._persistence_failures += 1
+            logging.getLogger(__name__).exception("Conversation history commit failed")
+            raise
+        if mode in {"history", "history_only", "messages"}:
+            turn.metadata.setdefault("timings", {})["memory_write_ms"] = round(
+                (time.perf_counter() - post_started) * 1000
+            )
+            return {"mode": "history_only", "saved_turn": True}
+
         async def persist_turn() -> dict[str, Any]:
             async with lock:
-                for role, content, message_id in (("user", user_content, user_message_id),
-                                                 ("assistant", assistant_content, assistant_message_id)):
-                    if content:
-                        await self.memory_store.persist_message(
-                            user_id=turn.user_id, session_id=turn.original_request.session_id,
-                            role=role, content=content, message_id=message_id,
-                        )
-                if mode in {"history", "history_only", "messages"}:
-                    return {"mode": "history_only", "saved_turn": True}
                 return await self.skill_manager.after_turn(
                     request_id=turn.original_request.request_id,
                     trace_id=turn.original_request.trace_id,
@@ -644,7 +726,7 @@ class LLMAgentRuntime:
             self._persistence_tasks.add(task)
             self._persistence_started[task] = time.monotonic()
             task.add_done_callback(self._persistence_completed)
-            result = {"mode": mode, "scheduled": True, "history_locally_cached": True}
+            result = {"mode": mode, "scheduled": True, "saved_turn": True, "history_locally_cached": True}
         else:
             try:
                 result = await bounded_persist_turn()
@@ -656,6 +738,67 @@ class LLMAgentRuntime:
             (time.perf_counter() - post_started) * 1000
         )
         return result
+
+    async def assert_turn_epoch(self, turn: AgentTurn) -> None:
+        if self.summary_settings.enabled and turn.memory_epoch is not None:
+            await self.summary_repository.assert_epoch(turn.user_id, turn.memory_epoch)
+
+    async def _after_durable_turn(self, turn: AgentTurn, assistant_text: str, mode: str) -> dict[str, Any]:
+        if turn.memory_epoch is None:
+            return {"saved_turn": False, "reason": "unverified_memory_epoch"}
+        epoch = turn.memory_epoch
+        request = turn.original_request
+        fingerprint = digest({"session_id": request.session_id,
+                              "messages": [message.model_dump(mode="json") for message in request.messages]})
+        try:
+            async with asyncio.timeout(_read_float_env("MEMORY_HISTORY_WRITE_TIMEOUT_SECONDS", 5.0)):
+                result = await self.summary_repository.commit_turn(user_id=turn.user_id, session_id=request.session_id,
+                    request_id=request.request_id, fingerprint=fingerprint, epoch=turn.memory_epoch,
+                    user_text=turn.user_text, assistant_text=assistant_text)
+        except EpochChanged:
+            return {"saved_turn": False, "reason": "memory_changed"}
+        except RequestConflict:
+            raise
+        except Exception:
+            self._persistence_failures += 1
+            raise
+        if result["duplicate"] or mode in {"history", "history_only", "messages"}:
+            return {"saved_turn": True, **result}
+
+        loop = asyncio.get_running_loop()
+        if self._persistence_loop is not loop:
+            self._persistence_loop = loop
+            self._persistence_locks = [asyncio.Lock() for _ in range(32)]
+            self._history_locks = [asyncio.Lock() for _ in range(32)]
+        extraction_lock = self._persistence_locks[hash(turn.user_id) % 32]
+
+        async def extract() -> None:
+            token = write_epoch.set((turn.user_id, epoch))
+            try:
+                async with asyncio.timeout(_read_float_env("MEMORY_POST_TURN_TIMEOUT_SECONDS", 120.0)):
+                    async with extraction_lock:
+                        await self.summary_repository.assert_epoch(turn.user_id, epoch)
+                        await self.skill_manager.after_turn(request_id=request.request_id, trace_id=request.trace_id,
+                            session_id=request.session_id, user_id=turn.user_id, user_text=turn.user_text,
+                            assistant_text=assistant_text, context=turn.context,
+                            latency_ms=round((time.perf_counter()-turn.started_at)*1000),
+                            timings=turn.metadata.get("timings"), history_already_saved=True)
+            except EpochChanged:
+                pass
+            finally:
+                write_epoch.reset(token)
+
+        if _read_bool_env("MEMORY_POST_TURN_ASYNC", True):
+            # Extraction is optional after the authoritative turn commit; bounded admission.
+            if len(self._persistence_tasks) >= self.persistence_status()["limit"]:
+                return {"saved_turn": True, "extraction": "capacity_skipped", **result}
+            task = asyncio.create_task(extract())
+            self._persistence_tasks.add(task)
+            self._persistence_started[task] = time.monotonic()
+            task.add_done_callback(self._persistence_completed)
+        else:
+            await extract()
+        return {"saved_turn": True, **result}
 
     def _persistence_completed(self, task: asyncio.Task[Any]) -> None:
         self._persistence_tasks.discard(task)
@@ -744,10 +887,10 @@ def _reference_delivery_prompt(request: LLMRequest) -> str:
     if not bool(request.metadata.get("include_references", False)):
         return ""
     return (
-        "\n\n语音回答的可视来源要求：如果本轮知识上下文提供了[资料N]，"
+        "\n\n语音回答的可视来源要求：仅当实际使用本轮知识上下文的[资料N]支持回答时，"
         "可视文本必须在结尾单独列出“参考来源”，正文不要出现[资料N]或【资料N】等行内编号。"
         "参考来源仅供屏幕显示，必须与正文分行，不要把资料编号、机构、标题、路径或链接"
-        "混入朗读正文；不得编造未提供的来源。音频层会自动跳过该来源区块。"
+        "混入朗读正文；不得编造未提供的来源，也不得为通用知识强行配上无关引用。音频层会自动跳过该来源区块。"
     )
 
 

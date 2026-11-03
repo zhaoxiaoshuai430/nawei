@@ -319,7 +319,8 @@ async def test_background_history_is_immediately_visible_and_ordered(monkeypatch
     second = await runtime.prepare(request("继续", answer_mode="fast"))
     result = await runtime.after_turn(first, "第一轮")
     await runtime.after_turn(second, "第二轮")
-    assert result["scheduled"]
+    assert result["saved_turn"]
+    assert not runtime._persistence_tasks
     assert [item["content"] for item in await store.get_history(user_id="owner", session_id="session")] == ["你好", "第一轮", "继续", "第二轮"]
     await asyncio.gather(*list(runtime._persistence_tasks))
     assert persisted == [("user", "你好"), ("assistant", "第一轮"), ("user", "继续"), ("assistant", "第二轮")]

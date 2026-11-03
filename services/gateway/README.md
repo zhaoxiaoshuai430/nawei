@@ -24,7 +24,9 @@ directly, with JWT for management APIs and HTTPS/WSS for robot access.
 
 ```text
 GET  /health
+GET  /ready
 GET  /api/v1/status
+GET  /api/v1/status/details
 POST /xiaozhi/ota/
 POST /xiaozhi/ota/activate
 POST /api/v1/devices/bind
@@ -32,6 +34,7 @@ GET  /api/v1/devices
 WS   /xiaozhi/v1/
 POST /api/v1/audio/transcriptions/base64
 POST /api/v1/text/completions
+POST /api/v1/text/completions/stream
 POST /api/v1/text/speech-completions
 POST /api/v1/audio/speech
 POST /api/v1/audio/speech/stream
@@ -71,9 +74,13 @@ after the old response stream has been cancelled.
 
 When enabled, the realtime voice path becomes `ASR -> keyword filter -> LLM Agent -> TTS`.
 Gateway posts the final ASR transcript to the configured keyword API before creating an
-LLM request. A blocked transcript bypasses the Agent and LLM completely, returns
+LLM request for that transcript. A blocked transcript bypasses the final-turn Agent and LLM, returns
 `GATEWAY_KEYWORD_FILTER_FALLBACK_TEXT`, and sends that fallback text to TTS when audio
 output is enabled.
+
+If optional voice preview is enabled, an earlier allowed partial may already have
+started speculative inference. Blocking the final transcript prevents delivery
+and persistence of that preview; it cannot undo the earlier model call.
 
 The default request body is `{"text": "..."}` and the default response contract is:
 
